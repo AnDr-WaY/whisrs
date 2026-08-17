@@ -458,7 +458,18 @@ pub(crate) async fn handle_repeat_last(
         // is a level-neutral modifier (Super), so no settle is needed
         // there.
         std::thread::sleep(REPEAT_INJECTION_SETTLE);
-        inject_text(&text, is_terminal, key_delay, injector_backend, paste)
+        // Repeat is explicitly a *re-injection*, so the clipboard output
+        // modes (`[input] clipboard_fallback` / `clipboard_only`) do not
+        // apply: the text must land at the cursor.
+        inject_text(
+            &text,
+            is_terminal,
+            key_delay,
+            injector_backend,
+            paste,
+            /* clipboard_fallback = */ false,
+            /* clipboard_only = */ false,
+        )
     })
     .await
     {
