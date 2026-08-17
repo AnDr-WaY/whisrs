@@ -115,6 +115,8 @@ pub(crate) async fn handle_toggle(
                     backend_name: context.config.general.backend.clone(),
                     key_delay: std::time::Duration::from_millis(context.config.input.key_delay_ms),
                     injector_backend: context.config.input.backend,
+                    clipboard_fallback: context.config.input.clipboard_fallback,
+                    clipboard_only: context.config.input.clipboard_only,
                 };
 
                 let task = tokio::spawn(run_streaming_pipeline(params));

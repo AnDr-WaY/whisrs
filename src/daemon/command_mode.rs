@@ -470,18 +470,32 @@ async fn command_mode_background_inner(
     // inject, so the result replaces the highlighted command instead of being
     // tacked onto it. The clear is best-effort: if it fails we still inject,
     // because appending the LLM result beats losing it.
+    //
+    // `[input] clipboard_only` skips the clear: nothing is injected in that
+    // mode, so clearing would wipe whatever the user had typed at the prompt
+    // and put nothing in its place — destroying input to produce no output.
     info!("command mode: injecting {} chars", result.len());
     let text_clone = result.clone();
     let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
     let injector_backend = context.config.input.backend;
     let paste = context.config.input.paste;
+    let clipboard_fallback = context.config.input.clipboard_fallback;
+    let clipboard_only = context.config.input.clipboard_only;
     match tokio::task::spawn_blocking(move || {
-        if is_terminal {
+        if is_terminal && !clipboard_only {
             if let Err(e) = clear_line_via_keyboard(key_delay, injector_backend) {
                 warn!("command mode: failed to clear terminal line, injecting anyway: {e:#}");
             }
         }
-        inject_text(&text_clone, is_terminal, key_delay, injector_backend, paste)
+        inject_text(
+            &text_clone,
+            is_terminal,
+            key_delay,
+            injector_backend,
+            paste,
+            clipboard_fallback,
+            clipboard_only,
+        )
     })
     .await
     {
@@ -931,6 +945,8 @@ async fn llm_command_background_inner(
     let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
     let injector_backend = context.config.input.backend;
     let paste = context.config.input.paste;
+    let clipboard_fallback = context.config.input.clipboard_fallback;
+    let clipboard_only = context.config.input.clipboard_only;
     match tokio::task::spawn_blocking(move || {
         inject_text(
             &result_clone,
@@ -938,6 +954,8 @@ async fn llm_command_background_inner(
             key_delay,
             injector_backend,
             paste,
+            clipboard_fallback,
+            clipboard_only,
         )
     })
     .await

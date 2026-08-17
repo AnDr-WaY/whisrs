@@ -25,7 +25,7 @@ jobs:
           - name: Linux x86_64 (no local-whisper)
             runner: ubuntu-latest
             artifact: whisrs-linux-x86_64-minimal
-            features: "--no-default-features --features tray,overlay"
+            features: "--no-default-features --features tray,overlay,hooks"
           - name: Linux aarch64
             runner: ubuntu-24.04-arm
             artifact: whisrs-linux-aarch64
@@ -33,7 +33,7 @@ jobs:
           - name: Linux aarch64 (no local-whisper)
             runner: ubuntu-24.04-arm
             artifact: whisrs-linux-aarch64-minimal
-            features: "--no-default-features --features tray,overlay"
+            features: "--no-default-features --features tray,overlay,hooks"
 
     steps:
       - uses: actions/checkout@v4

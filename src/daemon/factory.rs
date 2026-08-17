@@ -299,6 +299,7 @@ mod tests {
             }),
             llm: None,
             hotkeys: None,
+            hooks: None,
             llm_commands: Vec::new(),
             overlay: None,
             tts: None,

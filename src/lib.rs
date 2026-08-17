@@ -3,9 +3,13 @@
 pub mod audio;
 pub mod config;
 pub mod history;
+#[cfg(feature = "hooks")]
+pub mod hooks;
 pub mod hotkey;
 pub mod ipc;
 pub mod llm;
+#[cfg(feature = "hooks")]
+pub mod mpris;
 pub mod overlay;
 pub mod service_ctl;
 pub mod state;

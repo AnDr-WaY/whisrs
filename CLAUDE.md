@@ -156,13 +156,22 @@ docs" in an untracked file changes nothing for users and shows up in no PR. Chec
 
 ## Feature Flags
 
-- `default = ["local-whisper", "tray", "overlay"]`
+- `default = ["local-whisper", "tray", "overlay", "hooks"]`
 - `local-whisper` — whisper-rs (whisper.cpp) for offline transcription. Requires a C++ toolchain and libclang.
 - `tray` — tray icon via `ksni`
 - `overlay` — recording overlay via `smithay-client-toolkit` + `wayland-client` + `tiny-skia`
+- `hooks` — recording-lifecycle hooks + MPRIS media pause via `zbus` (no new system dep; `overlay` already pulls `zbus`)
+- `vulkan` / `cuda` / `hipblas` — GPU backends for the bundled whisper.cpp, passed
+  through to `whisper-rs`. Each implies `local-whisper`. Off by default and never built
+  by CI or the release workflow, so they are source-build-only (`cargo install whisrs
+  --features vulkan`). Enabling one turns on whisper-rs's `_gpu`, which is what flips
+  `WhisperContextParameters::default().use_gpu` to true — there is no whisrs-side wiring.
 
-The **minimal** release build is `--no-default-features --features tray,overlay`: it
-drops only whisper.cpp. Keep `tray` and `overlay` in it (that omission was issue #51).
+The **minimal** release build is `--no-default-features --features tray,overlay,hooks`:
+it drops only whisper.cpp. Keep `tray`, `overlay` and `hooks` in it (that omission was
+issue #51). A feature left out of that list is silently ignored at runtime rather than
+diagnosed: `Config` is not feature-gated, so the key still parses as known and the
+unknown-key warning stays quiet.
 
 ## Coding Conventions
 

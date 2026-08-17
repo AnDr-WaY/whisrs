@@ -60,7 +60,7 @@ sudo dnf install gcc-c++ alsa-lib-devel libxkbcommon-devel pkg-config clang-deve
 default feature. To skip that toolchain, build without it:
 
 ```bash
-cargo build --no-default-features --features tray,overlay
+cargo build --no-default-features --features tray,overlay,hooks
 ```
 
 ### Build and test

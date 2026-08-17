@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
+use whisrs::config::types::unknown_config_keys;
 use whisrs::Config;
 
 /// Try to connect to an existing socket.
@@ -32,7 +33,17 @@ pub(crate) fn load_config() -> (Config, Option<String>) {
             Ok(contents) => match toml::from_str::<Config>(&contents) {
                 Ok(config) => {
                     info!("loaded config from {}", config_path.display());
-                    return (config, None);
+                    let unknown = unknown_config_keys(&contents);
+                    if unknown.is_empty() {
+                        return (config, None);
+                    }
+                    let msg = format!(
+                        "Unknown keys in config at {} ignored: {}",
+                        config_path.display(),
+                        unknown.join(", ")
+                    );
+                    warn!("{msg}");
+                    return (config, Some(msg));
                 }
                 Err(e) => {
                     let msg = format!(
@@ -80,6 +91,7 @@ fn default_config() -> Config {
         llm: None,
         tts: None,
         hotkeys: None,
+        hooks: None,
         llm_commands: Vec::new(),
         overlay: None,
     }
@@ -221,6 +233,36 @@ pub(crate) fn check_audio_devices() {
                     warn!("available audio input devices: {}", names.join(", "));
                 }
             }
+        }
+    }
+}
+
+/// Check if the D-Bus session bus is reachable. Required for MPRIS media
+/// pause. Warns once at startup if unavailable.
+#[cfg(feature = "hooks")]
+pub(crate) async fn check_session_bus() {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        zbus::Connection::session(),
+    )
+    .await
+    {
+        Ok(Ok(_)) => info!("D-Bus session bus: available"),
+        Ok(Err(e)) => {
+            warn!(
+                "D-Bus session bus unavailable: {e}\n\
+                 MPRIS media pause will not work.\n\
+                 Install dbus-broker or dbus-daemon and ensure \
+                 DBUS_SESSION_BUS_ADDRESS is set."
+            );
+        }
+        Err(_) => {
+            warn!(
+                "D-Bus session bus connection timed out (5 s)\n\
+                 MPRIS media pause will not work.\n\
+                 Ensure dbus-broker or dbus-daemon is running and \
+                 DBUS_SESSION_BUS_ADDRESS is set."
+            );
         }
     }
 }

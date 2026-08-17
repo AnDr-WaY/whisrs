@@ -15,6 +15,8 @@ mod command_mode;
 mod context;
 mod dictation;
 mod factory;
+#[cfg(feature = "hooks")]
+mod hooks;
 mod injection;
 mod notify;
 mod pipeline;
@@ -29,6 +31,8 @@ use crate::factory::create_backend;
 use crate::injection::warm_keyboard;
 use crate::notify::send_notification;
 use crate::speak::handle_speak;
+#[cfg(feature = "hooks")]
+use crate::startup::check_session_bus;
 use crate::startup::{
     check_audio_devices, check_uinput_access, cleanup_stale_socket, import_compositor_env,
     load_config, validate_config,
@@ -78,6 +82,12 @@ async fn main() -> Result<()> {
         std::time::Duration::from_millis(config.input.key_delay_ms),
         config.input.backend,
     );
+
+    // Check D-Bus session bus if MPRIS media pause is configured.
+    #[cfg(feature = "hooks")]
+    if config.hooks.as_ref().is_some_and(|h| h.media_auto_pause) {
+        check_session_bus().await;
+    }
 
     let window_tracker: Arc<dyn WindowTracker> = Arc::from(window::detect_tracker());
     info!(
@@ -138,6 +148,14 @@ async fn main() -> Result<()> {
             cmd_tx.clone(),
             tray_notify,
         ));
+    }
+
+    // Recording-lifecycle hooks (MPRIS pause + shell commands). Watches the
+    // same state broadcast as the tray/overlay; detached, so failures never
+    // delay recording.
+    #[cfg(feature = "hooks")]
+    if let Some(hooks) = context.config.hooks.clone() {
+        tokio::spawn(crate::hooks::hook_dispatch_loop(state_rx.clone(), hooks));
     }
 
     // Start bottom recording overlay if enabled.

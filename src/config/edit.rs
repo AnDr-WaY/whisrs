@@ -52,8 +52,11 @@ pub fn run_config_menu() -> Result<()> {
             "Vocabulary & prompt",
             "Audio device",
             "Keyboard injection (key delay)",
+            "Clipboard fallback (copy transcript to clipboard)",
+            "Clipboard-only mode (no injection)",
             "Hotkeys",
             "Tray & overlay",
+            "Recording hooks",
             "Command mode (LLM)",
             "Custom LLM commands",
             "Show full config (masked)",
@@ -78,30 +81,33 @@ pub fn run_config_menu() -> Result<()> {
             4 => edit_vocabulary_and_prompt(&mut config)?,
             5 => edit_audio_device(&mut config)?,
             6 => edit_key_delay(&mut config)?,
-            7 => edit_hotkeys(&mut config)?,
-            8 => edit_tray_overlay(&mut config)?,
-            9 => edit_llm(&mut config)?,
-            10 => edit_llm_commands(&mut config)?,
-            11 => show_config(&config),
-            12 => {
+            7 => edit_clipboard_fallback(&mut config)?,
+            8 => edit_clipboard_only(&mut config)?,
+            9 => edit_hotkeys(&mut config)?,
+            10 => edit_tray_overlay(&mut config)?,
+            11 => edit_media_hooks(&mut config)?,
+            12 => edit_llm(&mut config)?,
+            13 => edit_llm_commands(&mut config)?,
+            14 => show_config(&config),
+            15 => {
                 if open_in_editor(&mut config)? {
                     // External edit already wrote the file; reload and skip the
                     // normal save path so we don't clobber formatting/comments
-                    // the user might have added.
+                    // (see open_in_editor).
                     println!("  {GREEN}Applied edits from $EDITOR.{RESET}");
                 }
             }
-            13 => {
+            16 => {
                 // separator — no-op
             }
-            14 => {
+            17 => {
                 if save_and_restart(&config, fresh)? {
                     return Ok(());
                 }
                 // Validation failed — fall through to next loop iteration,
                 // preserving the in-memory `config` so the user can fix it.
             }
-            15 => {
+            18 => {
                 println!("\n  {DIM}Discarded changes.{RESET}");
                 return Ok(());
             }
@@ -127,6 +133,7 @@ fn default_config() -> Config {
         llm: None,
         tts: None,
         hotkeys: None,
+        hooks: None,
         overlay: None,
         llm_commands: Vec::new(),
     }
@@ -403,6 +410,38 @@ fn edit_key_delay(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+fn edit_clipboard_fallback(config: &mut Config) -> Result<()> {
+    println!("\n  {BOLD}Clipboard fallback{RESET}");
+    println!(
+        "  {DIM}Keep the final transcript in the system clipboard as a fallback, \\\
+         alongside injecting it at the cursor. Use this if injection fails \\\
+         silently or produces garbled text — paste and fix manually.{RESET}"
+    );
+
+    config.input.clipboard_fallback = Confirm::new()
+        .with_prompt("Keep the transcript in the clipboard after dictation?")
+        .default(config.input.clipboard_fallback)
+        .interact()
+        .unwrap_or(config.input.clipboard_fallback);
+    Ok(())
+}
+
+fn edit_clipboard_only(config: &mut Config) -> Result<()> {
+    println!("\n  {BOLD}Clipboard-only mode{RESET}");
+    println!(
+        "  {DIM}Copy the transcript to the clipboard without injecting it at \
+         the cursor — no keystrokes, no paste. Overrides paste and \
+         clipboard fallback.{RESET}"
+    );
+
+    config.input.clipboard_only = Confirm::new()
+        .with_prompt("Copy only to the clipboard (no injection)?")
+        .default(config.input.clipboard_only)
+        .interact()
+        .unwrap_or(config.input.clipboard_only);
+    Ok(())
+}
+
 fn edit_hotkeys(config: &mut Config) -> Result<()> {
     println!("\n  {BOLD}Hotkeys{RESET}");
     println!(
@@ -462,6 +501,34 @@ fn prompt_optional_string(label: &str, current: &Option<String>) -> Result<Optio
     } else {
         Some(input)
     })
+}
+
+fn edit_media_hooks(config: &mut Config) -> Result<()> {
+    println!("\n  {BOLD}Recording hooks{RESET}");
+    println!(
+        "  {DIM}Pause MPRIS media that is playing (browsers, Spotify, VLC, MPV,\n   \
+         KDE Connect) while dictating, and resume exactly those afterwards.\n   \
+         Media you paused yourself is left alone.{RESET}"
+    );
+
+    let mut hooks = config.hooks.clone().unwrap_or_default();
+
+    hooks.media_auto_pause = Confirm::new()
+        .with_prompt("Pause playing MPRIS media while recording?")
+        .default(hooks.media_auto_pause)
+        .interact()
+        .unwrap_or(hooks.media_auto_pause);
+
+    hooks.on_record_start =
+        prompt_optional_string("Shell command on record start", &hooks.on_record_start)?;
+    hooks.on_record_stop =
+        prompt_optional_string("Shell command on record stop", &hooks.on_record_stop)?;
+
+    // Drop the whole section if nothing is configured — keeps the TOML clean.
+    let any_set =
+        hooks.media_auto_pause || hooks.on_record_start.is_some() || hooks.on_record_stop.is_some();
+    config.hooks = if any_set { Some(hooks) } else { None };
+    Ok(())
 }
 
 fn edit_tray_overlay(config: &mut Config) -> Result<()> {

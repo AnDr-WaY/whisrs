@@ -43,7 +43,7 @@ jobs:
           - name: full (default features)
             features: ""
           - name: minimal (no local-whisper)
-            features: "--no-default-features --features tray,overlay"
+            features: "--no-default-features --features tray,overlay,hooks"
     steps:
       - uses: actions/checkout@v4
 

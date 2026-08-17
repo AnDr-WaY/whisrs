@@ -11,7 +11,7 @@ members = [
 
 [package]
 name = "whisrs"
-version = "0.1.24"
+version = "0.1.25"
 edition = "2021"
 description = "Linux-first voice-to-text dictation tool with Groq, OpenAI, and local Whisper backends"
 license = "MIT"
@@ -38,10 +38,19 @@ name = "issue55_stream_check"
 required-features = ["local-whisper"]
 
 [features]
-default = ["local-whisper", "tray", "overlay"]
+default = ["local-whisper", "tray", "overlay", "hooks"]
 local-whisper = ["dep:whisper-rs"]
 tray = ["dep:ksni"]
-overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:tiny-skia"]
+overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:tiny-skia", "dep:zbus"]
+hooks = ["dep:zbus"]
+# GPU backends for the bundled whisper.cpp. Opt-in at build time — the backend
+# has to be linked in, so there is no runtime switch — and CPU stays the default.
+# The `whisper-rs?/…` weak syntax applies the feature to whisper-rs without
+# itself enabling the optional dependency; `local-whisper` is what pulls it in,
+# so builds that never enable it stay free of whisper-rs.
+vulkan = ["local-whisper", "whisper-rs?/vulkan"]
+cuda = ["local-whisper", "whisper-rs?/cuda"]
+hipblas = ["local-whisper", "whisper-rs?/hipblas"]
 
 [dependencies]
 anyhow = "1"
@@ -77,7 +86,7 @@ toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x11rb = { version = "0.13", features = ["randr", "shape"] }
-zbus = "5"
+zbus = { version = "5", optional = true }
 
 [dependencies.ksni]
 version = "0.3"

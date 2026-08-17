@@ -1,12 +1,18 @@
-use std::sync::{Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use whisrs::llm;
 use whisrs::InjectorBackend;
+use xkb_type::ClipboardBackend;
 
 static KEYBOARD: OnceLock<StdMutex<Option<Box<dyn xkb_type::KeyInjector>>>> = OnceLock::new();
+
+/// Delay before the post-paste clipboard restore: long enough for the paste
+/// keystroke to land in the target app, short enough that the user's
+/// clipboard contents are back before they next reach for them.
+const CLIPBOARD_RESTORE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// What may be done with an LLM reply that is headed for the cursor, decided
 /// by [`prepare_llm_injection`].
@@ -226,18 +232,87 @@ pub(crate) fn clear_line_via_keyboard(
 /// when the clipboard no longer holds the text we set — something else (the
 /// user, another app) copied over it during the paste, and restoring would
 /// race that copy and discard it.
+///
+/// With `clipboard_fallback` (see
+/// [`whisrs::InputConfig::clipboard_fallback`]) the final text is left in
+/// the clipboard as a manual-fix fallback for silent injection failures:
+/// in typing mode it is copied after the keystrokes run, success or failure
+/// (a `warn!` on copy error, never a change to the returned `Result`); in
+/// paste mode the post-paste restore is skipped entirely, so the pasted text
+/// simply stays in the clipboard. The unreadable-clipboard fallback to
+/// typing above still applies in paste mode: it exists to protect non-text
+/// content, and typing already delivered the text, so no clipboard write
+/// happens on that degraded path.
+///
+/// With `clipboard_only` (see
+/// [`whisrs::InputConfig::clipboard_only`]) the text is never injected at
+/// all: it is written to the clipboard and the function returns. That mode
+/// wins over `paste` and `clipboard_fallback` (both become no-ops), and a
+/// copy failure is a hard error — the copy is the entire feature, there is
+/// no injection to fall back to.
 pub(crate) fn inject_text(
     text: &str,
     is_terminal: bool,
     key_delay: std::time::Duration,
     backend: InjectorBackend,
     paste: bool,
+    clipboard_fallback: bool,
+    clipboard_only: bool,
 ) -> Result<()> {
-    if !paste {
-        return type_text_at_cursor(text, key_delay, backend);
+    inject_text_with_clipboard(
+        text,
+        is_terminal,
+        key_delay,
+        backend,
+        paste,
+        clipboard_fallback,
+        clipboard_only,
+        CLIPBOARD_RESTORE_DELAY,
+        Arc::from(xkb_type::default_clipboard()),
+    )
+}
+
+/// Testable core of [`inject_text`]: the clipboard and the restore delay are
+/// injected so unit tests can pin the clipboard-fallback and restore policy
+/// without a real clipboard (or a 500 ms wait). `clipboard` is an `Arc`
+/// because the post-paste restore runs on a spawned thread, which needs
+/// `'static` access; the production entry point wraps
+/// `xkb_type::default_clipboard()`.
+#[allow(clippy::too_many_arguments)]
+fn inject_text_with_clipboard(
+    text: &str,
+    is_terminal: bool,
+    key_delay: std::time::Duration,
+    backend: InjectorBackend,
+    paste: bool,
+    clipboard_fallback: bool,
+    clipboard_only: bool,
+    restore_delay: std::time::Duration,
+    clipboard: Arc<dyn ClipboardBackend>,
+) -> Result<()> {
+    if clipboard_only {
+        // The clipboard is the output, not the transport: nothing is
+        // injected at the cursor, and a copy failure is a hard error —
+        // there is no injection to fall back to.
+        clipboard
+            .set_text(text)
+            .context("failed to set clipboard in clipboard-only mode")?;
+        return Ok(());
     }
 
-    let clipboard = xkb_type::default_clipboard();
+    if !paste {
+        let result = type_text_at_cursor(text, key_delay, backend);
+        if clipboard_fallback {
+            // The copy is the fallback, so it must happen even when the
+            // typing failed — and a copy error must never change the Result
+            // the caller sees (the typing result is authoritative).
+            if let Err(e) = clipboard.set_text(text) {
+                warn!("failed to set clipboard fallback: {e}");
+            }
+        }
+        return result;
+    }
+
     let saved = match clipboard.get_text() {
         Ok(s) => s,
         Err(e) => {
@@ -254,13 +329,20 @@ pub(crate) fn inject_text(
 
     let paste_result = paste_via_keyboard(is_terminal, key_delay, backend);
 
+    if clipboard_fallback {
+        // The pasted text stays in the clipboard — that IS the fallback, so
+        // there is nothing to restore. Skip the delayed read-back + restore
+        // entirely (the read-back would also be wrong here: it restores
+        // exactly the value we want to keep).
+        return paste_result;
+    }
+
     // Restore the user's clipboard after the paste has landed, regardless of
     // whether the keystroke succeeded — but only if it's safe to (see doc
     // comment above).
     let pasted_text = text.to_string();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let clipboard = xkb_type::default_clipboard();
+        std::thread::sleep(restore_delay);
         match clipboard.get_text() {
             Ok(current) if current == pasted_text => {
                 if let Err(e) = clipboard.set_text(&saved) {
@@ -1091,5 +1173,343 @@ mod tests {
         assert!(is_terminal_class("alacritty-float", &new.terminal_classes));
         assert!(is_terminal_class("st-mytermname", &new.terminal_classes));
         assert!(!is_terminal_class("steam", &new.terminal_classes));
+    }
+
+    // ---------------------------------------------------------------------
+    // `inject_text` clipboard-fallback policy
+    // ---------------------------------------------------------------------
+
+    /// Serializes the injection tests: they swap a mock keyboard into the
+    /// process-global `KEYBOARD` slot, and two tests doing that concurrently
+    /// could install over each other.
+    static KEYBOARD_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Scripted clipboard double, following the pattern from the
+    /// `selection.rs` tests: `texts` is the sequence of `get_text` results
+    /// (each call consumes the front entry; the last entry is sticky),
+    /// `writes` records every `set_text` so tests can assert the
+    /// fallback/restore policy byte-for-byte — including that nothing is
+    /// ever written. An empty `texts` list makes any `get_text` panic, which
+    /// is itself an assertion in the typing tests below (typing mode must
+    /// never read the clipboard).
+    struct ScriptedClipboard {
+        texts: StdMutex<Vec<Option<String>>>,
+        writes: StdMutex<Vec<String>>,
+        fail_writes: bool,
+    }
+
+    impl ScriptedClipboard {
+        fn new(texts: &[Option<&str>]) -> Self {
+            Self {
+                texts: StdMutex::new(texts.iter().map(|t| t.map(String::from)).collect()),
+                writes: StdMutex::new(Vec::new()),
+                fail_writes: false,
+            }
+        }
+
+        fn writes(&self) -> Vec<String> {
+            self.writes.lock().unwrap().clone()
+        }
+    }
+
+    impl ClipboardBackend for ScriptedClipboard {
+        fn get_text(&self) -> anyhow::Result<String> {
+            let mut texts = self.texts.lock().unwrap();
+            assert!(!texts.is_empty(), "get_text called with no scripted result");
+            let head = if texts.len() > 1 {
+                texts.remove(0)
+            } else {
+                texts[0].clone()
+            };
+            head.ok_or_else(|| anyhow::anyhow!("clipboard holds non-text content"))
+        }
+
+        fn set_text(&self, text: &str) -> anyhow::Result<()> {
+            if self.fail_writes {
+                return Err(anyhow::anyhow!("mock clipboard write failure"));
+            }
+            self.writes.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+
+        fn get_primary_selection(&self) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// Scripted keyboard double: records typed text and paste combos instead
+    /// of opening /dev/uinput. `fail_typing` makes `type_text` error, to
+    /// exercise the "copy even when typing fails" fallback contract.
+    #[derive(Default, Clone)]
+    struct MockKeyboard {
+        typed: Arc<StdMutex<Vec<String>>>,
+        paste_combos: Arc<StdMutex<usize>>,
+        fail_typing: bool,
+    }
+
+    impl xkb_type::KeyInjector for MockKeyboard {
+        fn type_text(&mut self, text: &str) -> anyhow::Result<()> {
+            if self.fail_typing {
+                return Err(anyhow::anyhow!("mock typing failure"));
+            }
+            self.typed.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+
+        fn backspace(&mut self, _count: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn send_combo(&mut self, _keys: &[evdev::Key]) -> anyhow::Result<()> {
+            *self.paste_combos.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        fn set_key_delay(&mut self, _delay: std::time::Duration) {}
+    }
+
+    /// Run `f` with `keyboard` installed as the persistent virtual keyboard,
+    /// restoring whatever occupied the slot before (a previous test's mock,
+    /// or the real device slot) afterwards.
+    fn with_keyboard(keyboard: MockKeyboard, f: impl FnOnce()) {
+        let slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
+        let mut guard = slot.lock().unwrap();
+        let previous = guard.take();
+        *guard = Some(Box::new(keyboard));
+        drop(guard);
+        f();
+        let mut guard = slot.lock().unwrap();
+        *guard = previous;
+    }
+
+    /// Run the testable inject core with a mock keyboard installed and a
+    /// near-zero restore delay, then give any spawned restore thread time to
+    /// land before returning. Generic over the concrete clipboard type so
+    /// tests keep typed access to the recording mock after the call.
+    fn inject<C: ClipboardBackend + 'static>(
+        keyboard: MockKeyboard,
+        clipboard: Arc<C>,
+        text: &str,
+        paste: bool,
+        clipboard_fallback: bool,
+        clipboard_only: bool,
+    ) -> anyhow::Result<()> {
+        let mut result = None;
+        with_keyboard(keyboard, || {
+            result = Some(inject_text_with_clipboard(
+                text,
+                /* is_terminal = */ false,
+                std::time::Duration::from_millis(1),
+                InjectorBackend::Uinput,
+                paste,
+                clipboard_fallback,
+                clipboard_only,
+                std::time::Duration::from_millis(5),
+                clipboard,
+            ));
+            // The restore thread (when spawned) sleeps its 5 ms delay, then
+            // does a clipboard read + write; 100 ms is ample for it to land
+            // before the test inspects the record.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        result.unwrap()
+    }
+
+    #[test]
+    fn paste_with_fallback_keeps_the_pasted_text_in_the_clipboard() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Same script as the restoring sibling test below: the pre-paste save
+        // reads "original", and a read-back — if one happened — would see the
+        // pasted text and therefore restore. With the fallback on, no
+        // read-back happens at all, so the pasted text stays in the clipboard.
+        // Scripting it this way is what makes the assertion load-bearing:
+        // with a sticky "original" the read-back would take the "clipboard
+        // changed, skip restore" arm and the test would pass even with the
+        // fallback logic deleted.
+        let clipboard = Arc::new(ScriptedClipboard::new(&[
+            Some("original"),
+            Some("hello world"),
+        ]));
+        let keyboard = MockKeyboard::default();
+        let paste_combos = Arc::clone(&keyboard.paste_combos);
+
+        let result = inject(
+            keyboard,
+            Arc::clone(&clipboard),
+            "hello world",
+            /* paste = */ true,
+            /* clipboard_fallback = */ true,
+            /* clipboard_only = */ false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(*paste_combos.lock().unwrap(), 1, "Ctrl+V must have fired");
+        assert_eq!(
+            clipboard.writes(),
+            vec!["hello world".to_string()],
+            "only the paste write — no restore may follow"
+        );
+    }
+
+    #[test]
+    fn paste_without_fallback_still_restores_the_previous_clipboard() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Reads: the pre-paste save ("original"), then the delayed restore
+        // read-back (still the pasted text, so nothing else copied over) →
+        // the original is written back exactly once.
+        let clipboard = Arc::new(ScriptedClipboard::new(&[
+            Some("original"),
+            Some("hello world"),
+        ]));
+        let keyboard = MockKeyboard::default();
+
+        let result = inject(
+            keyboard,
+            Arc::clone(&clipboard),
+            "hello world",
+            /* paste = */ true,
+            /* clipboard_fallback = */ false,
+            /* clipboard_only = */ false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            clipboard.writes(),
+            vec!["hello world".to_string(), "original".to_string()]
+        );
+    }
+
+    #[test]
+    fn typing_with_fallback_copies_the_typed_text() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Typing mode never reads the clipboard (empty script would panic on
+        // any read), and the fallback writes the typed text once.
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let keyboard = MockKeyboard::default();
+        let typed = Arc::clone(&keyboard.typed);
+
+        let result = inject(
+            keyboard,
+            Arc::clone(&clipboard),
+            "hello world",
+            /* paste = */ false,
+            /* clipboard_fallback = */ true,
+            /* clipboard_only = */ false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(*typed.lock().unwrap(), vec!["hello world".to_string()]);
+        assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn typing_without_fallback_never_touches_the_clipboard() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let keyboard = MockKeyboard::default();
+        let typed = Arc::clone(&keyboard.typed);
+
+        let result = inject(
+            keyboard,
+            Arc::clone(&clipboard),
+            "hello world",
+            /* paste = */ false,
+            /* clipboard_fallback = */ false,
+            /* clipboard_only = */ false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(*typed.lock().unwrap(), vec!["hello world".to_string()]);
+        assert!(
+            clipboard.writes().is_empty(),
+            "clipboard must stay untouched when the fallback is off"
+        );
+    }
+
+    #[test]
+    fn typing_failure_still_copies_with_fallback_on() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The copy is the fallback for the failure case: it must happen even
+        // when typing errors, and the typing error stays the returned Result.
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let keyboard = MockKeyboard {
+            fail_typing: true,
+            ..Default::default()
+        };
+
+        let result = inject(
+            keyboard,
+            Arc::clone(&clipboard),
+            "hello world",
+            /* paste = */ false,
+            /* clipboard_fallback = */ true,
+            /* clipboard_only = */ false,
+        );
+
+        assert!(result.is_err(), "the typing failure is authoritative");
+        assert_eq!(
+            clipboard.writes(),
+            vec!["hello world".to_string()],
+            "the fallback copy must happen even when typing failed"
+        );
+    }
+
+    #[test]
+    fn clipboard_only_copies_and_never_injects() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Copy-only mode must not read the clipboard (empty script panics on
+        // any read), must not type, and must not fire Ctrl+V — even with
+        // `paste = true` set, which it overrides.
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let keyboard = MockKeyboard::default();
+        let typed = Arc::clone(&keyboard.typed);
+        let paste_combos = Arc::clone(&keyboard.paste_combos);
+
+        let result = inject(
+            keyboard,
+            Arc::clone(&clipboard),
+            "hello world",
+            /* paste = */ true,
+            /* clipboard_fallback = */ false,
+            /* clipboard_only = */ true,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            clipboard.writes(),
+            vec!["hello world".to_string()],
+            "the clipboard write is the output"
+        );
+        assert!(typed.lock().unwrap().is_empty(), "nothing may be typed");
+        assert_eq!(
+            *paste_combos.lock().unwrap(),
+            0,
+            "no Ctrl+V in copy-only mode"
+        );
+    }
+
+    #[test]
+    fn clipboard_only_copy_failure_is_an_error() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Unlike the typing-mode fallback (best-effort warn), a copy failure
+        // in copy-only mode must surface — the copy is the entire feature.
+        let mut clipboard = ScriptedClipboard::new(&[]);
+        clipboard.fail_writes = true;
+        let clipboard = Arc::new(clipboard);
+        let keyboard = MockKeyboard::default();
+
+        let result = inject(
+            keyboard,
+            Arc::clone(&clipboard),
+            "hello world",
+            /* paste = */ false,
+            /* clipboard_fallback = */ false,
+            /* clipboard_only = */ true,
+        );
+
+        assert!(
+            result.is_err(),
+            "copy failure must surface in copy-only mode"
+        );
     }
 }

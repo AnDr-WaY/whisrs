@@ -1,4 +1,4 @@
-.TH WHISRS 1 "2026-08-09" "whisrs 0.1.24" "User Commands"
+.TH WHISRS 1 "2026-08-13" "whisrs 0.1.25" "User Commands"
 .SH NAME
 whisrs \- Linux-first voice-to-text dictation CLI
 .SH SYNOPSIS
@@ -191,7 +191,7 @@ Defaults to
 .I ~/.config/whisrs/config.toml
 Main configuration file. Created by
 .BR "whisrs setup" .
-Contains backend selection, API keys, language, and audio settings.
+Contains backend selection, API keys, language, audio settings, and hooks.
 Permissions should be 0600 since it may contain API keys.
 .TP
 .I $XDG_RUNTIME_DIR/whisrs.sock
