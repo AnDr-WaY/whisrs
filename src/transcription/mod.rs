@@ -29,7 +29,7 @@ pub mod local_whisper {
             _audio: &[u8],
             _config: &super::TranscriptionConfig,
         ) -> anyhow::Result<String> {
-            anyhow::bail!("local-whisper feature not enabled — rebuild with: cargo build --features local-whisper")
+            anyhow::bail!("local-whisper feature not enabled; rebuild with: cargo build --features local-whisper")
         }
 
         // Unreachable: `transcribe` bails before a request exists. `false`
@@ -47,7 +47,7 @@ pub mod local_whisper {
             _audio: &[u8],
             _config: &super::TranscriptionConfig,
         ) -> anyhow::Result<super::Transcript> {
-            anyhow::bail!("local-whisper feature not enabled — rebuild with: cargo build --features local-whisper")
+            anyhow::bail!("local-whisper feature not enabled; rebuild with: cargo build --features local-whisper")
         }
 
         // Matches the real backend so chunking does not depend on the build.
@@ -93,6 +93,84 @@ const SEGMENT_SAMPLE_RATE: usize = 16_000;
 /// Silence that ends a phrase in [`segments_by_phrase`]. Matches the
 /// local-whisper default so both phrase paths cut alike.
 const FALLBACK_PHRASE_SILENCE_MS: u64 = 400;
+
+/// A transient HTTP failure worth retrying later: 429 (rate limited) or 503
+/// (overloaded). Cloud backends return it inside their `anyhow::Error` so a
+/// long job such as a meeting can back off and resume, while dictation just
+/// shows the message as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryableHttpError {
+    pub status: u16,
+    /// The server's `Retry-After` (or `retry-after-ms`), when it sent one.
+    pub retry_after: Option<std::time::Duration>,
+    pub message: String,
+}
+
+impl std::fmt::Display for RetryableHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RetryableHttpError {}
+
+/// Whether an HTTP status is a transient failure ([`RetryableHttpError`]).
+pub fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 503)
+}
+
+/// An error for a failed request: a [`RetryableHttpError`] for 429/503, a
+/// plain error otherwise. `message` is what the user sees either way.
+pub(crate) fn http_error(
+    status: u16,
+    retry_after: Option<std::time::Duration>,
+    message: String,
+) -> anyhow::Error {
+    if is_retryable_status(status) {
+        RetryableHttpError {
+            status,
+            retry_after,
+            message,
+        }
+        .into()
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+/// The wait a response asks for: `retry-after-ms` (OpenAI), else
+/// `Retry-After` as seconds or an HTTP date.
+pub(crate) fn retry_after_header(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<std::time::Duration> {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(ms) = get("retry-after-ms").and_then(|v| v.trim().parse::<f64>().ok()) {
+        if ms.is_finite() && ms >= 0.0 {
+            return Some(std::time::Duration::from_millis(ms as u64));
+        }
+    }
+    get("retry-after").and_then(|v| parse_retry_after(v, chrono::Utc::now()))
+}
+
+/// Parse a `Retry-After` value: delay seconds (fractions allowed) or an
+/// HTTP date, relative to `now`. A date in the past means "now".
+pub(crate) fn parse_retry_after(
+    value: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<std::time::Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<f64>() {
+        return (secs.is_finite() && secs >= 0.0)
+            .then(|| std::time::Duration::from_secs_f64(secs.min(86_400.0)));
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        at.with_timezone(&chrono::Utc)
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or_default(),
+    )
+}
 
 /// Convert seconds (as reported by every cloud API) to whole milliseconds.
 pub(crate) fn secs_to_ms(secs: f64) -> u64 {
@@ -306,6 +384,44 @@ pub(crate) fn live_only_error(backend: &str) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn retry_after_seconds_and_dates() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).unwrap();
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(parse_retry_after("30", now), Some(secs(30)));
+        assert_eq!(
+            parse_retry_after(" 1.5 ", now),
+            Some(std::time::Duration::from_millis(1500))
+        );
+        assert_eq!(
+            parse_retry_after("Fri, 02 Oct 2026 12:01:00 GMT", now),
+            Some(secs(60))
+        );
+        // A date already past means retry now.
+        assert_eq!(
+            parse_retry_after("Fri, 02 Oct 2026 11:00:00 GMT", now),
+            Some(secs(0))
+        );
+        assert_eq!(parse_retry_after("-3", now), None);
+        assert_eq!(parse_retry_after("soon", now), None);
+    }
+
+    #[test]
+    fn only_429_and_503_are_retryable() {
+        let err = http_error(429, None, "rate limited".into());
+        assert!(err.downcast_ref::<RetryableHttpError>().is_some());
+        assert_eq!(err.to_string(), "rate limited");
+        assert!(http_error(503, None, "x".into())
+            .downcast_ref::<RetryableHttpError>()
+            .is_some());
+        for status in [400, 401, 500] {
+            assert!(http_error(status, None, "x".into())
+                .downcast_ref::<RetryableHttpError>()
+                .is_none());
+        }
+    }
     use super::*;
 
     /// Canned `transcribe` that reports what it was sent, for the fallback.

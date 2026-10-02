@@ -140,16 +140,6 @@ async fn main() -> Result<()> {
         meeting: meeting_runtime,
     });
 
-    // Meeting processing runs on its own task, one meeting at a time, so a
-    // long transcription never holds up IPC or dictation. Recovery of
-    // meetings a crash or shutdown interrupted is spawned too, so the socket
-    // comes up without waiting for WAV repair.
-    tokio::spawn(crate::meeting::run_worker(
-        Arc::clone(&context),
-        meeting_queue_rx,
-    ));
-    tokio::spawn(crate::meeting::recover_on_startup(Arc::clone(&context)));
-
     let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
 
     // Shared command channel for in-process command sources (hotkeys, tray
@@ -162,6 +152,24 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 info!("internal command (hotkey/tray): {cmd:?}");
+                // A meeting start can spend seconds opening devices; run it
+                // aside so a dictation hotkey pressed meanwhile is not held
+                // behind it. Meetings never touch the dictation state, so
+                // there is nothing to broadcast after it.
+                if let Command::Meeting { action, title, id } = cmd {
+                    let ctx = Arc::clone(&dispatch_ctx);
+                    tokio::spawn(async move {
+                        let notify = ctx.notify_error();
+                        if let Response::Error { message } =
+                            handle_meeting(ctx, action, title, id).await
+                        {
+                            if notify {
+                                send_notification("whisrs", &format!("Meeting: {message}"));
+                            }
+                        }
+                    });
+                    continue;
+                }
                 let _response =
                     handle_command(cmd, Arc::clone(&dispatch_state), Arc::clone(&dispatch_ctx))
                         .await;
@@ -221,6 +229,19 @@ async fn main() -> Result<()> {
 
     let listener = UnixListener::bind(&sock_path).context("failed to bind Unix socket")?;
     info!("listening on {}", sock_path.display());
+
+    // Only now, with the socket ours: a second whisrsd that exits at the
+    // check above must not also recover and process the same meetings.
+    // Meeting processing runs on its own task, one meeting at a time, so a
+    // long transcription never holds up IPC or dictation. Recovery of
+    // meetings a crash or shutdown interrupted is spawned too, so the socket
+    // serves without waiting for WAV repair. Commands that queued a meeting
+    // before this wait in the channel.
+    tokio::spawn(crate::meeting::run_worker(
+        Arc::clone(&context),
+        meeting_queue_rx,
+    ));
+    tokio::spawn(crate::meeting::recover_on_startup(Arc::clone(&context)));
 
     // SIGTERM (systemd stop/restart, tray Quit) and SIGINT both finalize a
     // recording meeting before exiting, so it is transcribed on the next start.

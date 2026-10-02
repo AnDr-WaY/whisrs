@@ -111,17 +111,16 @@ impl AsrSidecarBackend {
         }
         let response = request.multipart(form).send().await?;
         let status = response.status();
+        let retry_after = super::retry_after_header(response.headers());
         let body = response.text().await?;
 
         if !status.is_success() {
-            if let Ok(err_resp) = serde_json::from_str::<AsrSidecarErrorResponse>(&body) {
-                anyhow::bail!(
-                    "ASR sidecar error ({}): {}",
-                    status.as_u16(),
-                    err_resp.message()
-                );
-            }
-            anyhow::bail!("ASR sidecar error ({}): {}", status.as_u16(), body);
+            let code = status.as_u16();
+            let message = match serde_json::from_str::<AsrSidecarErrorResponse>(&body) {
+                Ok(err_resp) => format!("ASR sidecar error ({code}): {}", err_resp.message()),
+                Err(_) => format!("ASR sidecar error ({code}): {body}"),
+            };
+            return Err(super::http_error(code, retry_after, message));
         }
         Ok(body)
     }

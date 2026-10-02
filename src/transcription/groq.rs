@@ -82,22 +82,21 @@ impl GroqBackend {
             .await?;
 
         let status = response.status();
+        let retry_after = super::retry_after_header(response.headers());
         let body = response.text().await?;
 
         if !status.is_success() {
+            let code = status.as_u16();
             // Try to parse error response for a better message.
-            if let Ok(err_resp) = serde_json::from_str::<GroqErrorResponse>(&body) {
-                match status.as_u16() {
-                    401 => anyhow::bail!("Groq API: invalid API key — {}", err_resp.error.message),
-                    429 => anyhow::bail!("Groq API: rate limited — {}", err_resp.error.message),
-                    _ => anyhow::bail!(
-                        "Groq API error ({}): {}",
-                        status.as_u16(),
-                        err_resp.error.message
-                    ),
-                }
-            }
-            anyhow::bail!("Groq API error ({}): {}", status.as_u16(), body);
+            let message = match serde_json::from_str::<GroqErrorResponse>(&body) {
+                Ok(err_resp) => match code {
+                    401 => format!("Groq API: invalid API key: {}", err_resp.error.message),
+                    429 => format!("Groq API: rate limited: {}", err_resp.error.message),
+                    _ => format!("Groq API error ({code}): {}", err_resp.error.message),
+                },
+                Err(_) => format!("Groq API error ({code}): {body}"),
+            };
+            return Err(super::http_error(code, retry_after, message));
         }
         Ok(body)
     }

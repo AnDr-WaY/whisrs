@@ -18,6 +18,11 @@ const FRAME_MS: usize = 100;
 /// How far before the cap to look for a quiet place to cut.
 const LOOKBACK_SECS: usize = 60;
 
+/// Length in samples of one analysis frame at `sample_rate`.
+pub fn frame_len(sample_rate: usize) -> usize {
+    (sample_rate * FRAME_MS / 1000).max(1)
+}
+
 /// Split `samples` into contiguous ranges of at most `max_chunk_secs` each.
 ///
 /// The ranges cover every sample exactly once, in order. When a cut is needed
@@ -31,27 +36,46 @@ pub fn split_at_silence(
     max_chunk_secs: usize,
     threshold: f64,
 ) -> Vec<Range<usize>> {
-    let frame = (sample_rate * FRAME_MS / 1000).max(1);
+    let frame = frame_len(sample_rate);
+    let energies: Vec<f64> = samples.chunks_exact(frame).map(rms_energy).collect();
+    split_by_energies(
+        &energies,
+        samples.len(),
+        sample_rate,
+        max_chunk_secs,
+        threshold,
+    )
+}
+
+/// [`split_at_silence`] from precomputed frame energies, so a long track
+/// can be split without holding its samples: `energies[i]` is the RMS
+/// ([`rms_energy`]) of samples `i * frame_len .. (i + 1) * frame_len` for
+/// every whole frame of the `total_len`-sample track.
+pub fn split_by_energies(
+    energies: &[f64],
+    total_len: usize,
+    sample_rate: usize,
+    max_chunk_secs: usize,
+    threshold: f64,
+) -> Vec<Range<usize>> {
+    let frame = frame_len(sample_rate);
     let max_len = (max_chunk_secs * sample_rate).max(frame);
     // Whole frames only, and at least one, so every cut makes progress.
     let lookback_frames = ((LOOKBACK_SECS * sample_rate).min(max_len / 2) / frame).max(1);
 
     let mut ranges = Vec::new();
     let mut start = 0;
-    while start < samples.len() {
-        if samples.len() - start <= max_len {
-            ranges.push(start..samples.len());
+    while start < total_len {
+        if total_len - start <= max_len {
+            ranges.push(start..total_len);
             break;
         }
+        // Every cut is a whole number of frames from 0, so `start` is
+        // frame-aligned and the frames up to the cap are all whole.
+        let base = start / frame;
         let cap_frames = max_len / frame;
         let first = cap_frames.saturating_sub(lookback_frames).max(1);
-        let energies: Vec<f64> = (first..cap_frames)
-            .map(|f| {
-                let from = start + f * frame;
-                rms_energy(&samples[from..from + frame])
-            })
-            .collect();
-        let cut_frame = first + pick_cut(&energies, threshold);
+        let cut_frame = first + pick_cut(&energies[base + first..base + cap_frames], threshold);
         let cut = start + cut_frame * frame;
         ranges.push(start..cut);
         start = cut;
@@ -153,6 +177,64 @@ mod tests {
             "cut at {} is not in the quiet second",
             ranges[0].end
         );
+    }
+
+    /// The implementation before frame energies were precomputed, kept as
+    /// the reference [`split_by_energies`] must match.
+    fn reference_split(
+        samples: &[i16],
+        sample_rate: usize,
+        max_chunk_secs: usize,
+        threshold: f64,
+    ) -> Vec<Range<usize>> {
+        let frame = (sample_rate * FRAME_MS / 1000).max(1);
+        let max_len = (max_chunk_secs * sample_rate).max(frame);
+        let lookback_frames = ((LOOKBACK_SECS * sample_rate).min(max_len / 2) / frame).max(1);
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        while start < samples.len() {
+            if samples.len() - start <= max_len {
+                ranges.push(start..samples.len());
+                break;
+            }
+            let cap_frames = max_len / frame;
+            let first = cap_frames.saturating_sub(lookback_frames).max(1);
+            let energies: Vec<f64> = (first..cap_frames)
+                .map(|f| {
+                    let from = start + f * frame;
+                    rms_energy(&samples[from..from + frame])
+                })
+                .collect();
+            let cut = start + (first + pick_cut(&energies, threshold)) * frame;
+            ranges.push(start..cut);
+            start = cut;
+        }
+        ranges
+    }
+
+    #[test]
+    fn energies_split_matches_the_reference() {
+        // Speech-like bursts of varying loudness and gaps, plus a partial
+        // trailing frame, at a short cap so there are many cuts.
+        let mut samples = Vec::new();
+        for i in 0..400usize {
+            let amp = [LOUD, 0, LOUD / 3, 0, LOUD / 8][i % 5];
+            let secs = 1 + (i * 7) % 4;
+            samples.extend((0..secs * RATE).map(|j| if j % 2 == 0 { amp } else { -amp }));
+        }
+        samples.extend([5i16; 37]);
+        for cap in [7, 10, 30, 120] {
+            let expected = reference_split(&samples, RATE, cap, 0.01);
+            assert_eq!(split_at_silence(&samples, RATE, cap, 0.01), expected);
+            let energies: Vec<f64> = samples
+                .chunks_exact(frame_len(RATE))
+                .map(rms_energy)
+                .collect();
+            assert_eq!(
+                split_by_energies(&energies, samples.len(), RATE, cap, 0.01),
+                expected
+            );
+        }
     }
 
     #[test]

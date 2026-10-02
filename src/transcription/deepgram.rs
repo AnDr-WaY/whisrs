@@ -364,26 +364,23 @@ impl DeepgramRestBackend {
             .await?;
 
         let status = response.status();
+        let retry_after = super::retry_after_header(response.headers());
         let body = response.text().await?;
 
         if !status.is_success() {
-            if let Ok(err_resp) = serde_json::from_str::<DeepgramErrorResponse>(&body) {
-                match status.as_u16() {
-                    401 | 403 => {
-                        anyhow::bail!("Deepgram API: invalid API key — {}", err_resp.err_msg)
-                    }
-                    429 => {
-                        anyhow::bail!("Deepgram API: rate limited — {}", err_resp.err_msg)
-                    }
-                    _ => anyhow::bail!(
-                        "Deepgram API error ({} {}): {}",
-                        status.as_u16(),
-                        err_resp.err_code,
-                        err_resp.err_msg
+            let code = status.as_u16();
+            let message = match serde_json::from_str::<DeepgramErrorResponse>(&body) {
+                Ok(err_resp) => match code {
+                    401 | 403 => format!("Deepgram API: invalid API key: {}", err_resp.err_msg),
+                    429 => format!("Deepgram API: rate limited: {}", err_resp.err_msg),
+                    _ => format!(
+                        "Deepgram API error ({code} {}): {}",
+                        err_resp.err_code, err_resp.err_msg
                     ),
-                }
-            }
-            anyhow::bail!("Deepgram API error ({}): {}", status.as_u16(), body);
+                },
+                Err(_) => format!("Deepgram API error ({code}): {body}"),
+            };
+            return Err(super::http_error(code, retry_after, message));
         }
         Ok(body)
     }

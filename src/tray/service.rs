@@ -215,9 +215,9 @@ impl ksni::Tray for WhisrsTray {
         // dictating during a meeting is normal and its state matters more
         // in the moment.
         match (self.state.current, self.state.meeting.phase) {
-            (State::Idle, MeetingPhase::Recording) => "whisrs — meeting recording".to_string(),
-            (State::Idle, MeetingPhase::Processing) => "whisrs — processing meeting".to_string(),
-            (state, _) => format!("whisrs — {}", state_word(state)),
+            (State::Idle, MeetingPhase::Recording) => "whisrs: meeting recording".to_string(),
+            (State::Idle, MeetingPhase::Processing) => "whisrs: processing meeting".to_string(),
+            (state, _) => format!("whisrs: {}", state_word(state)),
         }
     }
 

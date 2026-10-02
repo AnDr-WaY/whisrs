@@ -603,7 +603,16 @@ cause (a missing API key, a network error) and run `whisrs meeting retry`.
 
 `max_duration_minutes` (default 180, at most 2160) stops a recording that was
 left running. A meeting interrupted by a crash or reboot is recovered from its
-audio the next time the daemon starts.
+audio the next time the daemon starts. If its transcription is interrupted three
+times in a row (for example because it keeps crashing the daemon), it is marked
+failed instead of being resumed again, so dictation keeps working; run
+`whisrs meeting retry` to try once more.
+
+Cloud backends that answer "rate limited" (HTTP 429) or "overloaded" (503) are
+retried with a backoff, honoring the server's `Retry-After`, for up to five
+minutes per chunk. Each finished chunk is saved in the meeting's `.cache/`
+folder, so a retry after a failure only sends what was not transcribed yet.
+The cache is deleted once the transcript is written.
 
 ## The vocabulary file
 

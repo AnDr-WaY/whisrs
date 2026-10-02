@@ -86,25 +86,20 @@ impl OpenAIRestBackend {
             .await?;
 
         let status = response.status();
+        let retry_after = super::retry_after_header(response.headers());
         let body = response.text().await?;
 
         if !status.is_success() {
-            if let Ok(err_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
-                match status.as_u16() {
-                    401 => {
-                        anyhow::bail!("OpenAI API: invalid API key — {}", err_resp.error.message)
-                    }
-                    429 => {
-                        anyhow::bail!("OpenAI API: rate limited — {}", err_resp.error.message)
-                    }
-                    _ => anyhow::bail!(
-                        "OpenAI API error ({}): {}",
-                        status.as_u16(),
-                        err_resp.error.message
-                    ),
-                }
-            }
-            anyhow::bail!("OpenAI API error ({}): {}", status.as_u16(), body);
+            let code = status.as_u16();
+            let message = match serde_json::from_str::<OpenAIErrorResponse>(&body) {
+                Ok(err_resp) => match code {
+                    401 => format!("OpenAI API: invalid API key: {}", err_resp.error.message),
+                    429 => format!("OpenAI API: rate limited: {}", err_resp.error.message),
+                    _ => format!("OpenAI API error ({code}): {}", err_resp.error.message),
+                },
+                Err(_) => format!("OpenAI API error ({code}): {body}"),
+            };
+            return Err(super::http_error(code, retry_after, message));
         }
         Ok(body)
     }

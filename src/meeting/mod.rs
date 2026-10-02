@@ -179,6 +179,11 @@ pub struct MeetingMeta {
     pub error: Option<String>,
     #[serde(default)]
     pub audio_deleted: bool,
+    /// Processing attempts started since the last manual retry. Written
+    /// before each attempt, so a meeting whose processing keeps crashing the
+    /// daemon is not requeued on every start forever.
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 /// Current `meeting.json` schema version.
@@ -206,6 +211,7 @@ impl MeetingMeta {
             errors: Vec::new(),
             error: None,
             audio_deleted: false,
+            attempts: 0,
         }
     }
 }

@@ -184,7 +184,10 @@ Print the meeting folder.
 Copy the transcript to the clipboard.
 .TP
 \fBretry\fR \fIID\fR
-Transcribe the meeting again, for example after a failure.
+Transcribe the meeting again, for example after a failure. A meeting whose
+transcription was interrupted three times (a crash or restart each time) is
+marked failed rather than resumed at startup; retry starts it over. Chunks
+already transcribed with the same backend are reused.
 .RE
 .IP
 .BR list ,

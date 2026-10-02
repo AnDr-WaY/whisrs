@@ -8,6 +8,7 @@
 //! never animates the overlay or fires recording hooks.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,9 +39,26 @@ const FLUSH_EVERY: Duration = Duration::from_secs(2);
 /// How long a stop waits for each track writer to finalize its file.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How much longer a writer that missed its timeout gets once its capture
+/// (the sender side of its channel) has been dropped.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
 /// How long shutdown waits for a recording to be finalized, so a SIGTERM
 /// from systemd is answered well inside its own timeout.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Grace after [`SHUTDOWN_TIMEOUT`]; recovery repairs whatever is left.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
+/// How long shutdown waits for the session lock. A start holds it while
+/// it opens two devices (up to ~5 s each), and must either finish or be
+/// left with a `meeting.json` that recovery picks up.
+const SHUTDOWN_LOCK_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Processing attempts after which recovery stops requeueing a meeting: a
+/// meeting whose processing crashes the daemon would otherwise be retried
+/// on every restart, and systemd restarts it forever.
+const MAX_ATTEMPTS: u32 = 3;
 
 /// Longest error text put in a notification.
 const NOTIFY_ERROR_MAX: usize = 200;
@@ -111,8 +129,72 @@ pub(crate) struct QueuedMeeting {
 /// One track being recorded.
 struct TrackCapture {
     kind: TrackKind,
-    handle: AudioCaptureHandle,
+    /// `None` only in tests, which feed the writer's channel directly.
+    handle: Option<AudioCaptureHandle>,
     writer: JoinHandle<Result<TrackStats>>,
+    /// Set when the writer ended before the meeting was stopped: the device
+    /// stopped delivering audio (unplugged, server restart) or a write failed.
+    ended_early: Arc<AtomicBool>,
+}
+
+impl TrackCapture {
+    fn new(
+        kind: TrackKind,
+        handle: Option<AudioCaptureHandle>,
+        writer: JoinHandle<Result<TrackStats>>,
+    ) -> Self {
+        Self {
+            kind,
+            handle,
+            writer,
+            ended_early: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// What a track is called in notifications and notes.
+fn track_label(kind: TrackKind) -> &'static str {
+    match kind {
+        TrackKind::Mic => "microphone",
+        TrackKind::System => "system audio",
+    }
+}
+
+/// Wrap a track's writer so that its ending before `stopping` is set is
+/// noticed: logged, flagged for the meta, and notified once.
+fn watch_writer(track: &mut TrackCapture, id: &str, stopping: &Arc<AtomicBool>, notify: bool) {
+    let placeholder = tokio::spawn(async { Ok(TrackStats::default()) });
+    let writer = std::mem::replace(&mut track.writer, placeholder);
+    let kind = track.kind;
+    let early = Arc::clone(&track.ended_early);
+    let stopping = Arc::clone(stopping);
+    let id = id.to_string();
+    track.writer = tokio::spawn(async move {
+        let result = match writer.await {
+            Ok(result) => result,
+            Err(e) => Err(anyhow::anyhow!("writer task failed: {e}")),
+        };
+        if !stopping.load(Ordering::Acquire) {
+            early.store(true, Ordering::Release);
+            match &result {
+                Ok(_) => warn!(
+                    "meeting {id}: the {} stopped delivering audio before the meeting was stopped",
+                    track_label(kind)
+                ),
+                Err(e) => warn!(
+                    "meeting {id}: the {} track stopped early: {e:#}",
+                    track_label(kind)
+                ),
+            }
+            if notify {
+                send_notification(
+                    "whisrs",
+                    &format!("Meeting: {} stopped delivering audio", track_label(kind)),
+                );
+            }
+        }
+        result
+    });
 }
 
 /// The meeting being recorded.
@@ -124,6 +206,9 @@ pub(crate) struct MeetingSession {
     tracks: Vec<TrackCapture>,
     /// The max-duration timer, aborted when the meeting stops another way.
     timer: Option<JoinHandle<()>>,
+    /// Set before the captures are stopped, so a writer ending after it is
+    /// a normal end and one ending before it is a device that died.
+    stopping: Arc<AtomicBool>,
 }
 
 /// Meeting state shared by every connection. Deliberately separate from
@@ -134,6 +219,9 @@ pub(crate) struct MeetingRuntime {
     view: std::sync::Mutex<MeetingView>,
     status_tx: watch::Sender<MeetingStatus>,
     queue_tx: mpsc::UnboundedSender<QueuedMeeting>,
+    /// Set by [`shutdown`], so a start queued behind it on the session lock
+    /// does not open devices while the daemon exits.
+    shutting_down: AtomicBool,
 }
 
 impl MeetingRuntime {
@@ -151,6 +239,7 @@ impl MeetingRuntime {
             view: std::sync::Mutex::new(MeetingView::default()),
             status_tx,
             queue_tx,
+            shutting_down: AtomicBool::new(false),
         };
         (runtime, status_rx, queue_rx)
     }
@@ -296,6 +385,16 @@ pub(crate) async fn handle_meeting(
     }
 }
 
+/// Find the system track's source name. Blocking. `None` when the meeting
+/// records the mic only.
+fn resolve_system(system: SystemSource) -> Option<Result<String>> {
+    match system {
+        SystemSource::Off => None,
+        SystemSource::DefaultMonitor => Some(default_monitor_source()),
+        SystemSource::Named(name) => Some(Ok(name)),
+    }
+}
+
 /// Open the mic (required) and the system source (best effort), each with a
 /// writer started as soon as its capture is up so the first-chunk times are
 /// not skewed by the other device's start. Blocking: runs on the blocking
@@ -303,7 +402,7 @@ pub(crate) async fn handle_meeting(
 fn open_tracks(
     dir: &Path,
     mic: &str,
-    system: SystemSource,
+    system: Option<Result<String>>,
 ) -> Result<(Vec<TrackCapture>, Vec<TrackMeta>, Option<String>)> {
     let mut captures = Vec::new();
     let mut metas = Vec::new();
@@ -314,17 +413,11 @@ fn open_tracks(
         .take_receiver()
         .context("mic capture has no receiver")?;
     let writer = spawn_track_writer(rx, store::audio_path(dir, TrackKind::Mic), FLUSH_EVERY);
-    captures.push(TrackCapture {
-        kind: TrackKind::Mic,
-        handle,
-        writer,
-    });
+    captures.push(TrackCapture::new(TrackKind::Mic, Some(handle), writer));
     metas.push(track_meta(TrackKind::Mic, mic.to_string()));
 
-    let system_name = match system {
-        SystemSource::Off => return Ok((captures, metas, None)),
-        SystemSource::DefaultMonitor => default_monitor_source(),
-        SystemSource::Named(name) => Ok(name),
+    let Some(system_name) = system else {
+        return Ok((captures, metas, None));
     };
     // The strict start's errors already name the device.
     let opened =
@@ -336,11 +429,7 @@ fn open_tracks(
                 .context("system capture has no receiver")?;
             let writer =
                 spawn_track_writer(rx, store::audio_path(dir, TrackKind::System), FLUSH_EVERY);
-            captures.push(TrackCapture {
-                kind: TrackKind::System,
-                handle,
-                writer,
-            });
+            captures.push(TrackCapture::new(TrackKind::System, Some(handle), writer));
             metas.push(track_meta(TrackKind::System, name));
             Ok((captures, metas, None))
         }
@@ -350,6 +439,9 @@ fn open_tracks(
 
 async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()> {
     let mut slot = context.meeting.session.lock().await;
+    if context.meeting.shutting_down.load(Ordering::Acquire) {
+        bail!("the daemon is shutting down");
+    }
     if let Some(session) = slot.as_ref() {
         bail!("a meeting is already recording ({})", session.meta.id);
     }
@@ -364,21 +456,41 @@ async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()
 
     let mic = mic_device(&meeting_cfg, &context.config.audio.device);
     let system = system_source(meeting_cfg.system_device.as_deref());
+    let system = tokio::task::spawn_blocking(move || resolve_system(system))
+        .await
+        .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("system source lookup panicked: {e}"))));
+
+    // Written before any audio exists: a crash or SIGTERM while the devices
+    // open leaves a meeting recovery can find, never an orphan audio folder.
+    let mut meta = MeetingMeta::new(id.clone(), title, started_at);
+    meta.tracks = vec![track_meta(TrackKind::Mic, mic.clone())];
+    if let Some(Ok(name)) = &system {
+        meta.tracks
+            .push(track_meta(TrackKind::System, name.clone()));
+    }
+    if let Err(e) = store::write_meta(&dir, &meta) {
+        remove_meeting_dir(&dir).await;
+        return Err(e);
+    }
+
     let started = Instant::now();
     let open_dir = dir.clone();
     let opened = tokio::task::spawn_blocking(move || open_tracks(&open_dir, &mic, system))
         .await
         .context("audio start panicked")
         .and_then(|r| r);
-    let (tracks, track_metas, system_error) = match opened {
+    let (mut tracks, track_metas, system_error) = match opened {
         Ok(opened) => opened,
         Err(e) => {
             remove_meeting_dir(&dir).await;
             return Err(e);
         }
     };
+    let stopping = Arc::new(AtomicBool::new(false));
+    for track in &mut tracks {
+        watch_writer(track, &id, &stopping, context.notify);
+    }
 
-    let mut meta = MeetingMeta::new(id.clone(), title, started_at);
     meta.tracks = track_metas;
     if let Some(e) = &system_error {
         warn!("meeting {id}: system audio unavailable, recording the mic only: {e}");
@@ -387,7 +499,7 @@ async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()
         ));
     }
     if let Err(e) = store::write_meta(&dir, &meta) {
-        drop(finish_tracks(tracks, STOP_TIMEOUT).await);
+        drop(finish_tracks(tracks, &stopping, STOP_TIMEOUT, STOP_GRACE).await);
         remove_meeting_dir(&dir).await;
         return Err(e);
     }
@@ -413,6 +525,7 @@ async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()
         started,
         tracks,
         timer: Some(timer),
+        stopping,
     });
     drop(slot);
     context.meeting.update(|v| v.recording = Some(active));
@@ -435,31 +548,79 @@ async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()
 struct TrackOutcome {
     kind: TrackKind,
     stats: Result<TrackStats, String>,
+    /// The writer was still running after its timeout and grace: its file
+    /// may still change, so nothing may repair or read it yet.
+    stuck: bool,
+    /// The writer ended before the stop (see [`TrackCapture::ended_early`]).
+    ended_early: bool,
 }
 
-/// Stop every capture, then wait (bounded) for each writer to finalize its
-/// WAV. The capture threads are joined on the blocking pool without waiting:
-/// they exit on their own after the stop signal.
-async fn finish_tracks(mut tracks: Vec<TrackCapture>, limit: Duration) -> Vec<TrackOutcome> {
+fn joined(
+    result: Result<Result<TrackStats>, tokio::task::JoinError>,
+) -> Result<TrackStats, String> {
+    match result {
+        Ok(Ok(stats)) => Ok(stats),
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(e) => Err(format!("writer task failed: {e}")),
+    }
+}
+
+/// Mark the meeting as stopping, stop every capture, then wait (bounded)
+/// for each writer to finalize its WAV. A writer that misses `limit` has its
+/// capture dropped, which closes its channel, and gets `grace` more; one
+/// still running after that is reported `stuck`. Capture threads are joined
+/// on the blocking pool without waiting: they exit after the stop signal.
+async fn finish_tracks(
+    mut tracks: Vec<TrackCapture>,
+    stopping: &AtomicBool,
+    limit: Duration,
+    grace: Duration,
+) -> Vec<TrackOutcome> {
+    stopping.store(true, Ordering::Release);
     for track in &mut tracks {
-        track.handle.stop();
+        if let Some(handle) = track.handle.as_mut() {
+            handle.stop();
+        }
     }
     let deadline = tokio::time::Instant::now() + limit;
     let mut outcomes = Vec::new();
     for track in tracks {
         let TrackCapture {
             kind,
-            handle,
-            writer,
+            mut handle,
+            mut writer,
+            ended_early,
         } = track;
-        let stats = match tokio::time::timeout_at(deadline, writer).await {
-            Ok(Ok(Ok(stats))) => Ok(stats),
-            Ok(Ok(Err(e))) => Err(format!("{e:#}")),
-            Ok(Err(e)) => Err(format!("writer task failed: {e}")),
-            Err(_) => Err("the track did not finish writing in time".to_string()),
+        let mut stuck = false;
+        let stats = match tokio::time::timeout_at(deadline, &mut writer).await {
+            Ok(result) => joined(result),
+            Err(_) => {
+                warn!(
+                    "the {} track did not finish writing in {} s; closing its capture",
+                    kind.file_stem(),
+                    limit.as_secs()
+                );
+                if let Some(handle) = handle.take() {
+                    tokio::task::spawn_blocking(move || drop(handle));
+                }
+                match tokio::time::timeout(grace, &mut writer).await {
+                    Ok(result) => joined(result),
+                    Err(_) => {
+                        stuck = true;
+                        Err("the track was still being written after the stop".to_string())
+                    }
+                }
+            }
         };
-        tokio::task::spawn_blocking(move || drop(handle));
-        outcomes.push(TrackOutcome { kind, stats });
+        if let Some(handle) = handle {
+            tokio::task::spawn_blocking(move || drop(handle));
+        }
+        outcomes.push(TrackOutcome {
+            kind,
+            stats,
+            stuck,
+            ended_early: ended_early.load(Ordering::Acquire),
+        });
     }
     outcomes
 }
@@ -468,6 +629,15 @@ async fn finish_tracks(mut tracks: Vec<TrackCapture>, limit: Duration) -> Vec<Tr
 /// note for any track that did not finalize cleanly.
 fn apply_outcomes(meta: &mut MeetingMeta, started: Instant, outcomes: &[TrackOutcome]) {
     for outcome in outcomes {
+        if outcome.ended_early {
+            let note = format!(
+                "The {} stopped delivering audio before the meeting ended",
+                track_label(outcome.kind)
+            );
+            if !meta.errors.contains(&note) {
+                meta.errors.push(note);
+            }
+        }
         let Some(track) = meta.tracks.iter_mut().find(|t| t.kind == outcome.kind) else {
             continue;
         };
@@ -493,9 +663,10 @@ fn end_recording(meta: &mut MeetingMeta, reason: EndReason, ended_at: DateTime<L
 }
 
 /// Finalize a track that a writer could not: fix its header and read the
-/// sample count off the file.
+/// sample count off the file. A stuck writer's file is left alone: it may
+/// still be written to.
 fn repair_unfinished(dir: &Path, meta: &mut MeetingMeta, outcomes: &[TrackOutcome]) {
-    for outcome in outcomes.iter().filter(|o| o.stats.is_err()) {
+    for outcome in outcomes.iter().filter(|o| o.stats.is_err() && !o.stuck) {
         let path = store::audio_path(dir, outcome.kind);
         match repair_wav(&path) {
             Ok(rep) => {
@@ -530,6 +701,7 @@ async fn stop(
         started,
         tracks,
         timer,
+        stopping,
     } = session;
     // The timer is the caller on a max-duration stop: aborting it there
     // would cancel this very stop at its next await.
@@ -539,10 +711,39 @@ async fn stop(
         }
     }
 
-    let outcomes = finish_tracks(tracks, STOP_TIMEOUT).await;
+    let outcomes = finish_tracks(tracks, &stopping, STOP_TIMEOUT, STOP_GRACE).await;
     apply_outcomes(&mut meta, started, &outcomes);
     repair_unfinished(&dir, &mut meta, &outcomes);
     end_recording(&mut meta, reason, Local::now());
+    let stuck: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| o.stuck)
+        .map(|o| track_label(o.kind))
+        .collect();
+    if !stuck.is_empty() {
+        // Processing now would read a file that is still being written.
+        let message = format!(
+            "the {} track was still being written {} s after the stop, so it was not \
+             transcribed; retry with: whisrs meeting retry {}",
+            stuck.join(" and "),
+            (STOP_TIMEOUT + STOP_GRACE).as_secs(),
+            meta.id
+        );
+        meta.status = MeetingState::Failed;
+        meta.error = Some(message.clone());
+        let written = store::write_meta(&dir, &meta);
+        context.meeting.update(|v| v.recording = None);
+        written?;
+        error!("meeting {}: {message}", meta.id);
+        notify(
+            context,
+            &format!(
+                "Meeting stopped but not transcribed: {}",
+                truncate_preview(&message, NOTIFY_ERROR_MAX)
+            ),
+        );
+        bail!(message);
+    }
     let written = store::write_meta(&dir, &meta);
     let active = ActiveMeeting::from_meta(&dir, &meta);
     context.meeting.update(|v| v.recording = None);
@@ -574,7 +775,7 @@ async fn cancel(context: &Arc<DaemonContext>) -> Result<()> {
     if let Some(timer) = &session.timer {
         timer.abort();
     }
-    drop(finish_tracks(session.tracks, STOP_TIMEOUT).await);
+    drop(finish_tracks(session.tracks, &session.stopping, STOP_TIMEOUT, STOP_GRACE).await);
     remove_meeting_dir(&session.dir).await;
     context.meeting.update(|v| v.recording = None);
     info!("meeting {} cancelled and deleted", session.meta.id);
@@ -620,6 +821,8 @@ async fn retry(context: &Arc<DaemonContext>, query: &str) -> Result<()> {
     }
     meta.status = MeetingState::Processing;
     meta.error = None;
+    // A manual retry is a fresh start for the crash-loop guard.
+    meta.attempts = 0;
     store::write_meta(&dir, &meta)?;
     context
         .meeting
@@ -677,6 +880,11 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedMeeting) {
         v.processing = Some(meeting);
     });
 
+    // Counted before the attempt, so one that takes the daemon down with it
+    // still counts towards [`MAX_ATTEMPTS`] at the next start.
+    if let Err(e) = count_attempt(&dir) {
+        error!("failed to record a processing attempt for meeting {id}: {e:#}");
+    }
     let result = process_meeting(
         &dir,
         &context.config,
@@ -709,6 +917,12 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedMeeting) {
     }
     context.meeting.update(|v| v.processing = None);
     sweep(context).await;
+}
+
+fn count_attempt(dir: &Path) -> Result<()> {
+    let mut meta = store::read_meta(dir)?;
+    meta.attempts = meta.attempts.saturating_add(1);
+    store::write_meta(dir, &meta)
 }
 
 fn mark_failed(dir: &Path, message: &str) -> Result<()> {
@@ -752,6 +966,13 @@ fn recover_meta(
     }
     meta.status = MeetingState::Processing;
     meta.error = None;
+    if meta.attempts >= MAX_ATTEMPTS {
+        meta.status = MeetingState::Failed;
+        meta.error = Some(format!(
+            "processing was interrupted {} times; retry with whisrs meeting retry {}",
+            meta.attempts, meta.id
+        ));
+    }
 }
 
 /// Repair an interrupted meeting's WAVs and update its meta. Blocking.
@@ -814,6 +1035,22 @@ pub(crate) async fn recover_on_startup(context: Arc<DaemonContext>) {
 
     // Oldest first, so they are processed in the order they happened.
     for (dir, meta) in recovered.into_iter().rev() {
+        if meta.status == MeetingState::Failed {
+            warn!(
+                "not resuming meeting {}: {}",
+                meta.id,
+                meta.error.as_deref().unwrap_or_default()
+            );
+            notify(
+                &context,
+                &format!(
+                    "Meeting transcription stopped after {} interrupted attempts. \
+                     Retry with: whisrs meeting retry {}",
+                    meta.attempts, meta.id
+                ),
+            );
+            continue;
+        }
         info!(
             "resuming interrupted meeting {} ({:?})",
             meta.id, meta.end_reason
@@ -832,16 +1069,23 @@ pub(crate) async fn recover_on_startup(context: Arc<DaemonContext>) {
 /// `processing` with `end_reason: shutdown`, so the next start transcribes
 /// it. A meeting mid-processing is already `processing` on disk and is
 /// resumed the same way.
+///
+/// A start in progress holds the session lock while its devices open; this
+/// waits for it ([`SHUTDOWN_LOCK_TIMEOUT`]) and then stops what it started.
+/// A start that was waiting behind it on the lock refuses to run.
 pub(crate) async fn shutdown(context: &DaemonContext) {
-    let session = match tokio::time::timeout(SHUTDOWN_TIMEOUT, context.meeting.session.lock()).await
+    context.meeting.shutting_down.store(true, Ordering::Release);
+    let mut slot = match tokio::time::timeout(SHUTDOWN_LOCK_TIMEOUT, context.meeting.session.lock())
+        .await
     {
-        Ok(mut slot) => slot.take(),
+        Ok(slot) => slot,
         Err(_) => {
-            warn!("meeting busy at shutdown; it will be recovered on the next start");
+            // The start wrote meeting.json before opening any device.
+            warn!("a meeting start is still in progress at shutdown; it will be recovered on the next start");
             return;
         }
     };
-    let Some(session) = session else {
+    let Some(session) = slot.take() else {
         return;
     };
     let MeetingSession {
@@ -850,11 +1094,12 @@ pub(crate) async fn shutdown(context: &DaemonContext) {
         started,
         tracks,
         timer,
+        stopping,
     } = session;
     if let Some(timer) = timer {
         timer.abort();
     }
-    let outcomes = finish_tracks(tracks, SHUTDOWN_TIMEOUT).await;
+    let outcomes = finish_tracks(tracks, &stopping, SHUTDOWN_TIMEOUT, SHUTDOWN_GRACE).await;
     apply_outcomes(&mut meta, started, &outcomes);
     end_recording(&mut meta, EndReason::Shutdown, Local::now());
     match store::write_meta(&dir, &meta) {
@@ -864,6 +1109,7 @@ pub(crate) async fn shutdown(context: &DaemonContext) {
         ),
         Err(e) => error!("failed to save meeting {} at shutdown: {e:#}", meta.id),
     }
+    context.meeting.update(|v| v.recording = None);
 }
 
 #[cfg(test)]
@@ -968,10 +1214,14 @@ mod tests {
                     samples: 32_000,
                     first_chunk_at: Some(start + Duration::from_millis(40)),
                 }),
+                stuck: false,
+                ended_early: false,
             },
             TrackOutcome {
                 kind: TrackKind::System,
                 stats: Err("boom".into()),
+                stuck: false,
+                ended_early: false,
             },
         ];
         apply_outcomes(&mut meta, start, &outcomes);
@@ -1170,6 +1420,183 @@ mod tests {
             resp,
             Response::Meeting { meeting } if meeting.phase == MeetingPhase::Idle
         ));
-        // Shutdown with nothing recording is a no-op.
+    }
+
+    fn working_backend() -> Arc<FakeBackend> {
+        Arc::new(FakeBackend {
+            text: "fine",
+            fail: false,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_nothing_recording_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = test_context(tmp.path(), working_backend());
+        tokio::time::timeout(Duration::from_secs(1), shutdown(&context))
+            .await
+            .expect("an idle shutdown returns at once");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        assert!(queue.try_recv().is_err());
+        assert_eq!(context.meeting.status(), MeetingStatus::default());
+        // A start after shutdown began is refused.
+        let err = start(&context, None).await.unwrap_err();
+        assert!(err.to_string().contains("shutting down"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_saves_a_recording_for_the_next_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context(tmp.path(), working_backend());
+        let (id, dir) = store::create(tmp.path(), Local::now(), Some("standup")).unwrap();
+        let mut meta = MeetingMeta::new(id.clone(), Some("standup".into()), Local::now());
+        meta.tracks = vec![track_meta(TrackKind::Mic, "default".into())];
+        store::write_meta(&dir, &meta).unwrap();
+
+        // A track fed by the test instead of a device.
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = spawn_track_writer(rx, store::audio_path(&dir, TrackKind::Mic), FLUSH_EVERY);
+        tx.send(vec![1000i16; 3200]).unwrap();
+        drop(tx);
+        let started = Instant::now();
+        let stopping = Arc::new(AtomicBool::new(false));
+        *context.meeting.session.lock().await = Some(MeetingSession {
+            dir: dir.clone(),
+            meta: meta.clone(),
+            started,
+            tracks: vec![TrackCapture::new(TrackKind::Mic, None, writer)],
+            timer: None,
+            stopping,
+        });
+        context
+            .meeting
+            .update(|v| v.recording = Some(ActiveMeeting::from_meta(&dir, &meta)));
+
+        shutdown(&context).await;
+
+        let saved = store::read_meta(&dir).unwrap();
+        assert_eq!(saved.status, MeetingState::Processing);
+        assert_eq!(saved.end_reason, Some(EndReason::Shutdown));
+        assert!(saved.ended_at.is_some());
+        assert_eq!(saved.tracks[0].samples, 3200);
+        assert!(context.meeting.session.lock().await.is_none());
+        assert_eq!(context.meeting.status().phase, MeetingPhase::Idle);
+        // And the next start picks it up.
+        let interrupted = store::interrupted(tmp.path());
+        assert_eq!(interrupted, vec![dir]);
+    }
+
+    #[tokio::test]
+    async fn repeated_interruptions_end_in_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_meeting(tmp.path());
+        let backend = working_backend();
+        let (context, mut queue) = test_context(tmp.path(), Arc::clone(&backend));
+
+        // Each "crash" is: the worker counts an attempt, then the daemon dies
+        // before finishing; the next start recovers it.
+        for attempt in 1..=MAX_ATTEMPTS {
+            recover_on_startup(Arc::clone(&context)).await;
+            let item = queue.try_recv().expect("requeued while under the limit");
+            context.meeting.update(|v| v.queued.clear());
+            count_attempt(&item.meeting.dir).unwrap();
+            assert_eq!(store::read_meta(&dir).unwrap().attempts, attempt);
+        }
+        recover_on_startup(Arc::clone(&context)).await;
+        assert!(queue.try_recv().is_err(), "not requeued after the limit");
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, MeetingState::Failed);
+        assert_eq!(
+            meta.error.as_deref(),
+            Some(
+                format!(
+                    "processing was interrupted 3 times; retry with whisrs meeting retry {}",
+                    meta.id
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+
+        // A manual retry resets the count and processes it.
+        retry(&context, "last").await.unwrap();
+        assert_eq!(store::read_meta(&dir).unwrap().attempts, 0);
+        process_one(&context, queue.try_recv().unwrap()).await;
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, MeetingState::Done);
+        assert_eq!(meta.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn stuck_writer_is_reported_not_raced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mic.wav");
+        // The test holds the sender: with no capture to drop, the writer
+        // cannot finish.
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = spawn_track_writer(rx, path.clone(), FLUSH_EVERY);
+        let stopping = AtomicBool::new(false);
+        let outcomes = finish_tracks(
+            vec![TrackCapture::new(TrackKind::Mic, None, writer)],
+            &stopping,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(stopping.load(Ordering::Acquire));
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].stuck);
+        assert!(outcomes[0].stats.is_err());
+
+        // repair_unfinished leaves a stuck track's file alone.
+        let mut meta = MeetingMeta::new("m".into(), None, Local::now());
+        meta.tracks = vec![track_meta(TrackKind::Mic, "mic".into())];
+        let before = std::fs::read(&path).unwrap_or_default();
+        repair_unfinished(tmp.path(), &mut meta, &outcomes);
+        assert_eq!(std::fs::read(&path).unwrap_or_default(), before);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_track_that_ends_before_the_stop_is_noted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = spawn_track_writer(rx, tmp.path().join("system.wav"), FLUSH_EVERY);
+        let mut track = TrackCapture::new(TrackKind::System, None, writer);
+        let stopping = Arc::new(AtomicBool::new(false));
+        watch_writer(&mut track, "m", &stopping, false);
+        tx.send(vec![5i16; 1600]).unwrap();
+        // The device goes away mid-meeting.
+        drop(tx);
+        let early = Arc::clone(&track.ended_early);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !early.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "early end never noticed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let outcomes = finish_tracks(vec![track], &stopping, STOP_TIMEOUT, STOP_GRACE).await;
+        assert!(outcomes[0].ended_early);
+        assert!(!outcomes[0].stuck);
+        let mut meta = MeetingMeta::new("m".into(), None, Local::now());
+        meta.tracks = vec![track_meta(TrackKind::System, "sys".into())];
+        apply_outcomes(&mut meta, Instant::now(), &outcomes);
+        assert_eq!(meta.tracks[0].samples, 1600);
+        assert_eq!(
+            meta.errors,
+            ["The system audio stopped delivering audio before the meeting ended"]
+        );
+
+        // A writer that ends after the stop is a normal end.
+        let (tx, rx) = mpsc::unbounded_channel::<whisrs::audio::AudioChunk>();
+        let writer = spawn_track_writer(rx, tmp.path().join("mic.wav"), FLUSH_EVERY);
+        let mut track = TrackCapture::new(TrackKind::Mic, None, writer);
+        let stopping = Arc::new(AtomicBool::new(false));
+        watch_writer(&mut track, "m", &stopping, false);
+        stopping.store(true, Ordering::Release);
+        drop(tx);
+        let outcomes = finish_tracks(vec![track], &stopping, STOP_TIMEOUT, STOP_GRACE).await;
+        assert!(!outcomes[0].ended_early);
     }
 }

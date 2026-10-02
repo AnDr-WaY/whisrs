@@ -11,25 +11,28 @@
 use std::ffi::CStr;
 use std::fs;
 use std::io::Write;
+use std::ops::Range;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context};
-use audio_silence_gate::{audio_gate_reason, SILENCE_RMS_THRESHOLD};
+use audio_silence_gate::{audio_gate_reason, rms_energy, SILENCE_RMS_THRESHOLD};
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::render::render_markdown;
-use super::split::split_at_silence;
+use super::split::{frame_len, split_by_energies};
 use super::store;
 use super::{MeetingMeta, MeetingState, Segment, Speaker, TrackKind, TranscriptSegment};
 use crate::audio::wav::encode_wav;
 use crate::transcription::factory::{
     create_backend_named, meeting_backend_name, meeting_transcription_config,
 };
-use crate::transcription::{TranscriptionBackend, TranscriptionConfig};
+use crate::transcription::{RetryableHttpError, TranscriptionBackend, TranscriptionConfig};
 use crate::{Config, MeetingConfig};
 
 /// Meeting tracks are recorded at this rate (and `encode_wav` writes it).
@@ -40,6 +43,19 @@ const GATE_MIN_MS: u64 = 300;
 
 /// How far apart a mic segment and the system audio it echoes may be.
 pub const ECHO_TOLERANCE_MS: u64 = 1500;
+
+/// Per-chunk results of finished requests, under the meeting folder, so a
+/// retry or a recovery after a crash resumes instead of starting over.
+const CACHE_DIR: &str = ".cache";
+
+/// Longest a single chunk waits out rate limits (429/503) before the
+/// meeting fails; the chunks already done stay cached for a retry.
+const RETRY_BUDGET: Duration = Duration::from_secs(300);
+
+/// First backoff without a `Retry-After`, doubled per attempt up to
+/// [`BACKOFF_MAX`].
+const BACKOFF_BASE: Duration = Duration::from_secs(2);
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Transcribe a stopped meeting and write its transcript.
 ///
@@ -93,6 +109,11 @@ pub async fn process_meeting(
         filler,
     };
 
+    let cache = ChunkCache {
+        dir: dir.join(CACHE_DIR),
+        backend: name.clone(),
+        model: tcfg.model.clone(),
+    };
     let mut mic = Vec::new();
     let mut system = Vec::new();
     let mut readable_tracks = 0usize;
@@ -106,14 +127,17 @@ pub async fn process_meeting(
             }
             continue;
         }
-        let samples = read_track(&path)?;
         readable_tracks += 1;
-        let segments =
-            transcribe_track(backend.as_ref(), &tcfg, &filters, &samples, track.offset_ms)
-                .await
-                .with_context(|| {
-                    format!("failed to transcribe the {} track", track.kind.file_stem())
-                })?;
+        let job = TrackJob {
+            path: &path,
+            kind: track.kind,
+            offset_ms: track.offset_ms,
+        };
+        let segments = transcribe_track(backend.as_ref(), &tcfg, &filters, &cache, &job)
+            .await
+            .with_context(|| {
+                format!("failed to transcribe the {} track", track.kind.file_stem())
+            })?;
         info!(
             "meeting {}: {} track gave {} segment(s)",
             meta.id,
@@ -150,6 +174,7 @@ pub async fn process_meeting(
         render_markdown(&meta).as_bytes(),
     )?;
     store::write_meta(dir, &meta)?;
+    cache.clear();
     Ok(meta)
 }
 
@@ -183,8 +208,8 @@ impl SegmentFilters {
     }
 }
 
-/// Read a 16 kHz mono 16-bit track.
-fn read_track(path: &Path) -> anyhow::Result<Vec<i16>> {
+/// Open a 16 kHz mono 16-bit track.
+fn open_track(path: &Path) -> anyhow::Result<hound::WavReader<std::io::BufReader<fs::File>>> {
     let reader = hound::WavReader::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     let spec = reader.spec();
@@ -197,48 +222,161 @@ fn read_track(path: &Path) -> anyhow::Result<Vec<i16>> {
             spec.bits_per_sample
         );
     }
+    Ok(reader)
+}
+
+/// What one pass over a track learns, without keeping its samples: a
+/// three-hour track is ~350 MB of samples but ~1 MB of frame energies.
+#[derive(Debug, Clone, PartialEq)]
+struct TrackScan {
+    /// Samples in the track.
+    len: usize,
+    /// RMS of the whole track, as [`rms_energy`] computes it.
+    rms: f64,
+    /// RMS of every whole frame ([`frame_len`]), for [`split_by_energies`].
+    energies: Vec<f64>,
+}
+
+impl TrackScan {
+    /// The whole-track check of [`audio_gate_reason`]: nothing to send when
+    /// the track is empty, shorter than [`GATE_MIN_MS`], or silent.
+    fn is_skippable(&self) -> bool {
+        let duration_ms = self.len as u64 * 1000 / SAMPLE_RATE as u64;
+        self.len == 0 || duration_ms < GATE_MIN_MS || self.rms < SILENCE_RMS_THRESHOLD
+    }
+}
+
+/// Read a track once, computing its length and energies. Blocking.
+fn scan_track(path: &Path) -> anyhow::Result<TrackScan> {
+    let mut reader = open_track(path)?;
+    let frame = frame_len(SAMPLE_RATE as usize);
+    let mut buf = Vec::with_capacity(frame);
+    let mut energies = Vec::new();
+    let mut sum_squares = 0.0f64;
+    let mut len = 0usize;
+    for sample in reader.samples::<i16>() {
+        let sample = sample.with_context(|| format!("failed to read {}", path.display()))?;
+        sum_squares += f64::from(sample) * f64::from(sample);
+        len += 1;
+        buf.push(sample);
+        if buf.len() == frame {
+            energies.push(rms_energy(&buf));
+            buf.clear();
+        }
+    }
+    let rms = if len == 0 {
+        0.0
+    } else {
+        (sum_squares / len as f64).sqrt() / f64::from(i16::MAX)
+    };
+    Ok(TrackScan { len, rms, energies })
+}
+
+/// Read samples `range` of a track. Blocking.
+fn read_range(path: &Path, range: Range<usize>) -> anyhow::Result<Vec<i16>> {
+    let mut reader = open_track(path)?;
+    let start = u32::try_from(range.start).context("track too long")?;
     reader
-        .into_samples::<i16>()
+        .seek(start)
+        .with_context(|| format!("failed to seek in {}", path.display()))?;
+    reader
+        .samples::<i16>()
+        .take(range.len())
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("failed to read {}", path.display()))
 }
 
+/// Run a blocking track read off the async runtime.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .context("track read panicked")?
+}
+
+/// The track being transcribed.
+struct TrackJob<'a> {
+    path: &'a Path,
+    kind: TrackKind,
+    offset_ms: i64,
+}
+
 /// Transcribe one track into filtered segments on the meeting timeline.
+///
+/// Peak memory is one chunk: the track is scanned once for its frame
+/// energies, cut by [`split_by_energies`], and each chunk is read from disk
+/// only when it is sent. A chunk already in `cache` is not sent again.
 async fn transcribe_track(
     backend: &dyn TranscriptionBackend,
     tcfg: &TranscriptionConfig,
     filters: &SegmentFilters,
-    samples: &[i16],
-    offset_ms: i64,
+    cache: &ChunkCache,
+    job: &TrackJob<'_>,
 ) -> anyhow::Result<Vec<Segment>> {
-    if audio_gate_reason(samples, SAMPLE_RATE, GATE_MIN_MS, SILENCE_RMS_THRESHOLD).is_some() {
+    let path: PathBuf = job.path.to_path_buf();
+    let scan = {
+        let path = path.clone();
+        blocking(move || scan_track(&path)).await?
+    };
+    if scan.is_skippable() {
         debug!("track is empty or silent; skipping");
         return Ok(Vec::new());
     }
 
     let rate = SAMPLE_RATE as usize;
     let chunks = match backend.max_segment_chunk_secs(tcfg) {
-        Some(secs) => split_at_silence(samples, rate, secs as usize, SILENCE_RMS_THRESHOLD),
-        None => std::iter::once(0..samples.len()).collect(),
+        Some(secs) => split_by_energies(
+            &scan.energies,
+            scan.len,
+            rate,
+            secs as usize,
+            SILENCE_RMS_THRESHOLD,
+        ),
+        None => std::iter::once(0..scan.len).collect(),
     };
+    drop(scan);
 
     let mut out = Vec::new();
     for range in chunks {
-        let chunk = &samples[range.clone()];
-        if let Some(reason) =
-            audio_gate_reason(chunk, SAMPLE_RATE, GATE_MIN_MS, SILENCE_RMS_THRESHOLD)
-        {
-            debug!(
-                "skipping {} chunk at sample {}",
-                reason.as_str(),
-                range.start
-            );
-            continue;
-        }
+        let raw = match cache.load(job.kind, &range) {
+            Some(segments) => {
+                debug!(
+                    "reusing cached {} chunk {}..{}",
+                    job.kind.file_stem(),
+                    range.start,
+                    range.end
+                );
+                segments
+            }
+            None => {
+                let chunk = {
+                    let path = path.clone();
+                    let range = range.clone();
+                    blocking(move || read_range(&path, range)).await?
+                };
+                if let Some(reason) =
+                    audio_gate_reason(&chunk, SAMPLE_RATE, GATE_MIN_MS, SILENCE_RMS_THRESHOLD)
+                {
+                    debug!(
+                        "skipping {} chunk at sample {}",
+                        reason.as_str(),
+                        range.start
+                    );
+                    continue;
+                }
+                let wav = encode_wav(&chunk)?;
+                drop(chunk);
+                let transcript = transcribe_with_retry(backend, &wav, tcfg).await?;
+                if let Err(e) = cache.store(job.kind, &range, &transcript.segments) {
+                    warn!("could not cache a transcribed chunk: {e:#}");
+                }
+                transcript.segments
+            }
+        };
         let chunk_ms = (range.start as u64 * 1000 / SAMPLE_RATE as u64) as i64;
-        let wav = encode_wav(chunk)?;
-        let transcript = backend.transcribe_segments(&wav, tcfg).await?;
-        for seg in transcript.segments {
+        let offset_ms = job.offset_ms;
+        for seg in raw {
             let Some(text) = filters.apply(&seg.text) else {
                 continue;
             };
@@ -262,6 +400,130 @@ async fn transcribe_track(
         }
     }
     Ok(out)
+}
+
+/// How long to wait before retrying a rate-limited (429) or overloaded
+/// (503) request, or `None` to give up. Honors the server's `Retry-After`;
+/// otherwise backs off exponentially from [`BACKOFF_BASE`] to
+/// [`BACKOFF_MAX`]. Gives up once the wait would push the chunk's total past
+/// `budget`.
+fn backoff_delay(
+    attempt: u32,
+    retry_after: Option<Duration>,
+    waited: Duration,
+    budget: Duration,
+) -> Option<Duration> {
+    let exponential = BACKOFF_BASE
+        .saturating_mul(1u32 << attempt.min(16))
+        .min(BACKOFF_MAX);
+    // A zero `Retry-After` still gets a short pause, so a confused server
+    // cannot make this spin.
+    let delay = retry_after.map_or(exponential, |d| d.max(Duration::from_millis(500)));
+    (waited.saturating_add(delay) <= budget).then_some(delay)
+}
+
+/// Transcribe one chunk, waiting out rate limits within [`RETRY_BUDGET`].
+async fn transcribe_with_retry(
+    backend: &dyn TranscriptionBackend,
+    wav: &[u8],
+    tcfg: &TranscriptionConfig,
+) -> anyhow::Result<crate::transcription::Transcript> {
+    let mut attempt = 0u32;
+    let mut waited = Duration::ZERO;
+    loop {
+        let err = match backend.transcribe_segments(wav, tcfg).await {
+            Ok(transcript) => return Ok(transcript),
+            Err(e) => e,
+        };
+        let Some(retryable) = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<RetryableHttpError>())
+            .cloned()
+        else {
+            return Err(err);
+        };
+        match backoff_delay(attempt, retryable.retry_after, waited, RETRY_BUDGET) {
+            Some(delay) => {
+                info!(
+                    "meeting transcription got HTTP {}; retrying in {:.1} s",
+                    retryable.status,
+                    delay.as_secs_f64()
+                );
+                tokio::time::sleep(delay).await;
+                waited += delay;
+                attempt += 1;
+            }
+            None => {
+                return Err(err.context(format!(
+                    "the backend still answered HTTP {} after {} s of retries; \
+                     the finished parts are saved, so a later retry resumes",
+                    retryable.status,
+                    waited.as_secs()
+                )))
+            }
+        }
+    }
+}
+
+/// The raw segments of one finished chunk, as cached on disk.
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedChunk {
+    backend: String,
+    model: String,
+    segments: Vec<Segment>,
+}
+
+/// Cache of finished chunks for one meeting and backend. Entries hold the
+/// backend's segments before filtering, relative to the chunk, so a config
+/// change to the filters still applies on reuse. A different backend or
+/// model ignores them.
+struct ChunkCache {
+    dir: PathBuf,
+    backend: String,
+    model: String,
+}
+
+impl ChunkCache {
+    fn path(&self, kind: TrackKind, range: &Range<usize>) -> PathBuf {
+        self.dir.join(format!(
+            "{}-{}-{}.json",
+            kind.file_stem(),
+            range.start,
+            range.end
+        ))
+    }
+
+    fn load(&self, kind: TrackKind, range: &Range<usize>) -> Option<Vec<Segment>> {
+        let data = fs::read(self.path(kind, range)).ok()?;
+        let cached: CachedChunk = serde_json::from_slice(&data).ok()?;
+        (cached.backend == self.backend && cached.model == self.model).then_some(cached.segments)
+    }
+
+    fn store(
+        &self,
+        kind: TrackKind,
+        range: &Range<usize>,
+        segments: &[Segment],
+    ) -> anyhow::Result<()> {
+        fs::create_dir_all(&self.dir)
+            .with_context(|| format!("failed to create {}", self.dir.display()))?;
+        fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
+        let cached = CachedChunk {
+            backend: self.backend.clone(),
+            model: self.model.clone(),
+            segments: segments.to_vec(),
+        };
+        write_private(&self.path(kind, range), &serde_json::to_vec(&cached)?)
+    }
+
+    /// Drop the cache once the transcript is written.
+    fn clear(&self) {
+        match fs::remove_dir_all(&self.dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("failed to delete {}: {e}", self.dir.display()),
+        }
+    }
 }
 
 /// Drop mic segments that are the system audio leaking into the microphone.
@@ -382,7 +644,9 @@ fn gecos_full_name(gecos: &str) -> Option<String> {
 
 /// Write a file atomically with mode 0600, like `meeting.json`.
 fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    let tmp = path.with_extension("md.tmp");
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
     {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -414,14 +678,29 @@ mod tests {
         texts: Vec<(i16, &'static str)>,
         chunk_secs: Option<u32>,
         calls: AtomicUsize,
+        /// Calls with this index or later fail (a dead network).
+        fail_from: Option<usize>,
+        /// The first this many calls answer HTTP 429.
+        rate_limited: usize,
     }
 
     impl FakeBackend {
         fn new(texts: &[(i16, &'static str)], chunk_secs: Option<u32>) -> Arc<Self> {
+            Self::with_failures(texts, chunk_secs, None, 0)
+        }
+
+        fn with_failures(
+            texts: &[(i16, &'static str)],
+            chunk_secs: Option<u32>,
+            fail_from: Option<usize>,
+            rate_limited: usize,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 texts: texts.to_vec(),
                 chunk_secs,
                 calls: AtomicUsize::new(0),
+                fail_from,
+                rate_limited,
             })
         }
     }
@@ -443,7 +722,18 @@ mod tests {
             audio: &[u8],
             _config: &TranscriptionConfig,
         ) -> anyhow::Result<Transcript> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call < self.rate_limited {
+                return Err(RetryableHttpError {
+                    status: 429,
+                    retry_after: Some(Duration::from_secs(7)),
+                    message: "slow down".into(),
+                }
+                .into());
+            }
+            if self.fail_from.is_some_and(|n| call >= n) {
+                bail!("network is down");
+            }
             let samples = crate::transcription::decode_wav_samples(audio)?;
             let frame = RATE / 10;
             let mut segments = Vec::new();
@@ -698,6 +988,176 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("batch backend"), "{err}");
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn finished_chunks_are_cached_and_reused_on_retry() {
+        let texts = [(3000, "first"), (4000, "second"), (5000, "third")];
+        let samples = track(
+            27.0,
+            &[(2.0, 1.0, 3000), (12.0, 1.0, 4000), (22.0, 1.0, 5000)],
+        );
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(samples))]);
+
+        // The third chunk's request fails: the first two are cached.
+        let failing = FakeBackend::with_failures(&texts, Some(10), Some(2), 0);
+        let err = process_meeting(
+            tmp.path(),
+            &config(),
+            Some(failing.clone() as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("network is down"), "{err:#}");
+        let cache_dir = tmp.path().join(CACHE_DIR);
+        assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 2);
+        let entry = fs::read_dir(&cache_dir).unwrap().next().unwrap().unwrap();
+        assert_eq!(
+            entry.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // The retry sends only the chunk that failed.
+        let working = FakeBackend::new(&texts, Some(10));
+        let meta = run(tmp.path(), working.clone()).await;
+        assert_eq!(working.calls.load(Ordering::Relaxed), 1);
+        let texts: Vec<_> = meta.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
+        assert!(!cache_dir.exists(), "the cache is dropped once done");
+    }
+
+    #[test]
+    fn cache_ignores_another_backend_or_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = |backend: &str, model: &str| ChunkCache {
+            dir: tmp.path().join(CACHE_DIR),
+            backend: backend.into(),
+            model: model.into(),
+        };
+        let segments = vec![seg(0, 1000, "hi")];
+        cache("groq", "m1")
+            .store(TrackKind::System, &(0..16_000), &segments)
+            .unwrap();
+        assert_eq!(
+            cache("groq", "m1").load(TrackKind::System, &(0..16_000)),
+            Some(segments)
+        );
+        assert_eq!(
+            cache("openai", "m1").load(TrackKind::System, &(0..16_000)),
+            None
+        );
+        assert_eq!(
+            cache("groq", "m2").load(TrackKind::System, &(0..16_000)),
+            None
+        );
+        assert_eq!(cache("groq", "m1").load(TrackKind::Mic, &(0..16_000)), None);
+        assert_eq!(
+            cache("groq", "m1").load(TrackKind::System, &(0..8_000)),
+            None
+        );
+    }
+
+    #[test]
+    fn backoff_honors_retry_after_and_the_budget() {
+        let budget = Duration::from_secs(300);
+        // Exponential without a Retry-After, capped.
+        assert_eq!(
+            backoff_delay(0, None, Duration::ZERO, budget),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            backoff_delay(3, None, Duration::ZERO, budget),
+            Some(Duration::from_secs(16))
+        );
+        assert_eq!(
+            backoff_delay(30, None, Duration::ZERO, budget),
+            Some(BACKOFF_MAX)
+        );
+        // The server's wait wins, even when longer than the backoff.
+        assert_eq!(
+            backoff_delay(0, Some(Duration::from_secs(90)), Duration::ZERO, budget),
+            Some(Duration::from_secs(90))
+        );
+        // A zero Retry-After still pauses.
+        assert_eq!(
+            backoff_delay(0, Some(Duration::ZERO), Duration::ZERO, budget),
+            Some(Duration::from_millis(500))
+        );
+        // Past the budget: give up.
+        assert_eq!(
+            backoff_delay(
+                0,
+                Some(Duration::from_secs(61)),
+                Duration::from_secs(240),
+                budget
+            ),
+            None
+        );
+        assert_eq!(
+            backoff_delay(0, None, Duration::from_secs(299), budget),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limits_are_waited_out() {
+        let backend = FakeBackend::with_failures(&[(3000, "patience")], None, None, 2);
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
+        let started = tokio::time::Instant::now();
+        let meta = run(tmp.path(), backend.clone()).await;
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(meta.segments[0].text, "patience");
+        // Two 7 s Retry-After waits on the paused clock.
+        assert!(started.elapsed() >= Duration::from_secs(14));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn endless_rate_limits_fail_with_a_clear_error() {
+        let backend = FakeBackend::with_failures(&[(3000, "never")], None, None, usize::MAX);
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
+        let err = process_meeting(
+            tmp.path(),
+            &config(),
+            Some(backend as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("HTTP 429") && text.contains("slow down"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn streamed_scan_splits_like_the_in_memory_track() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mic.wav");
+        let mut samples = track(
+            95.0,
+            &[
+                (1.0, 9.0, 3000),
+                (12.0, 20.0, 2000),
+                (40.0, 30.0, 4000),
+                (75.0, 15.0, 600),
+            ],
+        );
+        samples.extend([9i16; 123]); // a partial last frame
+        write_wav(&path, &samples);
+
+        let scan = scan_track(&path).unwrap();
+        assert_eq!(scan.len, samples.len());
+        assert_eq!(scan.rms, rms_energy(&samples));
+        for cap in [10, 25, 60] {
+            let expected =
+                crate::meeting::split::split_at_silence(&samples, RATE, cap, SILENCE_RMS_THRESHOLD);
+            let ranges =
+                split_by_energies(&scan.energies, scan.len, RATE, cap, SILENCE_RMS_THRESHOLD);
+            assert_eq!(ranges, expected, "cap {cap}");
+            for r in ranges {
+                assert_eq!(read_range(&path, r.clone()).unwrap(), samples[r]);
+            }
+        }
     }
 
     fn seg(start_ms: u64, end_ms: u64, text: &str) -> Segment {
