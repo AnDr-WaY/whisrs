@@ -54,6 +54,32 @@ impl Drop for AudioCaptureHandle {
     }
 }
 
+/// How a capture resolves its device name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureMode {
+    /// Dictation: `[audio] device`, an unknown name falls back to the default.
+    Dictation,
+    /// A meeting track: an unknown name is an error.
+    Strict,
+}
+
+impl CaptureMode {
+    fn resolve(self, device: &str) -> anyhow::Result<ResolvedInput> {
+        match self {
+            Self::Dictation => device::resolve_input(device),
+            Self::Strict => device::resolve_input_strict(device),
+        }
+    }
+
+    /// What to suggest when a named device misbehaves.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Dictation => "set [audio] device = \"default\"",
+            Self::Strict => "check the [meeting] mic_device and system_device settings",
+        }
+    }
+}
+
 impl AudioCaptureHandle {
     /// Start capturing from `device` (the `[audio] device` value) and
     /// optionally publish a normalized volume level.
@@ -63,6 +89,22 @@ impl AudioCaptureHandle {
     pub fn start_with_level_tx(
         device: &str,
         level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    ) -> anyhow::Result<Self> {
+        Self::start(device, level_tx, CaptureMode::Dictation)
+    }
+
+    /// Start capturing a meeting track from `device`: a PulseAudio source
+    /// (such as [`device::default_monitor_source`]), an ALSA PCM, or
+    /// `"default"`. Unlike [`Self::start_with_level_tx`] an unknown name is
+    /// an error, never the default input, and no level is published.
+    pub fn start_strict(device: &str) -> anyhow::Result<Self> {
+        Self::start(device, None, CaptureMode::Strict)
+    }
+
+    fn start(
+        device: &str,
+        level_tx: Option<tokio::sync::watch::Sender<f32>>,
+        mode: CaptureMode,
     ) -> anyhow::Result<Self> {
         let device_name = device.to_string();
         let device = device_name.clone();
@@ -76,7 +118,7 @@ impl AudioCaptureHandle {
         let thread_handle = std::thread::Builder::new()
             .name("whisrs-audio".into())
             .spawn(move || {
-                run_capture(&device, tx, stop_clone, init_tx, level_tx);
+                run_capture(&device, tx, stop_clone, init_tx, level_tx, mode);
             })
             .context("failed to spawn audio capture thread")?;
 
@@ -92,7 +134,7 @@ impl AudioCaptureHandle {
                 // once cpal returns, and nothing here ever joins it.
                 stop_signal.store(true, Ordering::Release);
                 drop(thread_handle);
-                return Err(start_timeout_error(&device_name));
+                return Err(start_timeout_error(&device_name, mode));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("audio capture thread exited unexpectedly")
@@ -149,7 +191,7 @@ impl AudioCaptureHandle {
 }
 
 /// The error for a device that did not start within [`START_TIMEOUT`].
-fn start_timeout_error(device: &str) -> anyhow::Error {
+fn start_timeout_error(device: &str, mode: CaptureMode) -> anyhow::Error {
     let secs = START_TIMEOUT.as_secs();
     if device::is_default_name(device) {
         anyhow::anyhow!(
@@ -158,9 +200,9 @@ fn start_timeout_error(device: &str) -> anyhow::Error {
         )
     } else {
         anyhow::anyhow!(
-            "audio device {} did not start within {secs}s; \
-             set [audio] device = \"default\"",
-            device.trim()
+            "audio device {} did not start within {secs}s; {}",
+            device.trim(),
+            mode.hint()
         )
     }
 }
@@ -195,8 +237,9 @@ fn run_capture(
     stop_signal: Arc<AtomicBool>,
     init_tx: std::sync::mpsc::Sender<anyhow::Result<()>>,
     level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    mode: CaptureMode,
 ) {
-    let result = setup_and_run(device, tx, stop_signal, &init_tx, level_tx);
+    let result = setup_and_run(device, tx, stop_signal, &init_tx, level_tx, mode);
     if let Err(e) = result {
         // If init_tx hasn't been used yet, send the error.
         init_tx.send(Err(e)).ok();
@@ -209,12 +252,13 @@ fn setup_and_run(
     stop_signal: Arc<AtomicBool>,
     init_tx: &std::sync::mpsc::Sender<anyhow::Result<()>>,
     level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    mode: CaptureMode,
 ) -> anyhow::Result<()> {
     // Non-empty chunks delivered so far.
     let chunks = Arc::new(AtomicU64::new(0));
-    let resolved = device::resolve_input(device_name)?;
+    let resolved = mode.resolve(device_name)?;
     let cached_pulse_host = resolved.cached_pulse_host;
-    let (stream, device, source) = match build_and_play(resolved, &tx, &level_tx, &chunks) {
+    let (stream, device, source) = match build_and_play(resolved, &tx, &level_tx, &chunks, mode) {
         Ok(opened) => opened,
         Err(e) if cached_pulse_host && device::is_host_level_error(&e) => {
             // The cached PulseAudio connection is stale (the server
@@ -224,8 +268,8 @@ fn setup_and_run(
                 "opening input on the cached PulseAudio connection failed ({e:#}), reconnecting"
             );
             device::invalidate_pulse_host();
-            let resolved = device::resolve_input(device_name)?;
-            build_and_play(resolved, &tx, &level_tx, &chunks)?
+            let resolved = mode.resolve(device_name)?;
+            build_and_play(resolved, &tx, &level_tx, &chunks, mode)?
         }
         Err(e) => return Err(e),
     };
@@ -248,7 +292,7 @@ fn setup_and_run(
         if watchdog_armed && started.elapsed() >= FIRST_CHUNK_TIMEOUT {
             watchdog_armed = false;
             if chunks.load(Ordering::Acquire) == 0 {
-                warn_no_audio(&device, &source);
+                warn_no_audio(&device, &source, mode);
             }
         }
     }
@@ -266,13 +310,13 @@ fn setup_and_run(
 /// A stream that started but has delivered nothing. A stalled PulseAudio
 /// source never gets here (its `play()` blocks until the first data, which
 /// [`START_TIMEOUT`] reports), so this is about the device itself.
-fn warn_no_audio(device: &str, source: &InputSource) {
+fn warn_no_audio(device: &str, source: &InputSource, mode: CaptureMode) {
     let secs = FIRST_CHUNK_TIMEOUT.as_secs();
     match source {
         InputSource::Named(..) => warn!(
             "no audio from input device {device} ({source}) {secs} s after starting; \
-             check that the device is connected and not muted, or set \
-             [audio] device = \"default\""
+             check that the device is connected and not muted, or {}",
+            mode.hint()
         ),
         _ => warn!(
             "no audio from input device {device} ({source}) {secs} s after starting; \
@@ -287,6 +331,7 @@ fn build_and_play(
     tx: &mpsc::UnboundedSender<AudioChunk>,
     level_tx: &Option<tokio::sync::watch::Sender<f32>>,
     chunks: &Arc<AtomicU64>,
+    mode: CaptureMode,
 ) -> anyhow::Result<(cpal::Stream, String, InputSource)> {
     let device = resolved.device;
     let device_label = device.to_string();
@@ -364,12 +409,13 @@ fn build_and_play(
     let stream = stream.map_err(|e| match resolved.build_timeout {
         // cpal gave up waiting on the server (a hung PulseAudio).
         Some(limit) if build_started.elapsed() >= limit => anyhow::Error::new(e).context(format!(
-            "audio device {} did not start within {}s; set [audio] device = \"default\"",
+            "audio device {} did not start within {}s; {}",
             match &resolved.source {
                 InputSource::Named(_, id) => id.as_str(),
                 _ => device_label.as_str(),
             },
-            limit.as_secs()
+            limit.as_secs(),
+            mode.hint()
         )),
         _ => anyhow::Error::new(e).context("failed to build audio input stream"),
     })?;
@@ -436,6 +482,23 @@ mod tests {
             &InputSource::Named(DeviceHost::PulseAudio, "x".into()),
             fixed
         ));
+    }
+
+    #[test]
+    fn dictation_hint_is_unchanged() {
+        // The dictation messages predate meeting mode; keep their wording.
+        assert_eq!(
+            CaptureMode::Dictation.hint(),
+            "set [audio] device = \"default\""
+        );
+        let msg = start_timeout_error("usb-mic", CaptureMode::Dictation).to_string();
+        assert_eq!(
+            msg,
+            "audio device usb-mic did not start within 5s; set [audio] device = \"default\""
+        );
+        let msg = start_timeout_error("x.monitor", CaptureMode::Strict).to_string();
+        assert!(msg.contains("[meeting]"), "{msg}");
+        assert!(!msg.contains("[audio]"), "{msg}");
     }
 
     #[test]

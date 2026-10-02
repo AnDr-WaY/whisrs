@@ -380,60 +380,128 @@ pub fn resolve_input_for_diagnostics(name: &str) -> anyhow::Result<ResolvedInput
     resolve(name, Lookup::Diagnostic)
 }
 
-fn resolve(name: &str, lookup: Lookup) -> anyhow::Result<ResolvedInput> {
-    if !is_default_name(name) {
-        let (mut candidates, cached_pulse_host) = pulse_input_devices(lookup);
-        let infos = |c: &[(InputDeviceInfo, cpal::Device)]| -> Vec<InputDeviceInfo> {
-            c.iter().map(|(info, _)| info.clone()).collect()
-        };
-        let mut found =
-            match_device(name, &infos(&candidates)).map(|index| candidates.swap_remove(index));
-        if found.is_none() {
-            if let Ok(host) = alsa_host() {
-                candidates.extend(alsa_input_devices(&host));
-                found = match_device(name, &infos(&candidates))
-                    .map(|index| candidates.swap_remove(index))
-                    .or_else(|| alsa_device_by_name(&host, name.trim()));
-            }
-        }
-        if let Some((info, device)) = found {
-            let (buffer_size, build_timeout) = match info.host {
-                DeviceHost::PulseAudio => (
-                    BufferSize::Fixed(PULSE_INPUT_FRAMES),
-                    Some(PULSE_BUILD_TIMEOUT),
-                ),
-                DeviceHost::Alsa => (BufferSize::Fixed(ALSA_DEFAULT_INPUT_FRAMES), None),
-            };
-            *WARNED_UNKNOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            return Ok(ResolvedInput {
-                device,
-                buffer_size,
-                build_timeout,
-                cached_pulse_host: cached_pulse_host && info.host == DeviceHost::PulseAudio,
-                source: InputSource::Named(info.host, info.id),
-            });
-        }
+/// Resolve a meeting track's device with no fallback: an unknown name is an
+/// error listing the valid names, where [`resolve_input`] would record from
+/// the default input instead. `"default"` (or empty) is the ALSA default
+/// input, as for dictation. Unlike [`resolve_input`] it never touches the
+/// unknown-name warning state, so dictation still warns on its own.
+pub fn resolve_input_strict(name: &str) -> anyhow::Result<ResolvedInput> {
+    if is_default_name(name) {
+        return default_input(InputSource::Default);
+    }
+    let named = lookup_named(name, Lookup::Capture);
+    match named.found {
+        Some((info, device)) => Ok(named_input(info, device, named.cached_pulse_host)),
+        None => Err(unknown_device_error(name, &named.candidates)),
+    }
+}
 
-        let mut warned = WARNED_UNKNOWN.lock().unwrap_or_else(|e| e.into_inner());
-        if should_warn_unknown(&mut warned, name, lookup) {
-            let pulse: Vec<&str> = candidates
-                .iter()
-                .filter(|(i, _)| i.host == DeviceHost::PulseAudio)
-                .map(|(i, _)| i.id.as_str())
-                .collect();
-            let names = if pulse.is_empty() {
-                candidates.iter().map(|(i, _)| i.id.as_str()).collect()
-            } else {
-                pulse
-            };
-            warn!(
-                "[audio] device \"{name}\" not found, using the system default. \
-                 Valid names: {} (or an ALSA PCM name from `arecord -L`)",
-                names.join(", ")
-            );
+/// The monitor source of the default output device, i.e. what the speakers
+/// are playing: the PulseAudio default sink's name plus `.monitor`, checked
+/// to exist. Returns the bare source name, for [`resolve_input_strict`].
+pub fn default_monitor_source() -> anyhow::Result<String> {
+    let (host, cached) = pulse_host(Lookup::Capture).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no PulseAudio server reachable (PipeWire needs pipewire-pulse), \
+             so system audio cannot be recorded"
+        )
+    })?;
+    let sink = match host.default_output_device() {
+        Some(sink) => sink,
+        // A cached connection can outlive a restarted server: reconnect once.
+        None if cached => {
+            debug!("no default sink on the cached PulseAudio connection, reconnecting");
+            invalidate_pulse_host();
+            let (host, _) = pulse_host(Lookup::Capture)
+                .ok_or_else(|| anyhow::anyhow!("PulseAudio server went away"))?;
+            return monitor_of_default_sink(&host);
+        }
+        None => anyhow::bail!("the PulseAudio server reports no default output device"),
+    };
+    monitor_of(&host, &sink)
+}
+
+fn monitor_of_default_sink(host: &cpal::Host) -> anyhow::Result<String> {
+    let sink = host
+        .default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("the PulseAudio server reports no default output device"))?;
+    monitor_of(host, &sink)
+}
+
+fn monitor_of(host: &cpal::Host, sink: &cpal::Device) -> anyhow::Result<String> {
+    let sink_id = sink
+        .id()
+        .map_err(|e| anyhow::anyhow!("cannot read the default output device name: {e}"))?;
+    let monitor = monitor_name(sink_id.id());
+    match host.device_by_id(&DeviceId::new(HostId::PulseAudio, monitor.as_str())) {
+        Some(device) if device.supports_input() => Ok(monitor),
+        _ => anyhow::bail!(
+            "the default output device {} has no monitor source ({monitor} not found)",
+            sink_id.id()
+        ),
+    }
+}
+
+/// The PulseAudio monitor source name for a sink.
+fn monitor_name(sink: &str) -> String {
+    format!("{sink}.monitor")
+}
+
+/// The outcome of looking a device name up on both hosts.
+struct NamedLookup {
+    found: Option<(InputDeviceInfo, cpal::Device)>,
+    /// Every candidate listed while searching, for the error message.
+    candidates: Vec<InputDeviceInfo>,
+    /// The PulseAudio candidates came from the cached connection.
+    cached_pulse_host: bool,
+}
+
+/// Look `name` up among PulseAudio sources, then ALSA PCMs (listed, then
+/// opened by name).
+fn lookup_named(name: &str, lookup: Lookup) -> NamedLookup {
+    let (mut candidates, cached_pulse_host) = pulse_input_devices(lookup);
+    let infos = |c: &[(InputDeviceInfo, cpal::Device)]| -> Vec<InputDeviceInfo> {
+        c.iter().map(|(info, _)| info.clone()).collect()
+    };
+    let mut found =
+        match_device(name, &infos(&candidates)).map(|index| candidates.swap_remove(index));
+    if found.is_none() {
+        if let Ok(host) = alsa_host() {
+            candidates.extend(alsa_input_devices(&host));
+            found = match_device(name, &infos(&candidates))
+                .map(|index| candidates.swap_remove(index))
+                .or_else(|| alsa_device_by_name(&host, name.trim()));
         }
     }
+    NamedLookup {
+        found,
+        candidates: infos(&candidates),
+        cached_pulse_host,
+    }
+}
 
+fn named_input(
+    info: InputDeviceInfo,
+    device: cpal::Device,
+    cached_pulse_host: bool,
+) -> ResolvedInput {
+    let (buffer_size, build_timeout) = match info.host {
+        DeviceHost::PulseAudio => (
+            BufferSize::Fixed(PULSE_INPUT_FRAMES),
+            Some(PULSE_BUILD_TIMEOUT),
+        ),
+        DeviceHost::Alsa => (BufferSize::Fixed(ALSA_DEFAULT_INPUT_FRAMES), None),
+    };
+    ResolvedInput {
+        device,
+        buffer_size,
+        build_timeout,
+        cached_pulse_host: cached_pulse_host && info.host == DeviceHost::PulseAudio,
+        source: InputSource::Named(info.host, info.id),
+    }
+}
+
+fn default_input(source: InputSource) -> anyhow::Result<ResolvedInput> {
     let device = alsa_host()?
         .default_input_device()
         .ok_or_else(|| anyhow::anyhow!("no default audio input device found"))?;
@@ -442,12 +510,59 @@ fn resolve(name: &str, lookup: Lookup) -> anyhow::Result<ResolvedInput> {
         buffer_size: BufferSize::Fixed(ALSA_DEFAULT_INPUT_FRAMES),
         build_timeout: None,
         cached_pulse_host: false,
-        source: if is_default_name(name) {
-            InputSource::Default
-        } else {
-            InputSource::Fallback
-        },
+        source,
     })
+}
+
+/// The names to suggest for an unknown device: PulseAudio sources when there
+/// are any, else everything listed.
+fn valid_names(candidates: &[InputDeviceInfo]) -> Vec<&str> {
+    let pulse: Vec<&str> = candidates
+        .iter()
+        .filter(|i| i.host == DeviceHost::PulseAudio)
+        .map(|i| i.id.as_str())
+        .collect();
+    if pulse.is_empty() {
+        candidates.iter().map(|i| i.id.as_str()).collect()
+    } else {
+        pulse
+    }
+}
+
+/// The error for a strict lookup that matched nothing.
+fn unknown_device_error(name: &str, candidates: &[InputDeviceInfo]) -> anyhow::Error {
+    let names = valid_names(candidates);
+    let valid = if names.is_empty() {
+        "no input devices were listed; use an ALSA PCM name from `arecord -L`".to_string()
+    } else {
+        format!(
+            "Valid names: {} (or an ALSA PCM name from `arecord -L`)",
+            names.join(", ")
+        )
+    };
+    anyhow::anyhow!("audio device \"{}\" not found. {valid}", name.trim())
+}
+
+fn resolve(name: &str, lookup: Lookup) -> anyhow::Result<ResolvedInput> {
+    if is_default_name(name) {
+        return default_input(InputSource::Default);
+    }
+    let named = lookup_named(name, lookup);
+    if let Some((info, device)) = named.found {
+        *WARNED_UNKNOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return Ok(named_input(info, device, named.cached_pulse_host));
+    }
+
+    let mut warned = WARNED_UNKNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if should_warn_unknown(&mut warned, name, lookup) {
+        warn!(
+            "[audio] device \"{name}\" not found, using the system default. \
+             Valid names: {} (or an ALSA PCM name from `arecord -L`)",
+            valid_names(&named.candidates).join(", ")
+        );
+    }
+    drop(warned);
+    default_input(InputSource::Fallback)
 }
 
 #[cfg(test)]
@@ -633,6 +748,54 @@ mod tests {
         .context("failed to build audio input stream");
         assert!(!is_host_level_error(&err));
         assert!(!is_host_level_error(&anyhow::anyhow!("plain")));
+    }
+
+    #[test]
+    fn strict_unknown_name_is_an_error_listing_pulse_names() {
+        let list = candidates();
+        // The matcher finds nothing, and the strict path turns that into an
+        // error rather than a fallback.
+        assert_eq!(match_device("bogus-mic", &list), None);
+        let msg = unknown_device_error(" bogus-mic ", &list).to_string();
+        assert!(msg.contains("\"bogus-mic\" not found"), "{msg}");
+        assert!(
+            msg.contains("alsa_input.usb-mic, alsa_output.speaker.monitor, shared, other"),
+            "{msg}"
+        );
+        // ALSA names are suggested only when PulseAudio listed nothing.
+        assert!(!msg.contains("pipewire"), "{msg}");
+    }
+
+    #[test]
+    fn strict_unknown_name_lists_alsa_without_pulse() {
+        let list: Vec<_> = candidates()
+            .into_iter()
+            .filter(|c| c.host == DeviceHost::Alsa)
+            .collect();
+        let msg = unknown_device_error("bogus", &list).to_string();
+        assert!(
+            msg.contains("pipewire, sysdefault:CARD=sofhdadsp, shared"),
+            "{msg}"
+        );
+        let msg = unknown_device_error("bogus", &[]).to_string();
+        assert!(msg.contains("no input devices were listed"), "{msg}");
+    }
+
+    #[test]
+    fn strict_known_names_resolve_named() {
+        let list = candidates();
+        let i = match_device("alsa_output.speaker.monitor", &list).unwrap();
+        assert!(list[i].is_monitor());
+        let i = match_device("Monitor of Speaker", &list).unwrap();
+        assert_eq!(list[i].id, "alsa_output.speaker.monitor");
+    }
+
+    #[test]
+    fn monitor_name_appends_suffix() {
+        assert_eq!(
+            monitor_name("alsa_output.pci-0000_00_1f.3.analog-stereo"),
+            "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
+        );
     }
 
     #[test]
