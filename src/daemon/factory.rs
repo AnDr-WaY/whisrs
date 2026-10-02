@@ -351,6 +351,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: Default::default(),
+            meeting: None,
             overlay: None,
             tts: None,
         }
@@ -492,6 +493,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: Default::default(),
+            meeting: None,
             overlay: None,
             tts: None,
         };

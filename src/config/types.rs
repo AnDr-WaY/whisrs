@@ -67,6 +67,64 @@ pub struct Config {
     /// [`crate::replacements`]. Empty by default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub replacements: BTreeMap<String, String>,
+    /// Meeting mode: record mic + system audio, transcribe into a transcript.
+    #[serde(default)]
+    pub meeting: Option<MeetingConfig>,
+}
+
+/// Meeting mode configuration (`[meeting]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeetingConfig {
+    /// Transcription backend for meetings. `None` uses `general.backend`.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Name used for the "me" speaker. `None` uses the passwd full name, else `$USER`.
+    #[serde(default)]
+    pub user_name: Option<String>,
+    /// Microphone device. `None` uses `[audio] device`.
+    #[serde(default)]
+    pub mic_device: Option<String>,
+    /// System audio source. `None`/`"default"` = default monitor, `"none"` = mic only.
+    #[serde(default)]
+    pub system_device: Option<String>,
+    /// Recording stops automatically after this many minutes.
+    #[serde(default = "default_meeting_max_duration_minutes")]
+    pub max_duration_minutes: u32,
+    /// Days to keep audio of processed meetings (0 = delete right away, negative = keep forever).
+    #[serde(default = "default_meeting_audio_retention_days")]
+    pub audio_retention_days: i64,
+    /// Meetings directory. `None` = `$XDG_DATA_HOME/whisrs/meetings`.
+    #[serde(default)]
+    pub dir: Option<String>,
+}
+
+fn default_meeting_max_duration_minutes() -> u32 {
+    180
+}
+
+fn default_meeting_audio_retention_days() -> i64 {
+    7
+}
+
+impl Default for MeetingConfig {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            user_name: None,
+            mic_device: None,
+            system_device: None,
+            max_duration_minutes: default_meeting_max_duration_minutes(),
+            audio_retention_days: default_meeting_audio_retention_days(),
+            dir: None,
+        }
+    }
+}
+
+impl MeetingConfig {
+    /// The effective meeting config: `[meeting]` if present, else defaults.
+    pub fn effective(config: &Config) -> MeetingConfig {
+        config.meeting.clone().unwrap_or_default()
+    }
 }
 
 /// Global hotkey configuration — key combos that trigger actions.
@@ -3398,6 +3456,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
         };
         let err = config.validate().unwrap_err();
@@ -3514,6 +3573,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
         };
         let err = config.validate().unwrap_err();
@@ -3546,6 +3606,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
         };
         let result = config.validate();
@@ -3581,6 +3642,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
         };
         let warnings = config.validate().unwrap();
@@ -3624,6 +3686,7 @@ mod tests {
                 hooks: None,
                 llm_commands: Vec::new(),
                 replacements: BTreeMap::new(),
+                meeting: None,
                 overlay: None,
             };
             let warnings = config.validate().unwrap();
@@ -3703,6 +3766,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
         }
     }
@@ -3927,6 +3991,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
         };
 
@@ -4190,6 +4255,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
         };
         let warnings = config.validate().unwrap();
@@ -4247,6 +4313,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         };
@@ -4282,6 +4349,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         };
@@ -4318,6 +4386,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         };
@@ -4354,6 +4423,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         };
@@ -4390,6 +4460,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         };
@@ -4423,6 +4494,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         };
@@ -4498,6 +4570,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         };
@@ -4539,6 +4612,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         };
@@ -4582,6 +4656,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         };
@@ -4650,6 +4725,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         };
@@ -4706,6 +4782,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            meeting: None,
             overlay: None,
             tts: None,
         }

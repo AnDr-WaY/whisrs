@@ -186,6 +186,7 @@ fn default_config() -> Config {
         overlay: None,
         llm_commands: Vec::new(),
         replacements: Default::default(),
+        meeting: None,
     }
 }
 

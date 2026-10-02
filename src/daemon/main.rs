@@ -296,6 +296,10 @@ async fn handle_command(
             handle_set_llm_instruction(daemon_state, context, name).await
         }
         Command::Speak => handle_speak(daemon_state, context).await,
+        // TODO(#174 lane C): replace with the meeting handler.
+        Command::Meeting { .. } => Response::Error {
+            message: "meeting mode is not wired yet".to_string(),
+        },
     }
 }
 

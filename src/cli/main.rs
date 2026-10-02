@@ -296,6 +296,10 @@ async fn send_command(cmd: Command) -> anyhow::Result<()> {
                 print_history(&entries, use_color);
             }
         }
+        // TODO(#174 lane D1): proper meeting status output.
+        Response::Meeting { meeting } => {
+            println!("meeting: {:?}", meeting.phase);
+        }
         Response::Error { message } => {
             if use_color {
                 eprintln!("{RED}error:{RESET} {message}");

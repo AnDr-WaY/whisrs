@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::history;
+use crate::meeting::{MeetingAction, MeetingStatus};
 
 // ---------------------------------------------------------------------------
 // IPC protocol
@@ -51,6 +52,16 @@ pub enum Command {
     /// stops any in-progress playback.
     #[serde(alias = "read")]
     Speak,
+    /// Meeting mode: record mic + system audio, then transcribe.
+    /// `title` names a new meeting (`start`/`toggle`); `id` selects an
+    /// existing one (`retry`/`copy`).
+    Meeting {
+        action: MeetingAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 }
 
 fn default_log_limit() -> usize {
@@ -61,9 +72,19 @@ fn default_log_limit() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum Response {
-    Ok { state: State },
-    Error { message: String },
-    History { entries: Vec<history::HistoryEntry> },
+    Ok {
+        state: State,
+    },
+    Error {
+        message: String,
+    },
+    History {
+        entries: Vec<history::HistoryEntry>,
+    },
+    /// Meeting status after a `meeting` command.
+    Meeting {
+        meeting: MeetingStatus,
+    },
 }
 
 /// Daemon state.
@@ -468,5 +489,68 @@ mod tests {
         );
         let parsed: Command = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Command::SetLlmInstruction { name } if name == "translate-de"));
+    }
+    #[test]
+    fn meeting_command_wire_format() {
+        let cmd = Command::Meeting {
+            action: MeetingAction::Start,
+            title: Some("x".to_string()),
+            id: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"cmd":"meeting","action":"start","title":"x"}"#);
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Command::Meeting { action: MeetingAction::Start, title: Some(t), id: None } if t == "x"
+        ));
+    }
+
+    #[test]
+    fn meeting_command_without_options() {
+        let parsed: Command =
+            serde_json::from_str(r#"{"cmd":"meeting","action":"toggle"}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            Command::Meeting {
+                action: MeetingAction::Toggle,
+                title: None,
+                id: None
+            }
+        ));
+        let cmd = Command::Meeting {
+            action: MeetingAction::Retry,
+            title: None,
+            id: Some("last".to_string()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"cmd":"meeting","action":"retry","id":"last"}"#);
+    }
+
+    #[test]
+    fn meeting_response_roundtrip() {
+        let status = MeetingStatus {
+            phase: crate::meeting::MeetingPhase::Recording,
+            id: Some("2026-10-02_1400_standup".to_string()),
+            title: Some("standup".to_string()),
+            started_at: Some(chrono::Local::now()),
+            dir: Some(PathBuf::from("/tmp/m")),
+            queued: vec!["2026-10-01_0900".to_string()],
+        };
+        let resp = Response::Meeting {
+            meeting: status.clone(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.starts_with(r#"{"status":"meeting","meeting":{"phase":"recording""#));
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::Meeting { meeting } => assert_eq!(meeting, status),
+            other => panic!("expected meeting response, got {other:?}"),
+        }
+        let idle: Response =
+            serde_json::from_str(r#"{"status":"meeting","meeting":{"phase":"idle"}}"#).unwrap();
+        assert!(
+            matches!(idle, Response::Meeting { meeting } if meeting == MeetingStatus::default())
+        );
     }
 }
