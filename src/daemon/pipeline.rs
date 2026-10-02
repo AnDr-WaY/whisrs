@@ -1893,6 +1893,7 @@ mod tests {
             state_tx: tokio::sync::watch::channel(State::Idle).0,
             overlay_level_tx: None,
             overlay_enabled: false,
+            meeting: crate::meeting::MeetingRuntime::new().0,
         }
     }
 

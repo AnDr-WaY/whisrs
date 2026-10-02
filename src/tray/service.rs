@@ -402,12 +402,18 @@ fn restart_daemon(notify: Option<NotifyFn>) {
     });
 }
 
-/// Quit from the tray menu, mirroring the daemon's SIGINT handler:
-/// remove the IPC socket, then exit cleanly.
+/// Quit from the tray menu by sending the daemon SIGTERM, so it takes the
+/// same shutdown path as `systemctl stop`: a recording meeting is finalized
+/// and the IPC socket removed before the process exits.
 fn quit_daemon() {
     info!("tray: quit requested, shutting down");
-    let _ = std::fs::remove_file(crate::socket_path());
-    std::process::exit(0);
+    // SAFETY: kill(2) on our own pid has no memory-safety preconditions.
+    let rc = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+    if rc != 0 {
+        // No handler could run; fall back to the old immediate exit.
+        let _ = std::fs::remove_file(crate::socket_path());
+        std::process::exit(0);
+    }
 }
 
 /// Maximum number of attempts to connect to the SNI tray host.

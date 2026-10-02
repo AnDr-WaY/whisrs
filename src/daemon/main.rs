@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
@@ -18,6 +19,7 @@ mod factory;
 #[cfg(feature = "hooks")]
 mod hooks;
 mod injection;
+mod meeting;
 mod notify;
 mod pipeline;
 mod selection;
@@ -29,6 +31,7 @@ use crate::context::{DaemonContext, DaemonState};
 use crate::dictation::{handle_cancel, handle_toggle};
 use crate::factory::create_backend;
 use crate::injection::{prime_modifier_probe, warm_keyboard};
+use crate::meeting::{handle_meeting, MeetingRuntime};
 use crate::notify::send_notification;
 use crate::speak::handle_speak;
 #[cfg(feature = "hooks")]
@@ -119,6 +122,9 @@ async fn main() -> Result<()> {
     // State broadcast channel — consumed by system tray and overlay.
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Idle);
     let (overlay_level_tx, overlay_level_rx) = tokio::sync::watch::channel(0.0_f32);
+    // Meeting status has its own channel, read by the tray only: a meeting
+    // must not animate the overlay or fire the recording hooks.
+    let (meeting_runtime, meeting_rx, meeting_queue_rx) = MeetingRuntime::new();
 
     let tray_enabled = config.general.tray;
     let overlay_enabled = config.general.overlay;
@@ -131,7 +137,18 @@ async fn main() -> Result<()> {
         state_tx,
         overlay_level_tx: overlay_enabled.then_some(overlay_level_tx),
         overlay_enabled,
+        meeting: meeting_runtime,
     });
+
+    // Meeting processing runs on its own task, one meeting at a time, so a
+    // long transcription never holds up IPC or dictation. Recovery of
+    // meetings a crash or shutdown interrupted is spawned too, so the socket
+    // comes up without waiting for WAV repair.
+    tokio::spawn(crate::meeting::run_worker(
+        Arc::clone(&context),
+        meeting_queue_rx,
+    ));
+    tokio::spawn(crate::meeting::recover_on_startup(Arc::clone(&context)));
 
     let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
 
@@ -166,6 +183,7 @@ async fn main() -> Result<()> {
             .then_some(send_notification as whisrs::tray::NotifyFn);
         tokio::spawn(whisrs::tray::spawn_tray(
             state_rx.clone(),
+            meeting_rx,
             cmd_tx.clone(),
             tray_notify,
         ));
@@ -204,10 +222,20 @@ async fn main() -> Result<()> {
     let listener = UnixListener::bind(&sock_path).context("failed to bind Unix socket")?;
     info!("listening on {}", sock_path.display());
 
+    // SIGTERM (systemd stop/restart, tray Quit) and SIGINT both finalize a
+    // recording meeting before exiting, so it is transcribed on the next start.
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
     let sock_path_clone = sock_path.clone();
+    let shutdown_ctx = Arc::clone(&context);
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("received SIGINT, shutting down");
+        let name = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+        };
+        info!("received {name}, shutting down");
+        crate::meeting::shutdown(&shutdown_ctx).await;
         let _ = std::fs::remove_file(&sock_path_clone);
         std::process::exit(0);
     });
@@ -296,10 +324,7 @@ async fn handle_command(
             handle_set_llm_instruction(daemon_state, context, name).await
         }
         Command::Speak => handle_speak(daemon_state, context).await,
-        // TODO(#174 lane C): replace with the meeting handler.
-        Command::Meeting { .. } => Response::Error {
-            message: "meeting mode is not wired yet".to_string(),
-        },
+        Command::Meeting { action, title, id } => handle_meeting(context, action, title, id).await,
     }
 }
 

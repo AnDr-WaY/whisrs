@@ -146,6 +146,14 @@ pub fn render_markdown(meta: &MeetingMeta) -> String {
             turn.text
         ));
     }
+    // Non-fatal recording notes, e.g. system audio that could not be opened.
+    if !meta.errors.is_empty() {
+        out.push_str("## Notes\n\n");
+        for note in &meta.errors {
+            out.push_str(&format!("- {}\n", note.trim()));
+        }
+        out.push('\n');
+    }
     if out.ends_with("\n\n") {
         out.pop();
     }
