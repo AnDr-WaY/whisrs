@@ -237,10 +237,13 @@ async fn main() -> Result<()> {
     // meetings a crash or shutdown interrupted is spawned too, so the socket
     // serves without waiting for WAV repair. Commands that queued a meeting
     // before this wait in the channel.
-    tokio::spawn(crate::meeting::run_worker(
+    let worker = tokio::spawn(crate::meeting::run_worker(
         Arc::clone(&context),
         meeting_queue_rx,
     ));
+    // Shutdown aborts it, so a SIGTERM mid-transcription is not counted as
+    // a crashed attempt.
+    context.meeting.set_worker(worker);
     tokio::spawn(crate::meeting::recover_on_startup(Arc::clone(&context)));
 
     // SIGTERM (systemd stop/restart, tray Quit) and SIGINT both finalize a

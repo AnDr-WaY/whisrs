@@ -18,6 +18,12 @@ use super::{MeetingMeta, MeetingState, TrackKind};
 const META_FILE: &str = "meeting.json";
 const META_TMP: &str = ".meeting.json.tmp";
 const AUDIO_DIR: &str = "audio";
+
+/// Per-chunk results of finished requests, under the meeting folder, so a
+/// retry or a recovery after a crash resumes instead of starting over.
+/// Dropped once the transcript is written; a failed meeting keeps it until
+/// its audio is deleted, since a retry needs both.
+pub const CACHE_DIR: &str = ".cache";
 const SLUG_MAX: usize = 40;
 
 /// The default meetings root, ignoring any `[meeting] dir` override.
@@ -282,6 +288,13 @@ pub fn sweep_retention(root: &Path, days: i64, now: DateTime<Local>) -> Vec<Path
                 warn!("failed to delete {}: {e}", audio.display());
                 continue;
             }
+        }
+        // A done meeting has no cache left; this is for completeness.
+        let cache = dir.join(CACHE_DIR);
+        match fs::remove_dir_all(&cache) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => warn!("failed to delete {}: {e}", cache.display()),
         }
         meta.audio_deleted = true;
         if let Err(e) = write_meta(&dir, &meta) {

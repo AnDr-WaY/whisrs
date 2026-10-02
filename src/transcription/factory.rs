@@ -111,17 +111,23 @@ fn asr_sidecar_backend(config: &Config) -> AsrSidecarBackend {
 /// `WHISRS_ASR_SIDECAR_API_KEY` in the shell running the tests cannot change
 /// what they assert.
 fn asr_sidecar_backend_from(env_key: Option<&str>, config: &Config) -> AsrSidecarBackend {
-    let url = config
-        .asr_sidecar
-        .as_ref()
-        .map(|v| v.url.clone())
-        .unwrap_or_else(|| "http://127.0.0.1:8765/transcribe".to_string());
+    let url = asr_sidecar_url(config);
     let api_key = resolve_asr_sidecar_api_key_from(env_key, config);
     if api_key.is_some() {
         info!("ASR sidecar API key configured");
     }
     info!("using ASR sidecar transcription backend ({url})");
     AsrSidecarBackend::new(url, api_key)
+}
+
+/// The sidecar endpoint: `[asr-sidecar] url`, or the default when the
+/// section is absent.
+fn asr_sidecar_url(config: &Config) -> String {
+    config
+        .asr_sidecar
+        .as_ref()
+        .map(|v| v.url.clone())
+        .unwrap_or_else(|| "http://127.0.0.1:8765/transcribe".to_string())
 }
 
 /// Build the OpenAI Realtime backend described by `config`.
@@ -333,6 +339,35 @@ pub fn model_for_backend(name: &str, config: &Config) -> String {
             .map(|v| v.model.clone())
             .unwrap_or_else(|| "microsoft/VibeVoice-ASR-HF".to_string()),
         _ => "whisper-large-v3-turbo".to_string(),
+    }
+}
+
+/// The canonical name of a backend: aliases resolve to the name they stand
+/// for (`local` is `local-whisper`; `asr` and `vibevoice` are
+/// `asr-sidecar`), every other name is returned as is.
+pub fn canonical_backend_name(name: &str) -> &str {
+    match name {
+        "local" => "local-whisper",
+        "asr" | "vibevoice" => "asr-sidecar",
+        other => other,
+    }
+}
+
+/// What decides backend `name`'s output beyond its [`TranscriptionConfig`]:
+/// the model file and phrase settings for local whisper, the endpoint for
+/// the ASR sidecar. Empty for cloud backends, whose model is in the request.
+/// Meetings key their chunk cache on it, so changing it re-transcribes.
+pub fn backend_identity(name: &str, config: &Config) -> String {
+    match canonical_backend_name(name) {
+        "local-whisper" => {
+            let settings = local_whisper_settings(config);
+            format!(
+                "model_path={}\nsegmentation={}\nphrase_silence_ms={}",
+                settings.model_path, settings.segmentation, settings.phrase_silence_ms
+            )
+        }
+        "asr-sidecar" => format!("url={}", asr_sidecar_url(config)),
+        _ => String::new(),
     }
 }
 

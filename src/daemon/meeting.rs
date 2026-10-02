@@ -55,6 +55,13 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// left with a `meeting.json` that recovery picks up.
 const SHUTDOWN_LOCK_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// How long shutdown waits for the aborted processing worker to unwind.
+const WORKER_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Size of the header the track writer (`hound`, 16-bit mono PCM) writes
+/// before any sample; a track no longer than this holds no audio.
+const WAV_HEADER_LEN: u64 = 44;
+
 /// Processing attempts after which recovery stops requeueing a meeting: a
 /// meeting whose processing crashes the daemon would otherwise be retried
 /// on every restart, and systemd restarts it forever.
@@ -222,6 +229,12 @@ pub(crate) struct MeetingRuntime {
     /// Set by [`shutdown`], so a start queued behind it on the session lock
     /// does not open devices while the daemon exits.
     shutting_down: AtomicBool,
+    /// The [`run_worker`] task, aborted by [`shutdown`] so an interrupted
+    /// transcription does not count as a crashed attempt.
+    worker: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The folder of a start in progress, so a shutdown that cannot wait for
+    /// the start can still tell whether it recorded anything.
+    starting: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl MeetingRuntime {
@@ -240,8 +253,15 @@ impl MeetingRuntime {
             status_tx,
             queue_tx,
             shutting_down: AtomicBool::new(false),
+            worker: std::sync::Mutex::new(None),
+            starting: std::sync::Mutex::new(None),
         };
         (runtime, status_rx, queue_rx)
+    }
+
+    /// Hand over the [`run_worker`] task, for [`shutdown`] to abort.
+    pub(crate) fn set_worker(&self, worker: JoinHandle<()>) {
+        *self.worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
     }
 
     fn status(&self) -> MeetingStatus {
@@ -263,20 +283,52 @@ impl MeetingRuntime {
     /// Queue a meeting for processing, refusing one that is already queued
     /// or being processed.
     fn enqueue(&self, meeting: ActiveMeeting) -> Result<()> {
-        {
-            let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-            if view.is_pending(&meeting.id) {
-                bail!("meeting {} is already queued for transcription", meeting.id);
-            }
-            view.queued.push(meeting.clone());
+        self.reserve(&meeting)?;
+        self.dispatch(meeting)
+    }
+
+    /// Claim a place in the queue, refusing a meeting that is already queued
+    /// or being processed. The check and the claim are one step, so two
+    /// retries of one meeting cannot both pass. Follow with [`Self::dispatch`]
+    /// or [`Self::unreserve`].
+    fn reserve(&self, meeting: &ActiveMeeting) -> Result<()> {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if view.is_pending(&meeting.id) {
+            bail!("meeting {} is already queued for transcription", meeting.id);
         }
+        view.queued.push(meeting.clone());
+        Ok(())
+    }
+
+    fn unreserve(&self, id: &str) {
+        self.update(|v| v.queued.retain(|q| q.id != id));
+    }
+
+    /// Hand a reserved meeting to the worker.
+    fn dispatch(&self, meeting: ActiveMeeting) -> Result<()> {
         let id = meeting.id.clone();
         if self.queue_tx.send(QueuedMeeting { meeting }).is_err() {
-            self.update(|v| v.queued.retain(|q| q.id != id));
+            self.unreserve(&id);
             bail!("the meeting processing worker is not running");
         }
         self.update(|_| {});
         Ok(())
+    }
+}
+
+/// Clears [`MeetingRuntime::starting`] however a start returns.
+struct StartingGuard<'a>(&'a MeetingRuntime);
+
+impl<'a> StartingGuard<'a> {
+    fn new(runtime: &'a MeetingRuntime, dir: &Path) -> Self {
+        *runtime.starting.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.to_path_buf());
+        Self(runtime)
+    }
+}
+
+impl Drop for StartingGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.starting.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -453,6 +505,7 @@ async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()
         .filter(|t| !t.is_empty());
     let started_at = Local::now();
     let (id, dir) = store::create(&root, started_at, title.as_deref())?;
+    let _starting = StartingGuard::new(&context.meeting, &dir);
 
     let mic = mic_device(&meeting_cfg, &context.config.audio.device);
     let system = system_source(meeting_cfg.system_device.as_deref());
@@ -723,8 +776,8 @@ async fn stop(
     if !stuck.is_empty() {
         // Processing now would read a file that is still being written.
         let message = format!(
-            "the {} track was still being written {} s after the stop, so it was not \
-             transcribed; retry with: whisrs meeting retry {}",
+            "meeting stopped but not transcribed: the {} track was still being written {} s \
+             after the stop; retry with: whisrs meeting retry {}",
             stuck.join(" and "),
             (STOP_TIMEOUT + STOP_GRACE).as_secs(),
             meta.id
@@ -735,13 +788,8 @@ async fn stop(
         context.meeting.update(|v| v.recording = None);
         written?;
         error!("meeting {}: {message}", meta.id);
-        notify(
-            context,
-            &format!(
-                "Meeting stopped but not transcribed: {}",
-                truncate_preview(&message, NOTIFY_ERROR_MAX)
-            ),
-        );
+        // No notification here: the error goes back to the caller, and the
+        // hotkey and tray path notifies it, so one stop gives one toast.
         bail!(message);
     }
     let written = store::write_meta(&dir, &meta);
@@ -802,7 +850,7 @@ fn has_audio(dir: &Path, meta: &MeetingMeta) -> bool {
 async fn retry(context: &Arc<DaemonContext>, query: &str) -> Result<()> {
     let root = meetings_root(&context.config);
     let dir = store::resolve(&root, query)?;
-    let mut meta = store::read_meta(&dir)?;
+    let meta = store::read_meta(&dir)?;
     let recording_id = context
         .meeting
         .session
@@ -819,14 +867,23 @@ async fn retry(context: &Arc<DaemonContext>, query: &str) -> Result<()> {
             meta.id
         );
     }
-    meta.status = MeetingState::Processing;
-    meta.error = None;
-    // A manual retry is a fresh start for the crash-loop guard.
-    meta.attempts = 0;
-    store::write_meta(&dir, &meta)?;
-    context
-        .meeting
-        .enqueue(ActiveMeeting::from_meta(&dir, &meta))?;
+    // Claimed before the meta is touched: a retry of a meeting that is
+    // queued or being processed must not rewrite it under the worker.
+    let active = ActiveMeeting::from_meta(&dir, &meta);
+    context.meeting.reserve(&active)?;
+    // Repair both tracks first (cheap and idempotent: a crash leftover may
+    // still have stale headers), then mark it `processing`. A manual retry
+    // is a fresh start for the crash-loop guard.
+    let repair_dir = dir.clone();
+    let prepared = tokio::task::spawn_blocking(move || recover_dir(&repair_dir, true))
+        .await
+        .context("meeting repair panicked")
+        .and_then(|r| r);
+    if let Err(e) = prepared {
+        context.meeting.unreserve(&meta.id);
+        return Err(e);
+    }
+    context.meeting.dispatch(active)?;
     info!("meeting {} queued for transcription again", meta.id);
     Ok(())
 }
@@ -881,7 +938,8 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedMeeting) {
     });
 
     // Counted before the attempt, so one that takes the daemon down with it
-    // still counts towards [`MAX_ATTEMPTS`] at the next start.
+    // still counts towards [`MAX_ATTEMPTS`] at the next start. A graceful
+    // shutdown gives it back ([`stop_worker`]).
     if let Err(e) = count_attempt(&dir) {
         error!("failed to record a processing attempt for meeting {id}: {e:#}");
     }
@@ -976,8 +1034,12 @@ fn recover_meta(
 }
 
 /// Repair an interrupted meeting's WAVs and update its meta. Blocking.
-fn recover_dir(dir: &Path) -> Result<MeetingMeta> {
+/// `reset_attempts` (a manual retry) zeroes the crash-loop count first.
+fn recover_dir(dir: &Path, reset_attempts: bool) -> Result<MeetingMeta> {
     let mut meta = store::read_meta(dir)?;
+    if reset_attempts {
+        meta.attempts = 0;
+    }
     let mut repaired = Vec::new();
     let mut newest: Option<std::time::SystemTime> = None;
     if !meta.audio_deleted {
@@ -1017,11 +1079,24 @@ fn recover_dir(dir: &Path) -> Result<MeetingMeta> {
 /// IPC server comes up without waiting for it.
 pub(crate) async fn recover_on_startup(context: Arc<DaemonContext>) {
     let root = meetings_root(&context.config);
-    let scan_root = root.clone();
+    // Listed under the session lock: a start in progress finishes first and
+    // its meeting is skipped below, and one that begins after the listing
+    // creates a folder the listing does not have. Recovering it would repair
+    // and requeue a recording that is still being written.
+    let (interrupted, recording) = {
+        let slot = context.meeting.session.lock().await;
+        let recording = slot.as_ref().map(|s| s.dir.clone());
+        let scan_root = root.clone();
+        let interrupted = tokio::task::spawn_blocking(move || store::interrupted(&scan_root))
+            .await
+            .unwrap_or_default();
+        (interrupted, recording)
+    };
     let recovered = tokio::task::spawn_blocking(move || {
-        store::interrupted(&scan_root)
+        interrupted
             .into_iter()
-            .filter_map(|dir| match recover_dir(&dir) {
+            .filter(|dir| recording.as_ref() != Some(dir))
+            .filter_map(|dir| match recover_dir(&dir, false) {
                 Ok(meta) => Some((dir, meta)),
                 Err(e) => {
                     warn!("failed to recover meeting {}: {e:#}", dir.display());
@@ -1075,16 +1150,15 @@ pub(crate) async fn recover_on_startup(context: Arc<DaemonContext>) {
 /// A start that was waiting behind it on the lock refuses to run.
 pub(crate) async fn shutdown(context: &DaemonContext) {
     context.meeting.shutting_down.store(true, Ordering::Release);
-    let mut slot = match tokio::time::timeout(SHUTDOWN_LOCK_TIMEOUT, context.meeting.session.lock())
-        .await
-    {
-        Ok(slot) => slot,
-        Err(_) => {
-            // The start wrote meeting.json before opening any device.
-            warn!("a meeting start is still in progress at shutdown; it will be recovered on the next start");
-            return;
-        }
-    };
+    stop_worker(&context.meeting).await;
+    let mut slot =
+        match tokio::time::timeout(SHUTDOWN_LOCK_TIMEOUT, context.meeting.session.lock()).await {
+            Ok(slot) => slot,
+            Err(_) => {
+                abandon_start(&context.meeting).await;
+                return;
+            }
+        };
     let Some(session) = slot.take() else {
         return;
     };
@@ -1110,6 +1184,92 @@ pub(crate) async fn shutdown(context: &DaemonContext) {
         Err(e) => error!("failed to save meeting {} at shutdown: {e:#}", meta.id),
     }
     context.meeting.update(|v| v.recording = None);
+}
+
+/// Abort the processing worker, so an interrupted transcription is resumed
+/// on the next start without counting as a crashed attempt: the attempt it
+/// counted up front ([`process_one`]) is given back once the task is gone.
+async fn stop_worker(runtime: &MeetingRuntime) {
+    let worker = runtime
+        .worker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let Some(worker) = worker else {
+        return;
+    };
+    worker.abort();
+    if tokio::time::timeout(WORKER_ABORT_TIMEOUT, worker)
+        .await
+        .is_err()
+    {
+        // Still running: giving the attempt back could race its writes.
+        warn!("the meeting processing worker did not stop in time");
+        return;
+    }
+    // Read only now, with the task gone, so the view is final.
+    let processing = runtime
+        .view
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .processing
+        .as_ref()
+        .map(|p| (p.id.clone(), p.dir.clone()));
+    let Some((id, dir)) = processing else {
+        return;
+    };
+    match tokio::task::spawn_blocking(move || uncount_attempt(&dir)).await {
+        Ok(Ok(true)) => info!(
+            "meeting {id}: transcription interrupted by shutdown; it resumes on the next start"
+        ),
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => warn!("meeting {id}: failed to give back the interrupted attempt: {e:#}"),
+        Err(e) => warn!("meeting {id}: attempt bookkeeping panicked: {e}"),
+    }
+}
+
+/// Undo [`count_attempt`] for a meeting a shutdown interrupted. Only a
+/// meeting still `processing` is touched: one that finished or failed
+/// before the abort keeps its count. Blocking.
+fn uncount_attempt(dir: &Path) -> Result<bool> {
+    let mut meta = store::read_meta(dir)?;
+    if meta.status != MeetingState::Processing || meta.attempts == 0 {
+        return Ok(false);
+    }
+    meta.attempts = meta.attempts.saturating_sub(1);
+    store::write_meta(dir, &meta)?;
+    Ok(true)
+}
+
+/// Whether any track of the meeting in `dir` holds a sample on disk.
+fn has_audio_frames(dir: &Path) -> bool {
+    [TrackKind::Mic, TrackKind::System].iter().any(|kind| {
+        std::fs::metadata(store::audio_path(dir, *kind)).is_ok_and(|m| m.len() > WAV_HEADER_LEN)
+    })
+}
+
+/// Shutdown could not wait for a start still opening its devices. With no
+/// audio written yet there is nothing to transcribe, so its folder is
+/// deleted instead of being left for recovery to fail on; with audio, the
+/// `meeting.json` the start wrote first lets the next start recover it.
+async fn abandon_start(runtime: &MeetingRuntime) {
+    let starting = runtime
+        .starting
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match starting {
+        Some(dir) if !has_audio_frames(&dir) => {
+            warn!(
+                "a meeting start was still opening devices at shutdown; deleting {} (no audio yet)",
+                dir.display()
+            );
+            remove_meeting_dir(&dir).await;
+        }
+        _ => warn!(
+            "a meeting start is still in progress at shutdown; it will be recovered on the next start"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1302,7 +1462,7 @@ mod tests {
 
     fn test_context(
         root: &Path,
-        backend: Arc<FakeBackend>,
+        backend: Arc<dyn TranscriptionBackend>,
     ) -> (Arc<DaemonContext>, mpsc::UnboundedReceiver<QueuedMeeting>) {
         let config: Config = toml::from_str(&format!(
             "[general]\nbackend = \"groq\"\n[meeting]\nuser_name = \"Tester\"\ndir = \"{}\"\n",
@@ -1352,7 +1512,7 @@ mod tests {
             fail: false,
             calls: AtomicUsize::new(0),
         });
-        let (context, mut queue) = test_context(tmp.path(), Arc::clone(&backend));
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
 
         recover_on_startup(Arc::clone(&context)).await;
         let meta = store::read_meta(&dir).unwrap();
@@ -1492,7 +1652,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = crashed_meeting(tmp.path());
         let backend = working_backend();
-        let (context, mut queue) = test_context(tmp.path(), Arc::clone(&backend));
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
 
         // Each "crash" is: the worker counts an attempt, then the daemon dies
         // before finishing; the next start recovers it.
@@ -1598,5 +1758,154 @@ mod tests {
         drop(tx);
         let outcomes = finish_tracks(vec![track], &stopping, STOP_TIMEOUT, STOP_GRACE).await;
         assert!(!outcomes[0].ended_early);
+    }
+
+    /// A backend whose requests never finish, like a long transcription.
+    struct HangingBackend;
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for HangingBackend {
+        async fn transcribe(&self, _audio: &[u8], _config: &TranscriptionConfig) -> Result<String> {
+            std::future::pending().await
+        }
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> Result<Transcript> {
+            std::future::pending().await
+        }
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_mid_processing_gives_the_attempt_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_meeting(tmp.path());
+        let (context, queue) = test_context(tmp.path(), Arc::new(HangingBackend));
+        recover_on_startup(Arc::clone(&context)).await;
+        context
+            .meeting
+            .set_worker(tokio::spawn(run_worker(Arc::clone(&context), queue)));
+
+        // Wait until the worker has counted its attempt and is transcribing.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store::read_meta(&dir).unwrap().attempts != 1
+            || context.meeting.status().queued.len() == 1
+        {
+            assert!(Instant::now() < deadline, "the worker never started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown(&context).await;
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, MeetingState::Processing);
+        assert_eq!(meta.attempts, 0, "a graceful shutdown is not a crash");
+        assert!(context.meeting.worker.lock().unwrap().is_none());
+
+        // The next start resumes it and it completes.
+        let (next, mut queue) = test_context(tmp.path(), working_backend());
+        recover_on_startup(Arc::clone(&next)).await;
+        process_one(&next, queue.try_recv().expect("resumed")).await;
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, MeetingState::Done);
+        assert_eq!(meta.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_of_a_pending_meeting_leaves_its_meta_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_meeting(tmp.path());
+        let (context, mut queue) = test_context(tmp.path(), working_backend());
+        recover_on_startup(Arc::clone(&context)).await;
+        let item = queue.try_recv().unwrap();
+        // The worker took it and counted two attempts so far.
+        context.meeting.update(|v| {
+            v.queued.clear();
+            v.processing = Some(item.meeting.clone());
+        });
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.attempts = 2;
+        store::write_meta(&dir, &meta).unwrap();
+
+        let err = retry(&context, "last").await.unwrap_err();
+        assert!(err.to_string().contains("already queued"), "{err:#}");
+        assert_eq!(store::read_meta(&dir).unwrap(), meta);
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_repairs_the_tracks_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_meeting(tmp.path());
+        // A crash leftover that was marked failed without a repair.
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.status = MeetingState::Failed;
+        meta.attempts = 3;
+        store::write_meta(&dir, &meta).unwrap();
+        let (context, mut queue) = test_context(tmp.path(), working_backend());
+
+        retry(&context, "last").await.unwrap();
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, MeetingState::Processing);
+        assert_eq!(meta.attempts, 0);
+        assert_eq!(meta.tracks[0].samples, 16_000);
+        let reader = hound::WavReader::open(store::audio_path(&dir, TrackKind::Mic)).unwrap();
+        assert_eq!(reader.duration(), 16_000);
+        assert!(queue.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn recovery_skips_the_meeting_recording_now() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_meeting(tmp.path());
+        let (context, mut queue) = test_context(tmp.path(), working_backend());
+        let meta = store::read_meta(&dir).unwrap();
+        *context.meeting.session.lock().await = Some(MeetingSession {
+            dir: dir.clone(),
+            meta: meta.clone(),
+            started: Instant::now(),
+            tracks: Vec::new(),
+            timer: None,
+            stopping: Arc::new(AtomicBool::new(false)),
+        });
+
+        recover_on_startup(Arc::clone(&context)).await;
+        assert!(queue.try_recv().is_err());
+        assert_eq!(store::read_meta(&dir).unwrap(), meta);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_start_is_deleted_only_without_audio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context(tmp.path(), working_backend());
+
+        // Devices still opening: meeting.json and a header-only track.
+        let (_, empty) = store::create(tmp.path(), Local::now(), Some("empty")).unwrap();
+        std::fs::write(
+            store::audio_path(&empty, TrackKind::Mic),
+            whisrs::audio::wav::encode_wav(&[]).unwrap(),
+        )
+        .unwrap();
+        {
+            let _starting = StartingGuard::new(&context.meeting, &empty);
+            abandon_start(&context.meeting).await;
+        }
+        assert!(!empty.exists());
+
+        // Audio already written: kept for recovery.
+        let with_audio = crashed_meeting(tmp.path());
+        {
+            let _starting = StartingGuard::new(&context.meeting, &with_audio);
+            abandon_start(&context.meeting).await;
+        }
+        assert!(with_audio.exists());
+        assert!(context.meeting.starting.lock().unwrap().is_none());
     }
 }

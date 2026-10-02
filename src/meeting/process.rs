@@ -15,7 +15,6 @@ use std::ops::Range;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{bail, Context};
 use audio_silence_gate::{audio_gate_reason, rms_energy, SILENCE_RMS_THRESHOLD};
@@ -26,13 +25,15 @@ use tracing::{debug, info, warn};
 
 use super::render::render_markdown;
 use super::split::{frame_len, split_by_energies};
-use super::store;
+use super::store::{self, CACHE_DIR};
 use super::{MeetingMeta, MeetingState, Segment, Speaker, TrackKind, TranscriptSegment};
 use crate::audio::wav::encode_wav;
 use crate::transcription::factory::{
-    create_backend_named, meeting_backend_name, meeting_transcription_config,
+    backend_identity, canonical_backend_name, create_backend_named, meeting_backend_name,
+    meeting_transcription_config,
 };
-use crate::transcription::{RetryableHttpError, TranscriptionBackend, TranscriptionConfig};
+use crate::transcription::retry::{retry_rate_limited, RateLimitExhausted, RATE_LIMIT_BUDGET};
+use crate::transcription::{TranscriptionBackend, TranscriptionConfig};
 use crate::{Config, MeetingConfig};
 
 /// Meeting tracks are recorded at this rate (and `encode_wav` writes it).
@@ -43,19 +44,6 @@ const GATE_MIN_MS: u64 = 300;
 
 /// How far apart a mic segment and the system audio it echoes may be.
 pub const ECHO_TOLERANCE_MS: u64 = 1500;
-
-/// Per-chunk results of finished requests, under the meeting folder, so a
-/// retry or a recovery after a crash resumes instead of starting over.
-const CACHE_DIR: &str = ".cache";
-
-/// Longest a single chunk waits out rate limits (429/503) before the
-/// meeting fails; the chunks already done stay cached for a retry.
-const RETRY_BUDGET: Duration = Duration::from_secs(300);
-
-/// First backoff without a `Retry-After`, doubled per attempt up to
-/// [`BACKOFF_MAX`].
-const BACKOFF_BASE: Duration = Duration::from_secs(2);
-const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Transcribe a stopped meeting and write its transcript.
 ///
@@ -77,7 +65,12 @@ pub async fn process_meeting(
 
     let name = meeting_backend_name(config)?;
     let backend = match dictation_backend {
-        Some(backend) if name == config.general.backend => backend,
+        // `local` and `local-whisper` are one backend: reuse its loaded model.
+        Some(backend)
+            if canonical_backend_name(&name) == canonical_backend_name(&config.general.backend) =>
+        {
+            backend
+        }
         _ => {
             // Loading a local model can take seconds; keep it off the runtime.
             let owned = config.clone();
@@ -111,8 +104,7 @@ pub async fn process_meeting(
 
     let cache = ChunkCache {
         dir: dir.join(CACHE_DIR),
-        backend: name.clone(),
-        model: tcfg.model.clone(),
+        fingerprint: cache_fingerprint(&name, config, &tcfg),
     };
     let mut mic = Vec::new();
     let mut system = Vec::new();
@@ -402,85 +394,67 @@ async fn transcribe_track(
     Ok(out)
 }
 
-/// How long to wait before retrying a rate-limited (429) or overloaded
-/// (503) request, or `None` to give up. Honors the server's `Retry-After`;
-/// otherwise backs off exponentially from [`BACKOFF_BASE`] to
-/// [`BACKOFF_MAX`]. Gives up once the wait would push the chunk's total past
-/// `budget`.
-fn backoff_delay(
-    attempt: u32,
-    retry_after: Option<Duration>,
-    waited: Duration,
-    budget: Duration,
-) -> Option<Duration> {
-    let exponential = BACKOFF_BASE
-        .saturating_mul(1u32 << attempt.min(16))
-        .min(BACKOFF_MAX);
-    // A zero `Retry-After` still gets a short pause, so a confused server
-    // cannot make this spin.
-    let delay = retry_after.map_or(exponential, |d| d.max(Duration::from_millis(500)));
-    (waited.saturating_add(delay) <= budget).then_some(delay)
-}
-
-/// Transcribe one chunk, waiting out rate limits within [`RETRY_BUDGET`].
+/// Transcribe one chunk, waiting out rate limits within
+/// [`RATE_LIMIT_BUDGET`]. Phrase backends retry each phrase inside
+/// `transcribe_segments` and give up with a [`RateLimitExhausted`], which
+/// this layer does not retry again, so the two waits never multiply.
 async fn transcribe_with_retry(
     backend: &dyn TranscriptionBackend,
     wav: &[u8],
     tcfg: &TranscriptionConfig,
 ) -> anyhow::Result<crate::transcription::Transcript> {
-    let mut attempt = 0u32;
-    let mut waited = Duration::ZERO;
-    loop {
-        let err = match backend.transcribe_segments(wav, tcfg).await {
-            Ok(transcript) => return Ok(transcript),
-            Err(e) => e,
-        };
-        let Some(retryable) = err
-            .chain()
-            .find_map(|c| c.downcast_ref::<RetryableHttpError>())
-            .cloned()
-        else {
-            return Err(err);
-        };
-        match backoff_delay(attempt, retryable.retry_after, waited, RETRY_BUDGET) {
-            Some(delay) => {
-                info!(
-                    "meeting transcription got HTTP {}; retrying in {:.1} s",
-                    retryable.status,
-                    delay.as_secs_f64()
-                );
-                tokio::time::sleep(delay).await;
-                waited += delay;
-                attempt += 1;
+    retry_rate_limited(RATE_LIMIT_BUDGET, || backend.transcribe_segments(wav, tcfg))
+        .await
+        .map_err(|err| {
+            if err.downcast_ref::<RateLimitExhausted>().is_some() {
+                err.context("the finished parts are saved, so a later retry resumes")
+            } else {
+                err
             }
-            None => {
-                return Err(err.context(format!(
-                    "the backend still answered HTTP {} after {} s of retries; \
-                     the finished parts are saved, so a later retry resumes",
-                    retryable.status,
-                    waited.as_secs()
-                )))
-            }
-        }
-    }
+        })
+}
+
+/// A stable 64-bit FNV-1a hash, so cache keys do not depend on the
+/// standard library's per-process hasher seeds.
+fn fnv1a64(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Everything that decides what a chunk transcribes to: the canonical
+/// backend, its model identity ([`backend_identity`]: the model file for
+/// local whisper, the URL for the sidecar) and every request field. Hashed
+/// rather than stored, so the prompt or a URL with a token in it is not
+/// copied into the cache.
+fn cache_fingerprint(name: &str, config: &Config, tcfg: &TranscriptionConfig) -> String {
+    let key = serde_json::json!({
+        "backend": canonical_backend_name(name),
+        "identity": backend_identity(name, config),
+        "language": tcfg.language,
+        "model": tcfg.model,
+        "prompt": tcfg.prompt,
+        "keyterms": tcfg.keyterms,
+    });
+    format!("{:016x}", fnv1a64(key.to_string().as_bytes()))
 }
 
 /// The raw segments of one finished chunk, as cached on disk.
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedChunk {
-    backend: String,
-    model: String,
+    /// [`cache_fingerprint`] of the request that produced it.
+    fingerprint: String,
     segments: Vec<Segment>,
 }
 
 /// Cache of finished chunks for one meeting and backend. Entries hold the
 /// backend's segments before filtering, relative to the chunk, so a config
-/// change to the filters still applies on reuse. A different backend or
-/// model ignores them.
+/// change to the filters still applies on reuse. An entry is reused only
+/// when its fingerprint matches exactly: another backend, model file,
+/// language, prompt or vocabulary ignores it.
 struct ChunkCache {
     dir: PathBuf,
-    backend: String,
-    model: String,
+    fingerprint: String,
 }
 
 impl ChunkCache {
@@ -496,7 +470,7 @@ impl ChunkCache {
     fn load(&self, kind: TrackKind, range: &Range<usize>) -> Option<Vec<Segment>> {
         let data = fs::read(self.path(kind, range)).ok()?;
         let cached: CachedChunk = serde_json::from_slice(&data).ok()?;
-        (cached.backend == self.backend && cached.model == self.model).then_some(cached.segments)
+        (cached.fingerprint == self.fingerprint).then_some(cached.segments)
     }
 
     fn store(
@@ -509,8 +483,7 @@ impl ChunkCache {
             .with_context(|| format!("failed to create {}", self.dir.display()))?;
         fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
         let cached = CachedChunk {
-            backend: self.backend.clone(),
-            model: self.model.clone(),
+            fingerprint: self.fingerprint.clone(),
             segments: segments.to_vec(),
         };
         write_private(&self.path(kind, range), &serde_json::to_vec(&cached)?)
@@ -666,8 +639,9 @@ fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::meeting::TrackMeta;
-    use crate::transcription::Transcript;
+    use crate::transcription::{RetryableHttpError, Transcript};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     const RATE: usize = SAMPLE_RATE as usize;
 
@@ -1031,8 +1005,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache = |backend: &str, model: &str| ChunkCache {
             dir: tmp.path().join(CACHE_DIR),
-            backend: backend.into(),
-            model: model.into(),
+            fingerprint: format!("{backend}/{model}"),
         };
         let segments = vec![seg(0, 1000, "hi")];
         cache("groq", "m1")
@@ -1057,45 +1030,142 @@ mod tests {
         );
     }
 
+    fn fingerprint_of(toml_text: &str) -> String {
+        let config: Config = toml::from_str(toml_text).unwrap();
+        let name = meeting_backend_name(&config).unwrap();
+        let tcfg = meeting_transcription_config(&name, &config);
+        cache_fingerprint(&name, &config, &tcfg)
+    }
+
     #[test]
-    fn backoff_honors_retry_after_and_the_budget() {
-        let budget = Duration::from_secs(300);
-        // Exponential without a Retry-After, capped.
+    fn fingerprint_changes_with_what_decides_the_output() {
+        let base = "[general]\nbackend = \"local-whisper\"\nlanguage = \"en\"\n\
+                    [local-whisper]\nmodel_path = \"/m/base.en.bin\"\n";
+        let fp = fingerprint_of(base);
+        // Stable across calls (and processes: no random hasher seed).
+        assert_eq!(fp, fingerprint_of(base));
+        // `local` is the same backend as `local-whisper`.
         assert_eq!(
-            backoff_delay(0, None, Duration::ZERO, budget),
-            Some(Duration::from_secs(2))
+            fp,
+            fingerprint_of(&base.replace("\"local-whisper\"", "\"local\""))
+        );
+        // A language change invalidates the cache.
+        assert_ne!(fp, fingerprint_of(&base.replace("\"en\"", "\"de\"")));
+        // A model file change invalidates it, though the model name is the same.
+        assert_ne!(
+            fp,
+            fingerprint_of(&base.replace("base.en.bin", "small.en.bin"))
+        );
+        // So do a prompt and vocabulary.
+        let prompted = base.replace("language", "prompt = \"Standup\"\nlanguage");
+        assert_ne!(fp, fingerprint_of(&prompted));
+        let vocab = base.replace("language", "vocabulary = [\"whisrs\"]\nlanguage");
+        assert_ne!(fp, fingerprint_of(&vocab));
+
+        // The sidecar URL is part of its identity.
+        let sidecar = "[general]\nbackend = \"asr-sidecar\"\n\
+                       [asr-sidecar]\nurl = \"http://127.0.0.1:1/t\"\n";
+        assert_ne!(
+            fingerprint_of(sidecar),
+            fingerprint_of(&sidecar.replace(":1/t", ":2/t"))
         );
         assert_eq!(
-            backoff_delay(3, None, Duration::ZERO, budget),
-            Some(Duration::from_secs(16))
+            fingerprint_of(sidecar),
+            fingerprint_of(&sidecar.replace("\"asr-sidecar\"\n[", "\"vibevoice\"\n["))
         );
-        assert_eq!(
-            backoff_delay(30, None, Duration::ZERO, budget),
-            Some(BACKOFF_MAX)
-        );
-        // The server's wait wins, even when longer than the backoff.
-        assert_eq!(
-            backoff_delay(0, Some(Duration::from_secs(90)), Duration::ZERO, budget),
-            Some(Duration::from_secs(90))
-        );
-        // A zero Retry-After still pauses.
-        assert_eq!(
-            backoff_delay(0, Some(Duration::ZERO), Duration::ZERO, budget),
-            Some(Duration::from_millis(500))
-        );
-        // Past the budget: give up.
-        assert_eq!(
-            backoff_delay(
-                0,
-                Some(Duration::from_secs(61)),
-                Duration::from_secs(240),
-                budget
-            ),
+    }
+
+    #[tokio::test]
+    async fn a_language_change_retranscribes_cached_chunks() {
+        let texts = [(3000, "first"), (4000, "second")];
+        let samples = track(17.0, &[(2.0, 1.0, 3000), (12.0, 1.0, 4000)]);
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(samples))]);
+        // The second chunk fails: the first is cached under English.
+        let failing = FakeBackend::with_failures(&texts, Some(10), Some(1), 0);
+        process_meeting(
+            tmp.path(),
+            &config(),
+            Some(failing as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(fs::read_dir(tmp.path().join(CACHE_DIR)).unwrap().count(), 1);
+
+        let mut german = config();
+        german.general.language = "de".into();
+        let working = FakeBackend::new(&texts, Some(10));
+        process_meeting(
+            tmp.path(),
+            &german,
+            Some(working.clone() as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap();
+        // Both chunks sent again: nothing English is reused.
+        assert_eq!(working.calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// A phrase backend (no timestamps) that is always rate limited.
+    struct LimitedPhrases {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for LimitedPhrases {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(RetryableHttpError {
+                status: 429,
+                retry_after: Some(Duration::from_secs(7)),
+                message: "slow down".into(),
+            }
+            .into())
+        }
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+        async fn transcribe_segments(
+            &self,
+            audio: &[u8],
+            config: &TranscriptionConfig,
+        ) -> anyhow::Result<Transcript> {
+            crate::transcription::segments_by_phrase(self, audio, config).await
+        }
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
             None
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn phrase_backend_rate_limits_are_not_retried_twice() {
+        let backend = Arc::new(LimitedPhrases {
+            calls: AtomicUsize::new(0),
+        });
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
+        let started = tokio::time::Instant::now();
+        let err = process_meeting(
+            tmp.path(),
+            &config(),
+            Some(backend.clone() as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap_err();
+        // One phrase budget (300 s at 7 s a wait is 43 retries), not one
+        // per chunk-level retry on top.
+        assert!(
+            started.elapsed() <= RATE_LIMIT_BUDGET,
+            "{:?}",
+            started.elapsed()
         );
-        assert_eq!(
-            backoff_delay(0, None, Duration::from_secs(299), budget),
-            None
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 43);
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("HTTP 429") && text.contains("later retry resumes"),
+            "{text}"
         );
     }
 

@@ -62,6 +62,7 @@ pub mod openai_realtime;
 pub mod openai_realtime_protocol;
 pub mod openai_rest;
 pub mod phrase_split;
+pub mod retry;
 pub mod verbose_json;
 
 use async_trait::async_trait;
@@ -199,6 +200,13 @@ pub(crate) fn decode_wav_samples(audio: &[u8]) -> anyhow::Result<Vec<i16>> {
 /// returns one segment per non-empty phrase, timed by where the phrase sits in
 /// the chunk. Not a trait default on purpose: each backend that relies on it
 /// calls it explicitly from its own `transcribe_segments`.
+///
+/// Each phrase request waits out rate limits on its own
+/// ([`retry::retry_rate_limited`], [`retry::RATE_LIMIT_BUDGET`] per phrase),
+/// so a 429 on one phrase does not resend the phrases already done. A phrase
+/// still limited when its budget runs out fails the chunk with a
+/// [`retry::RateLimitExhausted`], which the caller's own retry layer does
+/// not retry again.
 pub async fn segments_by_phrase<B>(
     backend: &B,
     audio: &[u8],
@@ -221,7 +229,10 @@ where
     let mut segments = Vec::new();
     for phrase in phrases {
         let wav = encode_wav(&phrase.samples)?;
-        let text = backend.transcribe(&wav, config).await?;
+        let text = retry::retry_rate_limited(retry::RATE_LIMIT_BUDGET, || {
+            backend.transcribe(&wav, config)
+        })
+        .await?;
         let text = text.trim();
         if text.is_empty() {
             continue;
@@ -496,6 +507,92 @@ mod tests {
         let wav = crate::audio::wav::encode_wav(&vec![0i16; 48_000]).unwrap();
         let t = EchoLength.transcribe_segments(&wav, &cfg()).await.unwrap();
         assert!(t.segments.is_empty());
+    }
+
+    /// Phrase backend whose calls listed in `limited` answer HTTP 429.
+    struct FlakyPhrases {
+        calls: std::sync::atomic::AtomicUsize,
+        limited: Vec<usize>,
+    }
+
+    #[async_trait]
+    impl TranscriptionBackend for FlakyPhrases {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> anyhow::Result<String> {
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.limited.contains(&call) || self.limited.contains(&usize::MAX) {
+                return Err(RetryableHttpError {
+                    status: 429,
+                    retry_after: Some(std::time::Duration::from_secs(5)),
+                    message: "slow down".into(),
+                }
+                .into());
+            }
+            Ok(format!("call {call}"))
+        }
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+        async fn transcribe_segments(
+            &self,
+            audio: &[u8],
+            config: &TranscriptionConfig,
+        ) -> anyhow::Result<Transcript> {
+            segments_by_phrase(self, audio, config).await
+        }
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
+    }
+
+    fn two_phrases() -> Vec<u8> {
+        let mut audio = vec![0i16; 16_000];
+        audio.extend(tone(1.0));
+        audio.extend(vec![0i16; 32_000]);
+        audio.extend(tone(1.0));
+        audio.extend(vec![0i16; 16_000]);
+        crate::audio::wav::encode_wav(&audio).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_phrase_is_retried_alone() {
+        // The second phrase's first request is rate limited.
+        let backend = FlakyPhrases {
+            calls: Default::default(),
+            limited: vec![1],
+        };
+        let t = backend
+            .transcribe_segments(&two_phrases(), &cfg())
+            .await
+            .unwrap();
+        // Phrase one once, phrase two twice: the first phrase is not resent.
+        assert_eq!(backend.calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+        let texts: Vec<_> = t.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["call 0", "call 2"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_phrase_fails_without_a_retryable_error() {
+        let backend = FlakyPhrases {
+            calls: Default::default(),
+            limited: vec![usize::MAX],
+        };
+        let started = tokio::time::Instant::now();
+        let err = backend
+            .transcribe_segments(&two_phrases(), &cfg())
+            .await
+            .unwrap_err();
+        // One phrase's budget, then the chunk fails.
+        assert!(started.elapsed() <= retry::RATE_LIMIT_BUDGET);
+        assert!(err.downcast_ref::<retry::RateLimitExhausted>().is_some());
+        assert!(err
+            .chain()
+            .all(|c| c.downcast_ref::<RetryableHttpError>().is_none()));
     }
 
     #[test]
