@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioChunk;
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{secs_to_ms, Segment, Transcript, TranscriptionBackend, TranscriptionConfig, Word};
 
 /// Deepgram REST API endpoint for pre-recorded audio.
 const DEEPGRAM_REST_URL: &str = "https://api.deepgram.com/v1/listen";
@@ -341,29 +341,17 @@ impl DeepgramRestBackend {
             api_key,
         }
     }
-}
 
-#[async_trait]
-impl TranscriptionBackend for DeepgramRestBackend {
-    async fn transcribe(
+    /// POST `audio` to `/v1/listen` with the common params plus `extra`, and
+    /// return the raw success body.
+    async fn post(
         &self,
         audio: &[u8],
         config: &TranscriptionConfig,
+        extra: &[(&str, &str)],
     ) -> anyhow::Result<String> {
-        if audio.is_empty() {
-            anyhow::bail!("cannot transcribe empty audio");
-        }
-
         let api_key = resolve_api_key(&self.api_key)?;
-
-        debug!(
-            "sending {} bytes to Deepgram REST API (model={}, language={})",
-            audio.len(),
-            config.model,
-            config.language
-        );
-
-        let params = build_query_params(config, &[]);
+        let params = build_query_params(config, extra);
 
         let response = self
             .client
@@ -397,6 +385,150 @@ impl TranscriptionBackend for DeepgramRestBackend {
             }
             anyhow::bail!("Deepgram API error ({}): {}", status.as_u16(), body);
         }
+        Ok(body)
+    }
+}
+
+/// Extra query params for a meeting request: `utterances=true` makes Deepgram
+/// group words into timed utterances at pauses.
+const SEGMENT_QUERY_EXTRA: &[(&str, &str)] = &[("utterances", "true")];
+
+/// Longest chunk sent to Deepgram in one request. Pre-recorded audio has no
+/// small upload cap, so an hour (~115 MB of WAV) keeps requests few while
+/// bounding how much one failed request costs.
+const DEEPGRAM_CHUNK_SECS: u32 = 3600;
+
+#[derive(Debug, Deserialize)]
+struct UtteranceResponse {
+    results: UtteranceResults,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceResults {
+    #[serde(default)]
+    utterances: Option<Vec<Utterance>>,
+    #[serde(default)]
+    channels: Vec<UtteranceChannel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceChannel {
+    #[serde(default)]
+    alternatives: Vec<UtteranceAlternative>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceAlternative {
+    #[serde(default)]
+    transcript: String,
+    #[serde(default)]
+    words: Vec<UtteranceWord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Utterance {
+    start: f64,
+    end: f64,
+    #[serde(default)]
+    transcript: String,
+    #[serde(default)]
+    speaker: Option<u32>,
+    #[serde(default)]
+    words: Vec<UtteranceWord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceWord {
+    word: String,
+    #[serde(default)]
+    punctuated_word: Option<String>,
+    start: f64,
+    end: f64,
+    #[serde(default)]
+    speaker: Option<u32>,
+}
+
+impl UtteranceWord {
+    fn to_word(&self) -> Word {
+        Word {
+            start_ms: secs_to_ms(self.start),
+            end_ms: secs_to_ms(self.end),
+            text: self
+                .punctuated_word
+                .clone()
+                .unwrap_or_else(|| self.word.clone()),
+            speaker: self.speaker.map(|s| s.to_string()),
+        }
+    }
+}
+
+/// Parse a `/v1/listen?utterances=true` body into timed segments.
+///
+/// One segment per utterance with its words. Without an `utterances` array
+/// (a request that did not ask for them), the first channel's transcript
+/// becomes one segment spanning its words.
+pub fn parse_utterances(body: &str) -> anyhow::Result<Transcript> {
+    let parsed: UtteranceResponse = serde_json::from_str(body)?;
+    let words_of = |words: &[UtteranceWord]| -> Option<Vec<Word>> {
+        (!words.is_empty()).then(|| words.iter().map(UtteranceWord::to_word).collect())
+    };
+
+    let segments = match parsed.results.utterances {
+        Some(utterances) => utterances
+            .iter()
+            .filter(|u| !u.transcript.trim().is_empty())
+            .map(|u| {
+                let start_ms = secs_to_ms(u.start);
+                Segment {
+                    start_ms,
+                    end_ms: secs_to_ms(u.end).max(start_ms),
+                    text: u.transcript.trim().to_string(),
+                    speaker: u.speaker.map(|s| s.to_string()),
+                    words: words_of(&u.words),
+                }
+            })
+            .collect(),
+        None => parsed
+            .results
+            .channels
+            .first()
+            .and_then(|ch| ch.alternatives.first())
+            .filter(|alt| !alt.transcript.trim().is_empty())
+            .map(|alt| {
+                let start_ms = alt.words.first().map_or(0, |w| secs_to_ms(w.start));
+                let end_ms = alt.words.last().map_or(start_ms, |w| secs_to_ms(w.end));
+                vec![Segment {
+                    start_ms,
+                    end_ms,
+                    text: alt.transcript.trim().to_string(),
+                    speaker: None,
+                    words: words_of(&alt.words),
+                }]
+            })
+            .unwrap_or_default(),
+    };
+    Ok(Transcript { segments })
+}
+
+#[async_trait]
+impl TranscriptionBackend for DeepgramRestBackend {
+    async fn transcribe(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<String> {
+        if audio.is_empty() {
+            anyhow::bail!("cannot transcribe empty audio");
+        }
+
+        debug!(
+            "sending {} bytes to Deepgram REST API (model={}, language={})",
+            audio.len(),
+            config.model,
+            config.language
+        );
+
+        let body = self.post(audio, config, &[]).await?;
 
         let parsed: DeepgramResponse = serde_json::from_str(&body)?;
         let text = parsed
@@ -420,6 +552,28 @@ impl TranscriptionBackend for DeepgramRestBackend {
     // Deepgram has no prompt field; vocabulary rides as `keyterm` params.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
+    }
+
+    // Native timestamps via `utterances=true`.
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        if audio.is_empty() {
+            anyhow::bail!("cannot transcribe empty audio");
+        }
+        debug!(
+            "sending {} bytes to Deepgram REST API for utterances (model={})",
+            audio.len(),
+            config.model
+        );
+        let body = self.post(audio, config, SEGMENT_QUERY_EXTRA).await?;
+        parse_utterances(&body)
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(DEEPGRAM_CHUNK_SECS)
     }
 }
 
@@ -619,6 +773,22 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
     // as `keyterm` query params.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
+    }
+
+    // A recorded meeting has no use for the live socket: same key and model,
+    // sent to the REST endpoint.
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        DeepgramRestBackend::new(self.api_key.clone())
+            .transcribe_segments(audio, config)
+            .await
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(DEEPGRAM_CHUNK_SECS)
     }
 }
 
@@ -1137,5 +1307,66 @@ mod tests {
             query.contains("model=nova-3"),
             "the fixed params must survive encoding: {query}"
         );
+    }
+
+    /// Trimmed from a real nova-3 `/v1/listen?utterances=true&smart_format=true`
+    /// response.
+    const UTTERANCES_BODY: &str = r#"{
+        "metadata": {"request_id": "x", "duration": 9.5, "channels": 1},
+        "results": {
+            "channels": [{"alternatives": [{"transcript": "Hi team. Let's start.", "confidence": 0.99,
+                "words": []}]}],
+            "utterances": [
+                {"start": 0.32, "end": 1.1, "confidence": 0.98, "channel": 0,
+                 "transcript": "Hi team.", "id": "a",
+                 "words": [
+                    {"word": "hi", "start": 0.32, "end": 0.6, "confidence": 0.9, "punctuated_word": "Hi"},
+                    {"word": "team", "start": 0.6, "end": 1.1, "confidence": 0.9, "punctuated_word": "team."}
+                 ]},
+                {"start": 4.0, "end": 5.25, "confidence": 0.97, "channel": 0,
+                 "transcript": "Let's start.", "id": "b", "speaker": 1,
+                 "words": [
+                    {"word": "let's", "start": 4.0, "end": 4.6, "confidence": 0.9, "punctuated_word": "Let's", "speaker": 1},
+                    {"word": "start", "start": 4.6, "end": 5.25, "confidence": 0.9, "punctuated_word": "start.", "speaker": 1}
+                 ]},
+                {"start": 7.0, "end": 7.2, "confidence": 0.1, "channel": 0,
+                 "transcript": "", "id": "c", "words": []}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn parse_utterances_into_segments() {
+        let t = parse_utterances(UTTERANCES_BODY).unwrap();
+        assert_eq!(t.segments.len(), 2, "blank utterances are dropped");
+        assert_eq!((t.segments[0].start_ms, t.segments[0].end_ms), (320, 1100));
+        assert_eq!(t.segments[0].text, "Hi team.");
+        let words = t.segments[0].words.as_ref().unwrap();
+        assert_eq!(words[1].text, "team.", "punctuated_word wins");
+        assert_eq!(t.segments[1].speaker.as_deref(), Some("1"));
+        assert_eq!(t.segments[1].start_ms, 4000);
+    }
+
+    #[test]
+    fn parse_utterances_without_utterances_uses_the_channel() {
+        let body = r#"{"results": {"channels": [{"alternatives": [{"transcript": "hello",
+            "words": [{"word": "hello", "start": 1.5, "end": 2.0}]}]}]}}"#;
+        let t = parse_utterances(body).unwrap();
+        assert_eq!(t.segments.len(), 1);
+        assert_eq!((t.segments[0].start_ms, t.segments[0].end_ms), (1500, 2000));
+
+        let silent = r#"{"results": {"channels": [{"alternatives": [{"transcript": ""}]}]}}"#;
+        assert!(parse_utterances(silent).unwrap().segments.is_empty());
+    }
+
+    #[test]
+    fn segment_query_asks_for_utterances_and_keeps_keyterms() {
+        let config = query_config("nova-3", &["whisrs"]);
+        let params = build_query_params(&config, SEGMENT_QUERY_EXTRA);
+        assert!(params.contains(&("utterances", "true")));
+        assert!(params.contains(&("smart_format", "true")));
+        assert_eq!(keyterm_values(&params), ["whisrs"]);
+        // Dictation's params stay without it.
+        assert!(!build_query_params(&config, &[]).contains(&("utterances", "true")));
     }
 }

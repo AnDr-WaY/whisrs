@@ -8,7 +8,10 @@ use reqwest::multipart;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::verbose_json::parse_verbose_segments;
+use super::{
+    segments_by_phrase, Transcript, TranscriptionBackend, TranscriptionConfig, UPLOAD_CHUNK_SECS,
+};
 
 /// Maximum file size accepted by the OpenAI API (25 MB).
 const MAX_FILE_SIZE: usize = 25 * 1024 * 1024;
@@ -44,66 +47,28 @@ impl OpenAIRestBackend {
     }
 }
 
-/// Response from the OpenAI transcription API (verbose_json format).
-#[derive(Debug, Deserialize)]
-struct OpenAITranscriptionResponse {
-    text: String,
-}
-
-/// Error response from the OpenAI API.
-#[derive(Debug, Deserialize)]
-struct OpenAIErrorResponse {
-    error: OpenAIErrorDetail,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIErrorDetail {
-    message: String,
-}
-
-#[async_trait]
-impl TranscriptionBackend for OpenAIRestBackend {
-    async fn transcribe(
+impl OpenAIRestBackend {
+    /// POST one transcription request and return the raw success body.
+    async fn post(
         &self,
         audio: &[u8],
         config: &TranscriptionConfig,
+        response_format: &str,
+        granularities: &[&str],
     ) -> anyhow::Result<String> {
-        if audio.len() > MAX_FILE_SIZE {
-            anyhow::bail!(
-                "audio file too large ({} bytes, max {} bytes / 25MB)",
-                audio.len(),
-                MAX_FILE_SIZE
-            );
-        }
-
-        if audio.is_empty() {
-            anyhow::bail!("cannot transcribe empty audio");
-        }
-
         let api_key = self.resolve_api_key()?;
-
-        debug!(
-            "sending {} bytes to OpenAI API (model={}, language={})",
-            audio.len(),
-            config.model,
-            config.language
-        );
 
         let file_part = multipart::Part::bytes(audio.to_vec())
             .file_name("audio.wav")
             .mime_str("audio/wav")?;
 
-        // whisper-1 supports verbose_json; gpt-4o-transcribe models only support json/text.
-        let response_format = if config.model.starts_with("whisper") {
-            "verbose_json"
-        } else {
-            "json"
-        };
-
         let mut form = multipart::Form::new()
             .part("file", file_part)
             .text("model", config.model.clone())
             .text("response_format", response_format.to_string());
+        for granularity in granularities {
+            form = form.text("timestamp_granularities[]", granularity.to_string());
+        }
 
         if config.language != "auto" {
             form = form.text("language", config.language.clone());
@@ -141,6 +106,76 @@ impl TranscriptionBackend for OpenAIRestBackend {
             }
             anyhow::bail!("OpenAI API error ({}): {}", status.as_u16(), body);
         }
+        Ok(body)
+    }
+}
+
+/// Reject audio the API would refuse before uploading it.
+fn check_audio_size(audio: &[u8]) -> anyhow::Result<()> {
+    if audio.len() > MAX_FILE_SIZE {
+        anyhow::bail!(
+            "audio file too large ({} bytes, max {} bytes / 25MB)",
+            audio.len(),
+            MAX_FILE_SIZE
+        );
+    }
+    if audio.is_empty() {
+        anyhow::bail!("cannot transcribe empty audio");
+    }
+    Ok(())
+}
+
+/// Whether `model` returns segment timestamps.
+///
+/// Only the Whisper models accept `verbose_json` with
+/// `timestamp_granularities[]`. The gpt-4o family (`gpt-4o-transcribe`,
+/// `gpt-4o-mini-transcribe`, `gpt-transcribe`, and the `-diarize` variant
+/// until #175 wires its diarized format) answer plain `json`, so meetings on
+/// those go through the phrase fallback.
+pub fn model_has_timestamps(model: &str) -> bool {
+    model.starts_with("whisper")
+}
+
+/// Response from the OpenAI transcription API (verbose_json format).
+#[derive(Debug, Deserialize)]
+struct OpenAITranscriptionResponse {
+    text: String,
+}
+
+/// Error response from the OpenAI API.
+#[derive(Debug, Deserialize)]
+struct OpenAIErrorResponse {
+    error: OpenAIErrorDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIErrorDetail {
+    message: String,
+}
+
+#[async_trait]
+impl TranscriptionBackend for OpenAIRestBackend {
+    async fn transcribe(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<String> {
+        check_audio_size(audio)?;
+
+        debug!(
+            "sending {} bytes to OpenAI API (model={}, language={})",
+            audio.len(),
+            config.model,
+            config.language
+        );
+
+        // whisper-1 supports verbose_json; gpt-4o-transcribe models only support json/text.
+        let response_format = if config.model.starts_with("whisper") {
+            "verbose_json"
+        } else {
+            "json"
+        };
+        let body = self.post(audio, config, response_format, &[]).await?;
 
         let parsed: OpenAITranscriptionResponse = serde_json::from_str(&body)?;
         let text = parsed.text.trim().to_string();
@@ -158,6 +193,32 @@ impl TranscriptionBackend for OpenAIRestBackend {
     // `transcribe` puts the prompt on the wire as the `prompt` multipart field.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         true
+    }
+
+    // whisper-1: verbose_json segments. Everything else: one request per
+    // phrase via the shared fallback, with the same prompt on each.
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        check_audio_size(audio)?;
+        if !model_has_timestamps(&config.model) {
+            return segments_by_phrase(self, audio, config).await;
+        }
+        debug!(
+            "sending {} bytes to OpenAI API for segments (model={})",
+            audio.len(),
+            config.model
+        );
+        let body = self
+            .post(audio, config, "verbose_json", &["segment", "word"])
+            .await?;
+        parse_verbose_segments(&body)
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(UPLOAD_CHUNK_SECS)
     }
 }
 
@@ -204,5 +265,31 @@ mod tests {
         let body = r#"{"error": {"message": "Invalid API key"}}"#;
         let parsed: OpenAIErrorResponse = serde_json::from_str(body).unwrap();
         assert_eq!(parsed.error.message, "Invalid API key");
+    }
+
+    #[test]
+    fn only_whisper_models_have_timestamps() {
+        assert!(model_has_timestamps("whisper-1"));
+        for model in [
+            "gpt-4o-transcribe",
+            "gpt-4o-mini-transcribe",
+            "gpt-transcribe",
+            "gpt-4o-transcribe-diarize",
+        ] {
+            assert!(!model_has_timestamps(model), "{model}");
+        }
+    }
+
+    #[tokio::test]
+    async fn segments_reject_empty_audio_before_any_request() {
+        let backend = OpenAIRestBackend::new("test-key".to_string());
+        let config = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "whisper-1".to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+        };
+        let err = backend.transcribe_segments(&[], &config).await.unwrap_err();
+        assert!(err.to_string().contains("empty audio"));
     }
 }

@@ -16,7 +16,8 @@ use tracing::{debug, error, info, warn};
 use crate::audio::wav::encode_wav;
 use crate::audio::AudioChunk;
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::verbose_json::parse_verbose_segments;
+use super::{Transcript, TranscriptionBackend, TranscriptionConfig, UPLOAD_CHUNK_SECS};
 
 /// Maximum file size accepted by the Groq API (25 MB).
 const MAX_FILE_SIZE: usize = 25 * 1024 * 1024;
@@ -59,28 +60,24 @@ impl GroqBackend {
         wav_data: &[u8],
         config: &TranscriptionConfig,
     ) -> anyhow::Result<GroqTranscriptionResponse> {
-        let file_part = multipart::Part::bytes(wav_data.to_vec())
-            .file_name("audio.wav")
-            .mime_str("audio/wav")?;
+        let body = self.post(wav_data, config, &["word"]).await?;
+        let parsed: GroqTranscriptionResponse = serde_json::from_str(&body)?;
+        Ok(parsed)
+    }
 
-        let mut form = multipart::Form::new()
-            .part("file", file_part)
-            .text("model", config.model.clone())
-            .text("response_format", "verbose_json")
-            .text("timestamp_granularities[]", "word");
-
-        if config.language != "auto" {
-            form = form.text("language", config.language.clone());
-        }
-        if let Some(prompt) = &config.prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
+    /// POST `audio` as a `verbose_json` request with the given
+    /// `timestamp_granularities[]` and return the raw success body.
+    async fn post(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+        granularities: &[&str],
+    ) -> anyhow::Result<String> {
         let response = self
             .client
             .post(GROQ_TRANSCRIPTION_URL)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(form)
+            .multipart(build_form(audio, config, granularities)?)
             .send()
             .await?;
 
@@ -88,6 +85,7 @@ impl GroqBackend {
         let body = response.text().await?;
 
         if !status.is_success() {
+            // Try to parse error response for a better message.
             if let Ok(err_resp) = serde_json::from_str::<GroqErrorResponse>(&body) {
                 match status.as_u16() {
                     401 => anyhow::bail!("Groq API: invalid API key — {}", err_resp.error.message),
@@ -101,10 +99,53 @@ impl GroqBackend {
             }
             anyhow::bail!("Groq API error ({}): {}", status.as_u16(), body);
         }
-
-        let parsed: GroqTranscriptionResponse = serde_json::from_str(&body)?;
-        Ok(parsed)
+        Ok(body)
     }
+}
+
+/// Reject audio the API would refuse before uploading it.
+fn check_audio_size(audio: &[u8]) -> anyhow::Result<()> {
+    if audio.len() > MAX_FILE_SIZE {
+        anyhow::bail!(
+            "audio file too large ({} bytes, max {} bytes / 25MB)",
+            audio.len(),
+            MAX_FILE_SIZE
+        );
+    }
+    if audio.is_empty() {
+        anyhow::bail!("cannot transcribe empty audio");
+    }
+    Ok(())
+}
+
+/// The multipart form for one transcription request.
+///
+/// Dictation asks for `word` timestamps only; meetings add `segment`.
+fn build_form(
+    audio: &[u8],
+    config: &TranscriptionConfig,
+    granularities: &[&str],
+) -> anyhow::Result<multipart::Form> {
+    let file_part = multipart::Part::bytes(audio.to_vec())
+        .file_name("audio.wav")
+        .mime_str("audio/wav")?;
+
+    let mut form = multipart::Form::new()
+        .part("file", file_part)
+        .text("model", config.model.clone())
+        .text("response_format", "verbose_json");
+    for granularity in granularities {
+        form = form.text("timestamp_granularities[]", granularity.to_string());
+    }
+
+    // Only set language if not "auto" — letting the API auto-detect is the default.
+    if config.language != "auto" {
+        form = form.text("language", config.language.clone());
+    }
+    if let Some(prompt) = &config.prompt {
+        form = form.text("prompt", prompt.clone());
+    }
+    Ok(form)
 }
 
 /// The verbose JSON response from Groq's transcription API.
@@ -155,17 +196,7 @@ impl TranscriptionBackend for GroqBackend {
         audio: &[u8],
         config: &TranscriptionConfig,
     ) -> anyhow::Result<String> {
-        if audio.len() > MAX_FILE_SIZE {
-            anyhow::bail!(
-                "audio file too large ({} bytes, max {} bytes / 25MB)",
-                audio.len(),
-                MAX_FILE_SIZE
-            );
-        }
-
-        if audio.is_empty() {
-            anyhow::bail!("cannot transcribe empty audio");
-        }
+        check_audio_size(audio)?;
 
         debug!(
             "sending {} bytes to Groq API (model={}, language={})",
@@ -174,51 +205,7 @@ impl TranscriptionBackend for GroqBackend {
             config.language
         );
 
-        let file_part = multipart::Part::bytes(audio.to_vec())
-            .file_name("audio.wav")
-            .mime_str("audio/wav")?;
-
-        let mut form = multipart::Form::new()
-            .part("file", file_part)
-            .text("model", config.model.clone())
-            .text("response_format", "verbose_json")
-            .text("timestamp_granularities[]", "word");
-
-        // Only set language if not "auto" — letting the API auto-detect is the default.
-        if config.language != "auto" {
-            form = form.text("language", config.language.clone());
-        }
-        if let Some(prompt) = &config.prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
-        let response = self
-            .client
-            .post(GROQ_TRANSCRIPTION_URL)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(form)
-            .send()
-            .await?;
-
-        let status = response.status();
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            // Try to parse error response for a better message.
-            if let Ok(err_resp) = serde_json::from_str::<GroqErrorResponse>(&body) {
-                match status.as_u16() {
-                    401 => anyhow::bail!("Groq API: invalid API key — {}", err_resp.error.message),
-                    429 => anyhow::bail!("Groq API: rate limited — {}", err_resp.error.message),
-                    _ => anyhow::bail!(
-                        "Groq API error ({}): {}",
-                        status.as_u16(),
-                        err_resp.error.message
-                    ),
-                }
-            }
-            anyhow::bail!("Groq API error ({}): {}", status.as_u16(), body);
-        }
-
+        let body = self.post(audio, config, &["word"]).await?;
         let parsed: GroqTranscriptionResponse = serde_json::from_str(&body)?;
 
         if !parsed.words.is_empty() {
@@ -354,6 +341,27 @@ impl TranscriptionBackend for GroqBackend {
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         true
     }
+
+    // Native timestamps: verbose_json segments, parsed by
+    // `verbose_json::parse_verbose_segments` (no-speech heuristic included).
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        check_audio_size(audio)?;
+        debug!(
+            "sending {} bytes to Groq API for segments (model={})",
+            audio.len(),
+            config.model
+        );
+        let body = self.post(audio, config, &["segment", "word"]).await?;
+        parse_verbose_segments(&body)
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(UPLOAD_CHUNK_SECS)
+    }
 }
 
 /// Parse a Groq verbose JSON response body into a `GroqTranscriptionResponse`.
@@ -468,5 +476,33 @@ mod tests {
         let huge = vec![0u8; MAX_FILE_SIZE + 1];
         let err = backend.transcribe(&huge, &config).await.unwrap_err();
         assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn form_builds_for_both_granularity_sets() {
+        let config = TranscriptionConfig {
+            language: "auto".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            prompt: Some("whisrs".to_string()),
+            keyterms: Vec::new(),
+        };
+        // reqwest's Form is opaque; building must at least succeed for both
+        // the dictation and meeting shapes.
+        assert!(build_form(&[1, 2, 3], &config, &["word"]).is_ok());
+        assert!(build_form(&[1, 2, 3], &config, &["segment", "word"]).is_ok());
+    }
+
+    #[test]
+    fn groq_chunks_fit_the_upload_cap() {
+        let backend = GroqBackend::new(String::new());
+        let config = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+        };
+        let secs = backend.max_segment_chunk_secs(&config).unwrap() as usize;
+        // 16 kHz mono i16 plus a 44-byte header.
+        assert!(secs * 32_000 + 44 <= MAX_FILE_SIZE);
     }
 }

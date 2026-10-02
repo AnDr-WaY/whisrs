@@ -130,6 +130,68 @@ otherwise prints guidance for manual restart. Does not require the daemon
 to be running \(em
 .B restart
 will start a stopped service.
+.TP
+.B meeting
+Record a meeting and turn it into a transcript. Captures the microphone
+and the system audio (the default output's monitor) as two separate tracks,
+then transcribes them after
+.B stop
+into a Markdown transcript with \(lqme\(rq and \(lqothers\(rq speakers.
+Each meeting lives in its own folder under the meetings directory (see
+.BR FILES ),
+named by its id
+.RI ( YYYY\-MM\-DD_HHMM ,
+plus a slug of the title). Wherever an
+.I ID
+is taken, it may be a full id, a unique id prefix, or
+.B last
+for the newest meeting. Requires an action:
+.RS
+.TP
+\fBstart\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR]
+Start recording. The optional title goes into the transcript and the
+folder name.
+.TP
+.B stop
+Stop recording and queue the meeting for transcription.
+.TP
+.B cancel
+Stop recording and delete the meeting.
+.TP
+.B status
+Print whether a meeting is recording or processing.
+.TP
+\fBlist\fR [\fB\-\-json\fR]
+List meetings, newest first, with id, start time, duration, status and title.
+.B \-\-json
+prints a JSON array instead.
+.TP
+\fBshow\fR \fIID\fR [\fB\-f\fR, \fB\-\-format\fR \fBmd\fR|\fBjson\fR|\fBtxt\fR]
+Print a transcript:
+.B md
+(the default) prints the Markdown file,
+.B json
+prints
+.IR meeting.json ,
+and
+.B txt
+prints plain text.
+.TP
+\fBpath\fR \fIID\fR
+Print the meeting folder.
+.TP
+\fBcopy\fR \fIID\fR
+Copy the transcript to the clipboard.
+.TP
+\fBretry\fR \fIID\fR
+Transcribe the meeting again, for example after a failure.
+.RE
+.IP
+.BR list ,
+.B show
+and
+.B path
+read the meetings directory directly and work without the daemon.
 .SH LLM OUTPUT
 Applies to
 .B command
@@ -206,6 +268,14 @@ Unix domain socket for CLI\-daemon IPC.
 .TP
 .I ~/.cache/whisrs/recovery/
 Recovery directory for audio that failed transcription.
+.TP
+.I $XDG_DATA_HOME/whisrs/meetings/
+Meeting recordings and transcripts, one folder per meeting (defaults to
+.IR ~/.local/share/whisrs/meetings/ ;
+override with
+.B [meeting] dir
+in
+.IR config.toml ).
 .SH EXIT STATUS
 .TP
 .B 0

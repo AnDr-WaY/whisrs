@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::llm::LlmCommandConfig;
+use crate::meeting::MeetingAction;
 use crate::{Command, HotkeyConfig};
 pub use parse::{parse_hotkey, HotkeyBinding};
 
@@ -134,6 +135,15 @@ fn build_actions(config: &HotkeyConfig, llm_commands: &[LlmCommandConfig]) -> Ve
         ("cancel", &config.cancel, Command::Cancel),
         ("command", &config.command, Command::CommandMode),
         ("speak", &config.speak, Command::Speak),
+        (
+            "meeting",
+            &config.meeting,
+            Command::Meeting {
+                action: MeetingAction::Toggle,
+                title: None,
+                id: None,
+            },
+        ),
     ];
     for (label, spec, command) in fixed {
         let Some(spec) = spec else { continue };
@@ -531,6 +541,7 @@ mod tests {
             cancel: Some("Super+Shift+D".to_string()),
             command: Some("Super+Shift+G".to_string()),
             speak: Some("Super+Shift+R".to_string()),
+            meeting: Some("Super+Shift+M".to_string()),
         }
     }
 
@@ -566,6 +577,11 @@ mod tests {
             Command::Cancel,
             Command::CommandMode,
             Command::Speak,
+            Command::Meeting {
+                action: MeetingAction::Toggle,
+                title: None,
+                id: None,
+            },
         ] {
             assert_eq!(
                 actions

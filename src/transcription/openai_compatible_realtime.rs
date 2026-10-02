@@ -153,6 +153,20 @@ impl TranscriptionBackend for OpenAiCompatibleRealtimeBackend {
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
     }
+
+    // Live-only: a recorded meeting needs a batch backend.
+    async fn transcribe_segments(
+        &self,
+        _audio: &[u8],
+        _config: &TranscriptionConfig,
+    ) -> anyhow::Result<super::Transcript> {
+        Err(super::live_only_error("openai-compatible-realtime"))
+    }
+
+    // Never chunked: `transcribe_segments` always errors.
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use super::NotifyFn;
+use crate::meeting::{MeetingAction, MeetingPhase, MeetingStatus};
 use crate::service::{RestartOutcome, ServiceManager};
 use crate::{Command, State};
 
@@ -97,6 +98,45 @@ mod icons {
         };
         cache[index].clone()
     }
+
+    /// Generate a 16x16 "record" icon: an outer ring plus a center dot in
+    /// the given ARGB color, so a meeting reads differently from the solid
+    /// dictation dots at a glance.
+    pub fn ring_icon(argb: u32) -> Vec<u8> {
+        let size = 16;
+        let center = size as f32 / 2.0;
+        let (outer, inner, dot) = (7.0_f32, 5.0_f32, 3.0_f32);
+        let [a, r, g, b] = argb.to_be_bytes();
+        let mut pixels = Vec::with_capacity(size * size * 4);
+
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f32 + 0.5 - center;
+                let dy = y as f32 + 0.5 - center;
+                let dist = (dx * dx + dy * dy).sqrt();
+
+                // Coverage of the ring and of the dot, each anti-aliased
+                // over one pixel at its edges.
+                let ring =
+                    (outer + 0.5 - dist).clamp(0.0, 1.0) * (dist - inner + 0.5).clamp(0.0, 1.0);
+                let center_dot = (dot + 0.5 - dist).clamp(0.0, 1.0);
+                let coverage = ring.max(center_dot);
+                let alpha = (coverage * a as f32) as u8;
+                pixels.extend_from_slice(&[alpha, r, g, b]);
+            }
+        }
+        pixels
+    }
+
+    /// Meeting recording while dictation is idle (red ring).
+    pub fn meeting_recording() -> Vec<u8> {
+        ring_icon(0xFF_E0_40_40)
+    }
+
+    /// Meeting being transcribed while dictation is idle (amber ring).
+    pub fn meeting_processing() -> Vec<u8> {
+        ring_icon(0xFF_E0_A0_20)
+    }
 }
 
 /// Small mutable state owned by the tray service itself.
@@ -107,6 +147,25 @@ mod icons {
 /// miss icon refreshes and leave the old color visible.
 struct TrayState {
     current: State,
+    meeting: MeetingStatus,
+}
+
+/// One-line description of the meeting, or `None` when no meeting is active.
+fn meeting_line(meeting: &MeetingStatus) -> Option<String> {
+    match meeting.phase {
+        MeetingPhase::Idle => None,
+        MeetingPhase::Recording => {
+            let mut line = "Meeting recording".to_string();
+            if let Some(started) = meeting.started_at {
+                line.push_str(&format!(" since {}", started.format("%H:%M")));
+            }
+            if let Some(title) = meeting.title.as_deref().filter(|t| !t.is_empty()) {
+                line.push_str(&format!(" ({title})"));
+            }
+            Some(line)
+        }
+        MeetingPhase::Processing => Some("Processing meeting...".to_string()),
+    }
 }
 
 /// Human-readable word for a state, used in the title and menu status line.
@@ -152,7 +211,14 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn title(&self) -> String {
-        format!("whisrs — {}", state_word(self.state.current))
+        // A meeting only takes over the title while dictation is idle:
+        // dictating during a meeting is normal and its state matters more
+        // in the moment.
+        match (self.state.current, self.state.meeting.phase) {
+            (State::Idle, MeetingPhase::Recording) => "whisrs — meeting recording".to_string(),
+            (State::Idle, MeetingPhase::Processing) => "whisrs — processing meeting".to_string(),
+            (state, _) => format!("whisrs — {}", state_word(state)),
+        }
     }
 
     /// Left-click on the icon: toggle recording, same as `whisrs toggle`.
@@ -162,7 +228,22 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        icons::for_state(self.state.current)
+        // A meeting only takes over the icon while dictation is idle:
+        // dictating during a meeting is normal and its state matters more in
+        // the moment.
+        let ring = match (self.state.current, self.state.meeting.phase) {
+            (State::Idle, MeetingPhase::Recording) => Some(icons::meeting_recording()),
+            (State::Idle, MeetingPhase::Processing) => Some(icons::meeting_processing()),
+            _ => None,
+        };
+        match ring {
+            Some(data) => vec![Icon {
+                width: 16,
+                height: 16,
+                data,
+            }],
+            None => icons::for_state(self.state.current),
+        }
     }
 
     fn tool_tip(&self) -> ToolTip {
@@ -173,9 +254,16 @@ impl ksni::Tray for WhisrsTray {
             State::Synthesizing => "Synthesizing…",
             State::Speaking => "Reading aloud…",
         };
+        // The meeting line leads while dictation is idle, and is appended
+        // otherwise so a running meeting is never hidden.
+        let description = match (self.state.current, meeting_line(&self.state.meeting)) {
+            (_, None) => description.to_string(),
+            (State::Idle, Some(meeting)) => meeting,
+            (_, Some(meeting)) => format!("{description}\n{meeting}"),
+        };
         ToolTip {
             title: "whisrs".to_string(),
-            description: description.to_string(),
+            description,
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
         }
@@ -183,13 +271,15 @@ impl ksni::Tray for WhisrsTray {
 
     /// Right-click menu.
     ///
-    /// Deliberately holds no recording controls: whisrs is driven by hotkeys,
+    /// Deliberately holds no dictation controls: whisrs is driven by hotkeys,
     /// and toggle/cancel each already have a hotkey, a CLI command, and (for
     /// toggle) the left-click above. A menu item for them would be a fourth
-    /// way to do the same thing. What is left is what has no other trigger.
+    /// way to do the same thing. Meetings are the exception: they run for an
+    /// hour, often started without a hotkey bound, and the tray is where the
+    /// user sees one is running, so the start/stop/cancel controls live here.
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let state = self.state.current;
-        vec![
+        let mut items = vec![
             // Non-interactive status line: version + current state.
             MenuItem::Standard(StandardItem {
                 label: format!(
@@ -200,6 +290,10 @@ impl ksni::Tray for WhisrsTray {
                 enabled: false,
                 ..Default::default()
             }),
+            MenuItem::Separator,
+        ];
+        items.extend(meeting_menu_items(&self.state.meeting));
+        items.extend([
             MenuItem::Separator,
             MenuItem::Standard(StandardItem {
                 label: "Restart Daemon".to_string(),
@@ -215,7 +309,52 @@ impl ksni::Tray for WhisrsTray {
                 }),
                 ..Default::default()
             }),
-        ]
+        ]);
+        items
+    }
+}
+
+/// The meeting section of the menu: a status line while a meeting is active,
+/// a start/stop toggle, and cancel while recording.
+fn meeting_menu_items(meeting: &MeetingStatus) -> Vec<MenuItem<WhisrsTray>> {
+    let mut items = Vec::new();
+    if let Some(line) = meeting_line(meeting) {
+        items.push(MenuItem::Standard(StandardItem {
+            label: line,
+            enabled: false,
+            ..Default::default()
+        }));
+    }
+    let recording = meeting.phase == MeetingPhase::Recording;
+    items.push(MenuItem::Standard(StandardItem {
+        label: if recording {
+            "Stop meeting"
+        } else {
+            "Start meeting"
+        }
+        .to_string(),
+        activate: Box::new(|tray: &mut WhisrsTray| {
+            tray.send(meeting_command(MeetingAction::Toggle));
+        }),
+        ..Default::default()
+    }));
+    if recording {
+        items.push(MenuItem::Standard(StandardItem {
+            label: "Cancel meeting".to_string(),
+            activate: Box::new(|tray: &mut WhisrsTray| {
+                tray.send(meeting_command(MeetingAction::Cancel));
+            }),
+            ..Default::default()
+        }));
+    }
+    items
+}
+
+fn meeting_command(action: MeetingAction) -> Command {
+    Command::Meeting {
+        action,
+        title: None,
+        id: None,
     }
 }
 
@@ -284,6 +423,7 @@ const TRAY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1
 /// on boot when the daemon starts before the desktop environment is fully ready).
 pub async fn spawn_tray(
     mut state_rx: watch::Receiver<State>,
+    mut meeting_rx: watch::Receiver<MeetingStatus>,
     cmd_tx: mpsc::Sender<Command>,
     notify: Option<NotifyFn>,
 ) {
@@ -295,6 +435,7 @@ pub async fn spawn_tray(
         let tray = WhisrsTray {
             state: TrayState {
                 current: *state_rx.borrow(),
+                meeting: meeting_rx.borrow().clone(),
             },
             cmd_tx: cmd_tx.clone(),
             notify,
@@ -324,18 +465,42 @@ pub async fn spawn_tray(
 
     let handle = handle.expect("handle must be set after successful spawn");
 
-    // Watch for state changes and update the tray.
+    // Watch for dictation and meeting changes and update the tray. The
+    // dictation channel ends the loop when it closes (the daemon is going
+    // away); a closed meeting channel only stops meeting updates.
     tokio::spawn(async move {
-        while state_rx.changed().await.is_ok() {
-            let new_state = *state_rx.borrow();
-            debug!("tray state update: {new_state:?}");
-            // Mutate the tray object itself so ksni emits the corresponding
-            // D-Bus property changes for title, tooltip, and icon pixmap.
-            handle
-                .update(|tray| {
-                    tray.state.current = new_state;
-                })
-                .await;
+        let mut meeting_open = true;
+        loop {
+            tokio::select! {
+                changed = state_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let new_state = *state_rx.borrow();
+                    debug!("tray state update: {new_state:?}");
+                    // Mutate the tray object itself so ksni emits the
+                    // corresponding D-Bus property changes for title,
+                    // tooltip, and icon pixmap.
+                    handle
+                        .update(|tray| {
+                            tray.state.current = new_state;
+                        })
+                        .await;
+                }
+                changed = meeting_rx.changed(), if meeting_open => {
+                    if changed.is_err() {
+                        meeting_open = false;
+                        continue;
+                    }
+                    let meeting = meeting_rx.borrow().clone();
+                    debug!("tray meeting update: {:?}", meeting.phase);
+                    handle
+                        .update(|tray| {
+                            tray.state.meeting = meeting;
+                        })
+                        .await;
+                }
+            }
         }
     });
 }
@@ -348,19 +513,158 @@ mod tests {
     // it doesn't import the trait.
     use ksni::Tray as _;
 
+    fn tray_with(
+        cmd_tx: mpsc::Sender<Command>,
+        current: State,
+        meeting: MeetingStatus,
+    ) -> WhisrsTray {
+        WhisrsTray {
+            state: TrayState { current, meeting },
+            cmd_tx,
+            notify: None,
+        }
+    }
+
+    fn recording_meeting(title: Option<&str>) -> MeetingStatus {
+        use chrono::TimeZone;
+        MeetingStatus {
+            phase: MeetingPhase::Recording,
+            id: Some("2026-10-02_0930".to_string()),
+            title: title.map(str::to_string),
+            started_at: Some(
+                chrono::Local
+                    .with_ymd_and_hms(2026, 10, 2, 9, 30, 0)
+                    .unwrap(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn labels(items: &[MenuItem<WhisrsTray>]) -> Vec<(String, bool)> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Standard(s) => Some((s.label.clone(), s.enabled)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Activate the standard menu item with this label.
+    fn click(tray: &mut WhisrsTray, label: &str) {
+        let mut items = meeting_menu_items(&tray.state.meeting);
+        let item = items
+            .iter_mut()
+            .find_map(|i| match i {
+                MenuItem::Standard(s) if s.label == label => Some(s),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no menu item `{label}`"));
+        let activate = std::mem::replace(&mut item.activate, Box::new(|_: &mut WhisrsTray| {}));
+        activate(tray);
+    }
+
+    #[test]
+    fn meeting_line_describes_each_phase() {
+        assert_eq!(meeting_line(&MeetingStatus::default()), None);
+        assert_eq!(
+            meeting_line(&recording_meeting(Some("standup"))).as_deref(),
+            Some("Meeting recording since 09:30 (standup)")
+        );
+        assert_eq!(
+            meeting_line(&recording_meeting(None)).as_deref(),
+            Some("Meeting recording since 09:30")
+        );
+        let processing = MeetingStatus {
+            phase: MeetingPhase::Processing,
+            ..Default::default()
+        };
+        assert_eq!(
+            meeting_line(&processing).as_deref(),
+            Some("Processing meeting...")
+        );
+    }
+
+    #[test]
+    fn idle_meeting_menu_offers_only_start() {
+        assert_eq!(
+            labels(&meeting_menu_items(&MeetingStatus::default())),
+            vec![("Start meeting".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn recording_meeting_menu_offers_status_stop_and_cancel() {
+        assert_eq!(
+            labels(&meeting_menu_items(&recording_meeting(None))),
+            vec![
+                ("Meeting recording since 09:30".to_string(), false),
+                ("Stop meeting".to_string(), true),
+                ("Cancel meeting".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn meeting_menu_items_send_toggle_and_cancel() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let mut tray = tray_with(cmd_tx, State::Idle, recording_meeting(None));
+
+        click(&mut tray, "Stop meeting");
+        click(&mut tray, "Cancel meeting");
+
+        for expected in [MeetingAction::Toggle, MeetingAction::Cancel] {
+            let cmd = cmd_rx.try_recv().expect("a meeting command is queued");
+            assert!(
+                matches!(cmd, Command::Meeting { action, title: None, id: None } if action == expected),
+                "expected meeting {expected:?}, got {cmd:?}"
+            );
+        }
+    }
+
+    /// The meeting shows in the icon and tooltip only while dictation is
+    /// idle; a dictation in progress keeps its own icon, and the meeting is
+    /// still named in the tooltip.
+    #[test]
+    fn dictation_state_wins_the_icon_during_a_meeting() {
+        let (cmd_tx, _rx) = mpsc::channel(1);
+        let idle = tray_with(cmd_tx.clone(), State::Idle, recording_meeting(Some("x")));
+        assert_eq!(idle.icon_pixmap()[0].data, icons::meeting_recording());
+        assert_eq!(
+            idle.tool_tip().description,
+            "Meeting recording since 09:30 (x)"
+        );
+
+        let dictating = tray_with(cmd_tx, State::Recording, recording_meeting(Some("x")));
+        assert_eq!(
+            dictating.icon_pixmap()[0].data,
+            icons::for_state(State::Recording)[0].data
+        );
+        assert!(dictating
+            .tool_tip()
+            .description
+            .ends_with("Meeting recording since 09:30 (x)"));
+    }
+
+    #[test]
+    fn meeting_icons_are_distinct_from_dictation_icons() {
+        let ring = icons::meeting_recording();
+        assert_eq!(ring.len(), 16 * 16 * 4);
+        assert_ne!(ring, icons::for_state(State::Recording)[0].data);
+        assert_ne!(
+            icons::meeting_processing(),
+            icons::for_state(State::Transcribing)[0].data
+        );
+        assert_ne!(ring, icons::meeting_processing());
+    }
+
     /// `activate()` (left-click on the tray icon) is the only tray-driven
     /// command, and nothing checks that it still sends `Toggle` after a
     /// refactor — a typo'd variant here would ship silently. Pin it.
     #[test]
     fn activate_queues_toggle_command() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
-        let mut tray = WhisrsTray {
-            state: TrayState {
-                current: State::Idle,
-            },
-            cmd_tx,
-            notify: None,
-        };
+        let mut tray = tray_with(cmd_tx, State::Idle, MeetingStatus::default());
 
         tray.activate(0, 0);
 

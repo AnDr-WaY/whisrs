@@ -56,6 +56,9 @@ pub struct Phrase {
     /// True when this phrase starts at a forced cut boundary (mid-speech),
     /// i.e. it continues the previous phrase rather than starting fresh.
     pub continuation: bool,
+    /// Index of the phrase's first sample in the whole stream fed so far,
+    /// so a caller can place the phrase on the input's timeline.
+    pub start_sample: u64,
 }
 
 /// Incremental silence-delimited phrase splitter over i16 PCM samples.
@@ -85,6 +88,9 @@ pub struct PhraseSplitter {
     trailing_silence: usize,
     /// True while the open phrase started at a forced cut boundary.
     continuation: bool,
+    /// Samples dropped from the front of `buffer` since the stream began, so
+    /// `consumed + k` is the stream index of `buffer[k]`.
+    consumed: u64,
 }
 
 impl PhraseSplitter {
@@ -140,6 +146,7 @@ impl PhraseSplitter {
             speech_frames: 0,
             trailing_silence: 0,
             continuation: false,
+            consumed: 0,
         }
     }
 
@@ -180,6 +187,7 @@ impl PhraseSplitter {
         let phrase = Phrase {
             samples: self.buffer[self.emit_start_frame * self.frame_len..end_sample].to_vec(),
             continuation: self.continuation,
+            start_sample: self.stream_index(self.emit_start_frame),
         };
         self.clear();
         Some(phrase)
@@ -253,6 +261,7 @@ impl PhraseSplitter {
                     [self.emit_start_frame * self.frame_len..end_frame * self.frame_len]
                     .to_vec(),
                 continuation: self.continuation,
+                start_sample: self.stream_index(self.emit_start_frame),
             });
         }
 
@@ -323,6 +332,7 @@ impl PhraseSplitter {
                 [self.emit_start_frame * self.frame_len..split_frame * self.frame_len]
                 .to_vec(),
             continuation: self.continuation,
+            start_sample: self.stream_index(self.emit_start_frame),
         });
 
         self.drop_frames(split_frame);
@@ -342,16 +352,23 @@ impl PhraseSplitter {
             .count();
     }
 
+    /// Stream index of the first sample of buffered frame `frame`.
+    fn stream_index(&self, frame: usize) -> u64 {
+        self.consumed + (frame * self.frame_len) as u64
+    }
+
     /// Drop the first `n` analyzed frames (and their samples) from the front.
     fn drop_frames(&mut self, n: usize) {
         if n == 0 {
             return;
         }
+        self.consumed += (n * self.frame_len) as u64;
         self.buffer.drain(..n * self.frame_len);
         self.energies.drain(..n);
     }
 
     fn clear(&mut self) {
+        self.consumed += self.buffer.len() as u64;
         self.buffer.clear();
         self.energies.clear();
         self.in_phrase = false;
@@ -678,5 +695,55 @@ mod tests {
         s.feed(&frames(&[(0, 1000)]));
         // Only the pad frame (plus at most a partial tail) may remain.
         assert!(s.buffer.len() <= 2 * FRAME);
+    }
+
+    /// Every emitted phrase is the exact input slice at `start_sample`.
+    fn assert_phrases_at_their_offsets(audio: &[i16], phrases: &[Phrase]) {
+        for p in phrases {
+            let start = p.start_sample as usize;
+            assert_eq!(
+                &audio[start..start + p.samples.len()],
+                p.samples.as_slice(),
+                "phrase at {start} is not the input slice at that offset"
+            );
+        }
+    }
+
+    #[test]
+    fn start_sample_places_natural_phrases_on_the_input_timeline() {
+        let mut s = splitter();
+        let audio = frames(&[(0, 20), (SPEECH, 4), (0, 10), (SPEECH, 4), (0, 2)]);
+        let mut phrases = s.feed(&audio);
+        phrases.extend(s.flush());
+        assert_eq!(phrases.len(), 2);
+        // Speech onset minus one pad frame.
+        assert_eq!(phrases[0].start_sample, (19 * FRAME) as u64);
+        assert_eq!(phrases[1].start_sample, (33 * FRAME) as u64);
+        assert_phrases_at_their_offsets(&audio, &phrases);
+    }
+
+    #[test]
+    fn start_sample_survives_forced_cuts_and_chunked_feeding() {
+        let mut s = splitter();
+        let audio = frames(&[(0, 7), (SPEECH, 300), (0, 5)]);
+        let mut phrases = Vec::new();
+        // Odd-sized chunks so frame boundaries never line up with feeds.
+        for chunk in audio.chunks(37) {
+            phrases.extend(s.feed(chunk));
+        }
+        phrases.extend(s.flush());
+        assert!(phrases.len() >= 3, "300 voiced frames must force-cut");
+        assert!(phrases[1].continuation);
+        assert_phrases_at_their_offsets(&audio, &phrases);
+        // Contiguous across forced cuts: each continuation starts where the
+        // previous phrase ended.
+        for pair in phrases.windows(2) {
+            if pair[1].continuation {
+                assert_eq!(
+                    pair[1].start_sample,
+                    pair[0].start_sample + pair[0].samples.len() as u64
+                );
+            }
+        }
     }
 }

@@ -8,7 +8,11 @@ use reqwest::multipart;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::{
+    secs_to_ms, segments_by_phrase, Segment, Transcript, TranscriptionBackend, TranscriptionConfig,
+};
 
 /// Keep a guardrail so a runaway recording does not create an unbounded
 /// multipart request.
@@ -19,6 +23,9 @@ pub struct AsrSidecarBackend {
     client: reqwest::Client,
     url: String,
     api_key: Option<String>,
+    /// Set once the sidecar answered without `segments`, so later meeting
+    /// chunks go straight to the phrase fallback.
+    no_segments: AtomicBool,
 }
 
 impl AsrSidecarBackend {
@@ -30,15 +37,15 @@ impl AsrSidecarBackend {
             api_key: api_key
                 .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty()),
+            no_segments: AtomicBool::new(false),
         }
     }
 
     /// The endpoint this backend posts to, exactly as configured.
     ///
-    /// Test seam. The backend factory is the only place a URL and a key are
-    /// joined into a backend, and it lives in the `whisrsd` binary crate, so
-    /// neither `#[cfg(test)]` nor `pub(crate)` here is visible to the test that
-    /// proves that wiring. Hidden from the docs to keep it off the supported
+    /// Test seam. The backend factory ([`super::factory`]) is the only place a
+    /// URL and a key are joined into a backend, and its test proves that wiring
+    /// through this accessor. Hidden from the docs to keep it off the supported
     /// surface.
     #[doc(hidden)]
     pub fn url(&self) -> &str {
@@ -53,64 +60,9 @@ impl AsrSidecarBackend {
     }
 }
 
-/// The URL actually posted to, with trailing path slashes removed.
-///
-/// Some OpenAI-compatible endpoints 307-redirect when the URL has a trailing
-/// slash, which can downgrade http→https and cause reqwest to abort multipart
-/// POSTs. Trimming makes both forms work without a redirect. A URL made only of
-/// slashes would trim to the empty string, which reqwest rejects with an opaque
-/// relative-URL error, so keep the original in that case and let the request
-/// fail against what the user actually configured.
-///
-/// Only the *path* carries that noise. A trailing slash inside a query value or
-/// a fragment is data the user typed, so a URL carrying `?` or `#` is posted
-/// exactly as configured rather than silently rewritten.
-fn effective_url(url: &str) -> &str {
-    if url.contains('?') || url.contains('#') {
-        return url;
-    }
-    let trimmed = url.trim_end_matches('/');
-    if trimmed.is_empty() {
-        url
-    } else {
-        trimmed
-    }
-}
-
-/// Response from the ASR sidecar.
-#[derive(Debug, Deserialize)]
-pub struct AsrSidecarResponse {
-    /// Plain text transcript. Sidecars may also return richer diarized output,
-    /// but whisrs currently consumes the flattened text for typing.
-    pub text: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AsrSidecarErrorResponse {
-    error: Option<String>,
-    detail: Option<serde_json::Value>,
-}
-
-impl AsrSidecarErrorResponse {
-    fn message(&self) -> String {
-        if let Some(error) = &self.error {
-            return error.clone();
-        }
-        match &self.detail {
-            Some(serde_json::Value::String(detail)) => detail.clone(),
-            Some(detail) => detail.to_string(),
-            None => "unknown sidecar error".to_string(),
-        }
-    }
-}
-
-#[async_trait]
-impl TranscriptionBackend for AsrSidecarBackend {
-    async fn transcribe(
-        &self,
-        audio: &[u8],
-        config: &TranscriptionConfig,
-    ) -> anyhow::Result<String> {
+impl AsrSidecarBackend {
+    /// POST `audio` to the sidecar and return the raw success body.
+    async fn post(&self, audio: &[u8], config: &TranscriptionConfig) -> anyhow::Result<String> {
         if audio.len() > MAX_FILE_SIZE {
             anyhow::bail!(
                 "audio file too large ({} bytes, max {} bytes / 1GB)",
@@ -171,7 +123,119 @@ impl TranscriptionBackend for AsrSidecarBackend {
             }
             anyhow::bail!("ASR sidecar error ({}): {}", status.as_u16(), body);
         }
+        Ok(body)
+    }
+}
 
+/// Longest chunk sent to the sidecar in one request.
+const SIDECAR_CHUNK_SECS: u32 = 600;
+
+#[derive(Debug, Deserialize)]
+struct SidecarSegmentsResponse {
+    #[serde(default)]
+    segments: Option<Vec<SidecarSegment>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarSegment {
+    start: f64,
+    end: f64,
+    #[serde(default)]
+    text: String,
+    /// Diarizing sidecars label speakers with a string or a number.
+    #[serde(default)]
+    speaker: Option<serde_json::Value>,
+}
+
+/// Parse the optional `segments: [{start, end, text, speaker?}]` (seconds) of
+/// a sidecar response.
+///
+/// `Ok(None)` means the sidecar sent no `segments` key at all and the caller
+/// should fall back to phrases; `Ok(Some(..))` with no segments is a sidecar
+/// that segments but heard nothing.
+pub fn parse_sidecar_segments(body: &str) -> anyhow::Result<Option<Transcript>> {
+    let parsed: SidecarSegmentsResponse = serde_json::from_str(body)?;
+    Ok(parsed.segments.map(|segments| Transcript {
+        segments: segments
+            .into_iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .map(|s| {
+                let start_ms = secs_to_ms(s.start);
+                Segment {
+                    start_ms,
+                    end_ms: secs_to_ms(s.end).max(start_ms),
+                    text: s.text.trim().to_string(),
+                    speaker: s.speaker.and_then(|v| match v {
+                        serde_json::Value::String(s) => Some(s),
+                        serde_json::Value::Null => None,
+                        other => Some(other.to_string()),
+                    }),
+                    words: None,
+                }
+            })
+            .collect(),
+    }))
+}
+
+/// The URL actually posted to, with trailing path slashes removed.
+///
+/// Some OpenAI-compatible endpoints 307-redirect when the URL has a trailing
+/// slash, which can downgrade http→https and cause reqwest to abort multipart
+/// POSTs. Trimming makes both forms work without a redirect. A URL made only of
+/// slashes would trim to the empty string, which reqwest rejects with an opaque
+/// relative-URL error, so keep the original in that case and let the request
+/// fail against what the user actually configured.
+///
+/// Only the *path* carries that noise. A trailing slash inside a query value or
+/// a fragment is data the user typed, so a URL carrying `?` or `#` is posted
+/// exactly as configured rather than silently rewritten.
+fn effective_url(url: &str) -> &str {
+    if url.contains('?') || url.contains('#') {
+        return url;
+    }
+    let trimmed = url.trim_end_matches('/');
+    if trimmed.is_empty() {
+        url
+    } else {
+        trimmed
+    }
+}
+
+/// Response from the ASR sidecar.
+#[derive(Debug, Deserialize)]
+pub struct AsrSidecarResponse {
+    /// Plain text transcript. Sidecars may also return richer diarized output,
+    /// but whisrs currently consumes the flattened text for typing.
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AsrSidecarErrorResponse {
+    error: Option<String>,
+    detail: Option<serde_json::Value>,
+}
+
+impl AsrSidecarErrorResponse {
+    fn message(&self) -> String {
+        if let Some(error) = &self.error {
+            return error.clone();
+        }
+        match &self.detail {
+            Some(serde_json::Value::String(detail)) => detail.clone(),
+            Some(detail) => detail.to_string(),
+            None => "unknown sidecar error".to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl TranscriptionBackend for AsrSidecarBackend {
+    async fn transcribe(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<String> {
+        let body = self.post(audio, config).await?;
         let parsed: AsrSidecarResponse = serde_json::from_str(&body)?;
         let text = parsed.text.trim().to_string();
 
@@ -189,6 +253,28 @@ impl TranscriptionBackend for AsrSidecarBackend {
     // sent as the `hotwords` multipart field.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         true
+    }
+
+    // Native segments when the sidecar returns them; otherwise the phrase
+    // fallback, and the whole-chunk request is not repeated for later chunks.
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        if !self.no_segments.load(Ordering::Relaxed) {
+            let body = self.post(audio, config).await?;
+            if let Some(transcript) = parse_sidecar_segments(&body)? {
+                return Ok(transcript);
+            }
+            debug!("ASR sidecar returned no segments; transcribing phrase by phrase");
+            self.no_segments.store(true, Ordering::Relaxed);
+        }
+        segments_by_phrase(self, audio, config).await
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(SIDECAR_CHUNK_SECS)
     }
 }
 
@@ -454,5 +540,52 @@ mod tests {
         let body = r#"{"detail": "request asked for wrong model"}"#;
         let parsed: AsrSidecarErrorResponse = serde_json::from_str(body).unwrap();
         assert_eq!(parsed.message(), "request asked for wrong model");
+    }
+
+    #[test]
+    fn parse_sidecar_with_segments() {
+        let body = r#"{"text": "hi there. yes", "segments": [
+            {"start": 0.5, "end": 1.25, "text": " hi there.", "speaker": "SPEAKER_00"},
+            {"start": 2.0, "end": 2.4, "text": "yes", "speaker": 1},
+            {"start": 3.0, "end": 3.1, "text": "  "}
+        ]}"#;
+        let t = parse_sidecar_segments(body)
+            .unwrap()
+            .expect("segments present");
+        assert_eq!(t.segments.len(), 2);
+        assert_eq!((t.segments[0].start_ms, t.segments[0].end_ms), (500, 1250));
+        assert_eq!(t.segments[0].text, "hi there.");
+        assert_eq!(t.segments[0].speaker.as_deref(), Some("SPEAKER_00"));
+        assert_eq!(t.segments[1].speaker.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn parse_sidecar_without_segments_asks_for_the_fallback() {
+        assert!(parse_sidecar_segments(r#"{"text": "hello"}"#)
+            .unwrap()
+            .is_none());
+        let empty = parse_sidecar_segments(r#"{"text": "", "segments": []}"#).unwrap();
+        assert_eq!(empty, Some(Transcript::default()));
+    }
+
+    #[tokio::test]
+    async fn transcribe_segments_uses_sidecar_segments() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"text": "ok", "segments": [{"start": 1.0, "end": 2.0, "text": "ok"}]}"#,
+        ));
+
+        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
+        let t = backend
+            .transcribe_segments(&wav, &test_config())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(t.segments.len(), 1);
+        assert_eq!(t.segments[0].start_ms, 1000);
+        assert!(!backend.no_segments.load(Ordering::Relaxed));
     }
 }

@@ -149,6 +149,12 @@ IPC socket.
 .TP
 .I ~/.cache/whisrs/recovery/
 Audio recovery files saved on transcription failure.
+.TP
+.I $XDG_DATA_HOME/whisrs/meetings/
+Meeting recordings and transcripts, one folder per meeting. Override with
+.B [meeting] dir
+in
+.IR config.toml .
 .SH EXAMPLES
 Run the daemon in the foreground with debug logging:
 .PP

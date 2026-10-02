@@ -386,6 +386,23 @@ response_format = "wav"     # audio format requested from the API
 # url = "http://127.0.0.1:8880/v1/audio/speech"  # tts-sidecar only: local
 #                           #   OpenAI-compatible server (Kokoro, Supertonic, ...)
 
+# Meeting mode (optional). Records your mic and the system audio as two
+# tracks, then transcribes them after the meeting. Every key is optional;
+# see "Meeting mode" below for how it works.
+[meeting]
+# backend = "groq"            # default: [general] backend. Batch backends only:
+#                             #   groq | openai | deepgram | asr-sidecar | local-whisper.
+#                             #   deepgram-streaming uses Deepgram's REST API here.
+#                             #   openai-realtime and openai-compatible-realtime are rejected.
+# user_name = "Ada"           # your label in transcripts; default: your full name
+#                             #   from the system account, else $USER
+# mic_device = "..."          # default: [audio] device
+# system_device = "default"   # "default" = monitor of the default output,
+#                             #   "none" = mic only, or a source name ending in .monitor
+max_duration_minutes = 180    # recording stops by itself after this long (1 to 2160)
+audio_retention_days = 7      # 0 = delete audio once transcribed, negative = keep forever
+# dir = "~/Meetings"          # default: ~/.local/share/whisrs/meetings
+
 # Built-in global hotkeys (optional, works without WM keybinds)
 # Triggers: A-Z, 0-9, F1-F24, space, enter, escape, tab, backspace, delete,
 #   insert, home, end, pageup, pagedown, up, down, left, right, scrolllock,
@@ -403,6 +420,7 @@ toggle = "Super+Shift+W"
 cancel = "Super+Shift+D"
 command = "Super+Shift+G"
 speak = "Super+Shift+R"
+meeting = "Super+Shift+M"     # start or stop a meeting recording
 
 # Recording-lifecycle hooks: pause playing MPRIS media while dictating, run
 # shell commands fire-and-forget on record start/stop.  The child inherits the
@@ -520,6 +538,72 @@ everything whisrs types, pastes or copies, wherever it is going.
 - An ALSA PCM name, such as `pipewire`, `plughw:1,0` or `sysdefault:CARD=PCH` (see `arecord -L`). This also covers systems without a PulseAudio or PipeWire server.
 
 PulseAudio/PipeWire sources are checked first, then ALSA names. A name that matches nothing logs a warning listing the valid names and falls back to the system default. The daemon reads the device when it starts, so restart it after a change (`whisrs restart`); its startup log shows which device the name resolved to. Audio cues and read-aloud playback always use the default output device.
+
+## Meeting mode
+
+`whisrs meeting start [--title ...]` (or the `[hotkeys] meeting` binding, or
+"Start meeting" in the tray menu) records a meeting; `whisrs meeting stop` ends
+it and queues the transcript. `whisrs meeting cancel` stops and deletes it. The
+`meeting` hotkey toggles: it starts a meeting when none is recording and stops
+the one that is.
+
+**Two tracks.** Your microphone and the system audio (what your speakers or
+headphones play) are recorded as separate files and transcribed separately.
+Your track is labeled with `user_name`, and everything from the system track is
+labeled "Others". There is no per-person speaker detection on the other side
+yet.
+
+**Headphones are recommended.** With speakers, the other side leaks into your
+microphone. whisrs drops those echoed lines from your track, but headphones
+give a cleaner transcript and avoid the occasional miss.
+
+**Dictation keeps working.** A meeting records in the background, so
+`whisrs toggle`, command mode and read-aloud work as usual while it runs. The
+tray shows a ring icon while a meeting records (as long as you are not
+dictating at that moment).
+
+**Backends.** A meeting is transcribed from its recording after it ends, so it
+needs a batch backend: groq, openai, deepgram, asr-sidecar or local-whisper.
+`backend` defaults to `[general] backend`. With `deepgram-streaming` the meeting
+goes to Deepgram's REST API. The realtime backends (`openai-realtime`,
+`openai-compatible-realtime`) cannot transcribe a recording: setting one as
+`[meeting] backend` is a config error, and inheriting one from `[general]`
+gives a startup warning, since meetings would record but fail to transcribe.
+
+**Devices.** `mic_device` defaults to `[audio] device`. `system_device`
+defaults to the monitor of your default output device, found when the meeting
+starts, so it follows headphones you plug in before the meeting. Set it to
+`"none"` to record only your mic, or to a specific monitor source from
+`pactl list short sources` (names ending in `.monitor`). `whisrs config` lists
+the monitors under "Meeting mode". If the system audio cannot be opened, the
+meeting records your mic only and notes that in the transcript.
+
+**Where meetings are saved.** Each meeting gets its own folder under `dir`
+(default `~/.local/share/whisrs/meetings`), named after its start time and
+title, for example `2026-10-02_0930_standup/`:
+
+```
+2026-10-02_0930_standup/
+├── meeting.json          # status, tracks, speakers and the timed transcript
+├── 2026-10-02_0930_standup.md   # the readable transcript
+└── audio/
+    ├── mic.wav
+    └── system.wav
+```
+
+`whisrs meeting list` shows them, `whisrs meeting show last` prints the latest
+transcript and `whisrs meeting copy last` copies it.
+
+**Audio retention.** `audio_retention_days` controls how long the `audio/`
+folder of a transcribed meeting is kept: `7` (the default) deletes it a week
+later, `0` deletes it as soon as the transcript is written, and a negative
+value keeps it forever. The transcript and `meeting.json` are never deleted. A
+meeting whose transcription failed always keeps its audio, so you can fix the
+cause (a missing API key, a network error) and run `whisrs meeting retry`.
+
+`max_duration_minutes` (default 180, at most 2160) stops a recording that was
+left running. A meeting interrupted by a crash or reboot is recovered from its
+audio the next time the daemon starts.
 
 ## The vocabulary file
 

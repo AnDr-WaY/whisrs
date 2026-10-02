@@ -139,6 +139,8 @@ pub struct HotkeyConfig {
     /// Hotkey to read the selected text aloud (e.g. "Super+Shift+R").
     #[serde(alias = "read")]
     pub speak: Option<String>,
+    /// Hotkey to start or stop a meeting recording (e.g. "Super+Shift+M").
+    pub meeting: Option<String>,
 }
 
 /// Recording-lifecycle hooks. `media_auto_pause` pauses the MPRIS players
@@ -1538,6 +1540,18 @@ const BACKEND_NAMES: &[BackendName] = &[
     },
 ];
 
+/// Upper bound for `[meeting] max_duration_minutes`: 36 hours, under the
+/// ~37 h a 16 kHz mono 16-bit WAV can hold before its u32 size field wraps.
+pub const MAX_MEETING_DURATION_MINUTES: u32 = 2160;
+
+/// The backends meeting mode can transcribe with, as named in messages.
+const MEETING_BATCH_BACKENDS: &str = "groq, openai, deepgram, asr-sidecar, local-whisper";
+
+/// Backends that only stream live audio and cannot transcribe a recording.
+fn is_realtime_backend(backend: &str) -> bool {
+    matches!(backend, "openai-realtime" | "openai-compatible-realtime")
+}
+
 /// The names of every [`BACKEND_NAMES`] entry of one kind, in order.
 fn backend_names_of(kind: BackendNameKind) -> Vec<&'static str> {
     BACKEND_NAMES
@@ -1989,6 +2003,8 @@ impl Config {
             }
         }
 
+        warnings.extend(self.validate_meeting()?);
+
         // Duplicate-binding detection across [hotkeys] and llm_commands. The
         // listener dispatches every action whose binding matches, with no
         // early exit, so a shared combo silently fires multiple commands and
@@ -2002,6 +2018,7 @@ impl Config {
                 ("[hotkeys] cancel", &hotkeys.cancel),
                 ("[hotkeys] command", &hotkeys.command),
                 ("[hotkeys] speak", &hotkeys.speak),
+                ("[hotkeys] meeting", &hotkeys.meeting),
             ] {
                 if let Some(spec) = value {
                     binding_sources.push((label.to_string(), spec.as_str()));
@@ -2102,6 +2119,166 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Checks for meeting mode (`[meeting]` and `[hotkeys] meeting`).
+    ///
+    /// Skipped entirely when neither is set: meeting mode is opt-in, so a
+    /// dictation-only config must not get warnings about a feature it never
+    /// uses (an `openai-realtime` dictation user would otherwise be told on
+    /// every start that meetings cannot use their backend). When it is in
+    /// use, only values the user wrote are errors; a problem inherited from
+    /// `[general] backend` is a warning, because dictation with that backend
+    /// is fine and must keep starting. The meeting itself then fails at
+    /// processing time with the audio kept for `whisrs meeting retry`.
+    fn validate_meeting(&self) -> Result<Vec<ConfigWarning>, WhisrsError> {
+        let mut warnings = Vec::new();
+        let hotkey_set = self
+            .hotkeys
+            .as_ref()
+            .and_then(|h| h.meeting.as_deref())
+            .is_some_and(|s| !s.trim().is_empty());
+        if self.meeting.is_none() && !hotkey_set {
+            return Ok(warnings);
+        }
+        let meeting = MeetingConfig::effective(self);
+
+        // The WAV header stores the data size as a u32, which caps a 16 kHz
+        // mono 16-bit track at about 37 hours. 2160 minutes (36 h) stays
+        // under that with room to spare.
+        if !(1..=MAX_MEETING_DURATION_MINUTES).contains(&meeting.max_duration_minutes) {
+            return Err(WhisrsError::Config(format!(
+                "[meeting] max_duration_minutes = {} is out of range: use 1 to \
+                 {MAX_MEETING_DURATION_MINUTES} (36 hours, the most a WAV track can hold).",
+                meeting.max_duration_minutes
+            )));
+        }
+
+        match meeting.backend.as_deref().map(str::trim) {
+            Some(backend) => {
+                let Some(entry) = BACKEND_NAMES.iter().find(|b| b.name == backend) else {
+                    return Err(WhisrsError::Config(format!(
+                        "[meeting] backend = \"{backend}\" is not a backend. Use one of: \
+                         {MEETING_BATCH_BACKENDS}, or remove the key to use [general] backend."
+                    )));
+                };
+                if entry.kind == BackendNameKind::Stub {
+                    return Err(WhisrsError::Config(format!(
+                        "[meeting] backend = \"{backend}\" is not implemented yet. Use one \
+                         of: {MEETING_BATCH_BACKENDS}."
+                    )));
+                }
+                if is_realtime_backend(backend) {
+                    return Err(WhisrsError::Config(format!(
+                        "[meeting] backend = \"{backend}\" cannot transcribe meetings: \
+                         realtime backends only stream live audio, and a meeting is \
+                         transcribed from its recording after it ends. Use a batch backend: \
+                         {MEETING_BATCH_BACKENDS} (deepgram-streaming also works and uses \
+                         Deepgram's REST API for meetings)."
+                    )));
+                }
+                if let Some(message) = self.meeting_backend_credential_gap(backend) {
+                    warnings.push(ConfigWarning { message });
+                }
+            }
+            None => {
+                let backend = self.general.backend.as_str();
+                if is_realtime_backend(backend) {
+                    warnings.push(ConfigWarning {
+                        message: format!(
+                            "Meeting mode uses [general] backend = \"{backend}\", which \
+                             cannot transcribe meetings (realtime backends only stream live \
+                             audio). Meetings still record, but processing fails until you set \
+                             [meeting] backend to a batch backend: {MEETING_BATCH_BACKENDS}. \
+                             Failed meetings keep their audio, so `whisrs meeting retry` works \
+                             after the fix."
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Device sanity. Only an explicit system source can be wrong here:
+        // unset or "default" resolves to the default sink's monitor at start.
+        let mic = meeting
+            .mic_device
+            .as_deref()
+            .unwrap_or(self.audio.device.as_str())
+            .trim();
+        if let Some(system) = meeting.system_device.as_deref().map(str::trim) {
+            let is_preset = system.is_empty() || system == "default" || system == "none";
+            if !is_preset && system == mic {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "[meeting] system_device and the meeting microphone are both \
+                         \"{system}\": both tracks would record the same source, so every \
+                         line would appear twice. Point system_device at a monitor source \
+                         (or remove it to use the default monitor)."
+                    ),
+                });
+            } else if !is_preset && !system.ends_with(".monitor") {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "[meeting] system_device = \"{system}\" does not end in \
+                         \".monitor\", so it is probably a microphone rather than the audio \
+                         you hear. Run `pactl list short sources` to find the monitor of your \
+                         output device, or remove the key to use the default monitor."
+                    ),
+                });
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    /// Why an explicit `[meeting] backend` will fail for lack of credentials,
+    /// if it will. Only checked when it differs from `[general] backend`,
+    /// whose own credentials `validate` already requires.
+    fn meeting_backend_credential_gap(&self, backend: &str) -> Option<String> {
+        if backend == self.general.backend {
+            return None;
+        }
+        let key_missing = |config_key: Option<&str>, env: &str| {
+            let has_config = config_key.is_some_and(|k| !k.is_empty());
+            let has_env = std::env::var(env).map(|k| !k.is_empty()).unwrap_or(false);
+            !has_config && !has_env
+        };
+        let missing = match backend {
+            "deepgram" | "deepgram-streaming" => key_missing(
+                self.deepgram.as_ref().map(|d| d.api_key.as_str()),
+                "WHISRS_DEEPGRAM_API_KEY",
+            )
+            .then_some("[deepgram] api_key (or WHISRS_DEEPGRAM_API_KEY)"),
+            "groq" => key_missing(
+                self.groq.as_ref().map(|g| g.api_key.as_str()),
+                "WHISRS_GROQ_API_KEY",
+            )
+            .then_some("[groq] api_key (or WHISRS_GROQ_API_KEY)"),
+            "openai" => key_missing(
+                self.openai.as_ref().map(|o| o.api_key.as_str()),
+                "WHISRS_OPENAI_API_KEY",
+            )
+            .then_some("[openai] api_key (or WHISRS_OPENAI_API_KEY)"),
+            "asr-sidecar" | "asr" | "vibevoice" => self
+                .asr_sidecar
+                .as_ref()
+                .is_none_or(|a| a.url.trim().is_empty())
+                .then_some("[asr-sidecar] url"),
+            "local-whisper" | "local" => {
+                let model_path = self
+                    .local_whisper
+                    .as_ref()
+                    .map(|l| l.model_path.clone())
+                    .unwrap_or_else(default_whisper_model_path);
+                (!std::path::Path::new(&model_path).exists())
+                    .then_some("a whisper model file (run 'whisrs setup' to download one)")
+            }
+            _ => None,
+        }?;
+        Some(format!(
+            "[meeting] backend = \"{backend}\" needs {missing}; meetings will record but \
+             fail to transcribe until it is set."
+        ))
     }
 
     /// The Deepgram model this config will actually transcribe with.
@@ -4805,6 +4982,7 @@ mod tests {
             cancel: None,
             command: None,
             speak: None,
+            meeting: None,
         });
         config
             .llm_commands
@@ -4865,6 +5043,7 @@ mod tests {
             cancel: None,
             command: None,
             speak: Some("Meta+D".to_string()),
+            meeting: None,
         });
 
         let warnings = config.validate().unwrap();
@@ -4884,6 +5063,171 @@ mod tests {
         );
     }
 
+    fn meeting_config(edit: impl FnOnce(&mut MeetingConfig)) -> Option<MeetingConfig> {
+        let mut meeting = MeetingConfig::default();
+        edit(&mut meeting);
+        Some(meeting)
+    }
+
+    fn meeting_warnings(config: &Config) -> Vec<String> {
+        config
+            .validate()
+            .expect("config validates")
+            .into_iter()
+            .map(|w| w.message)
+            .filter(|m| m.contains("eeting"))
+            .collect()
+    }
+
+    #[test]
+    fn meeting_checks_are_skipped_when_meeting_mode_is_unused() {
+        // A realtime dictation user who never touched meetings gets no
+        // meeting warning on every start.
+        let config = validatable_config("openai-realtime");
+        assert!(meeting_warnings(&config).is_empty());
+    }
+
+    #[test]
+    fn meeting_max_duration_out_of_range_is_an_error() {
+        for minutes in [0, MAX_MEETING_DURATION_MINUTES + 1] {
+            let mut config = validatable_config("groq");
+            config.meeting = meeting_config(|m| m.max_duration_minutes = minutes);
+            let err = config.validate().expect_err("out-of-range duration");
+            assert!(err.to_string().contains("max_duration_minutes"), "{err}");
+        }
+        for minutes in [1, MAX_MEETING_DURATION_MINUTES] {
+            let mut config = validatable_config("groq");
+            config.meeting = meeting_config(|m| m.max_duration_minutes = minutes);
+            config.validate().expect("in-range duration");
+        }
+    }
+
+    #[test]
+    fn explicit_realtime_meeting_backend_is_an_error() {
+        for backend in ["openai-realtime", "openai-compatible-realtime"] {
+            let mut config = validatable_config("groq");
+            config.meeting = meeting_config(|m| m.backend = Some(backend.to_string()));
+            let err = config.validate().expect_err("realtime meeting backend");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(backend) && msg.contains("groq, openai, deepgram"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_or_stub_meeting_backend_is_an_error() {
+        for backend in ["nope", "local-vosk"] {
+            let mut config = validatable_config("groq");
+            config.meeting = meeting_config(|m| m.backend = Some(backend.to_string()));
+            assert!(config.validate().is_err(), "{backend} must be rejected");
+        }
+    }
+
+    #[test]
+    fn batch_meeting_backends_are_accepted() {
+        for backend in ["groq", "openai", "deepgram", "deepgram-streaming"] {
+            let mut config = validatable_config("openai-realtime");
+            config.meeting = meeting_config(|m| m.backend = Some(backend.to_string()));
+            assert!(
+                meeting_warnings(&config).is_empty(),
+                "{backend}: {:?}",
+                meeting_warnings(&config)
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_realtime_backend_is_a_warning_not_an_error() {
+        // Via the hotkey alone, no [meeting] section.
+        let mut config = validatable_config("openai-realtime");
+        config.hotkeys = Some(HotkeyConfig {
+            meeting: Some("Super+Shift+M".to_string()),
+            ..Default::default()
+        });
+        let warnings = meeting_warnings(&config);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("openai-realtime") && w.contains("[meeting] backend")),
+            "{warnings:?}"
+        );
+
+        // Via a [meeting] section that leaves the backend unset.
+        let mut config = validatable_config("openai-compatible-realtime");
+        config.meeting = meeting_config(|_| {});
+        assert!(!meeting_warnings(&config).is_empty());
+    }
+
+    #[test]
+    fn meeting_backend_without_credentials_warns() {
+        let mut config = validatable_config("groq");
+        config.meeting = meeting_config(|m| m.backend = Some("asr-sidecar".to_string()));
+        let warnings = meeting_warnings(&config);
+        assert!(
+            warnings.iter().any(|w| w.contains("[asr-sidecar] url")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn meeting_system_device_equal_to_mic_warns() {
+        let mut config = validatable_config("groq");
+        config.audio.device = "alsa_input.usb-mic".to_string();
+        config.meeting =
+            meeting_config(|m| m.system_device = Some("alsa_input.usb-mic".to_string()));
+        let warnings = meeting_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("same source"), "{warnings:?}");
+    }
+
+    #[test]
+    fn meeting_system_device_that_is_not_a_monitor_warns() {
+        let mut config = validatable_config("groq");
+        config.meeting =
+            meeting_config(|m| m.system_device = Some("alsa_input.webcam".to_string()));
+        let warnings = meeting_warnings(&config);
+        assert!(
+            warnings.iter().any(|w| w.contains(".monitor")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn meeting_system_device_presets_and_monitors_do_not_warn() {
+        for system in [
+            "default",
+            "none",
+            "alsa_output.pci-0000.analog-stereo.monitor",
+        ] {
+            let mut config = validatable_config("groq");
+            config.meeting = meeting_config(|m| m.system_device = Some(system.to_string()));
+            assert!(
+                meeting_warnings(&config).is_empty(),
+                "{system}: {:?}",
+                meeting_warnings(&config)
+            );
+        }
+    }
+
+    #[test]
+    fn meeting_hotkey_collision_is_reported() {
+        let mut config = validatable_config("groq");
+        config.hotkeys = Some(HotkeyConfig {
+            toggle: Some("Super+Shift+M".to_string()),
+            meeting: Some("shift+super+m".to_string()),
+            ..Default::default()
+        });
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.message.contains("[hotkeys] meeting")),
+            "{warnings:?}"
+        );
+    }
+
     #[test]
     fn config_validate_no_collision_warning_for_distinct_bindings() {
         let mut config = validatable_config("groq");
@@ -4892,6 +5236,7 @@ mod tests {
             cancel: Some("Super+Shift+Escape".to_string()),
             command: Some("Super+Shift+C".to_string()),
             speak: Some("Super+Shift+R".to_string()),
+            meeting: Some("Super+Shift+M".to_string()),
         });
         config
             .llm_commands

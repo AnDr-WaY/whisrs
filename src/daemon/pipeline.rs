@@ -16,7 +16,7 @@ use whisrs::history::{self, HistoryEntry};
 use whisrs::llm;
 use whisrs::replacements::Replacer;
 use whisrs::state::Action;
-use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
+use whisrs::transcription::{transcription_prompt, TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
 use xkb_type::ClipboardBackend;
@@ -1271,24 +1271,6 @@ fn batch_transcription_config(
     }
 }
 
-/// Joins `prompt` and `vocabulary` with `". "`, prompt first. Blank prompts
-/// are treated as absent; returns `None` only when both inputs are empty so
-/// backends skip the hint entirely rather than receiving an empty string.
-fn transcription_prompt(prompt: Option<&str>, vocabulary: &[String]) -> Option<String> {
-    let prompt = prompt.map(str::trim).filter(|s| !s.is_empty());
-    let vocab = if vocabulary.is_empty() {
-        None
-    } else {
-        Some(vocabulary.join(", "))
-    };
-    match (prompt, vocab) {
-        (Some(p), Some(v)) => Some(format!("{p}. {v}")),
-        (Some(p), None) => Some(p.to_string()),
-        (None, Some(v)) => Some(v),
-        (None, None) => None,
-    }
-}
-
 /// Save a transcription to the history file, unless `[general] history` is
 /// off. `enabled` is a parameter, not a lookup, so no caller can skip the check.
 pub(crate) fn save_history_entry(
@@ -1873,6 +1855,20 @@ mod tests {
 
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             self.sends_prompt
+        }
+
+        // The batch path never asks for segments; meetings have their own
+        // fakes in `whisrs::meeting::process`.
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> anyhow::Result<whisrs::transcription::Transcript> {
+            unreachable!("the dictation batch path does not request segments")
+        }
+
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
         }
     }
 

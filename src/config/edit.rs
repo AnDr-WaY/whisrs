@@ -16,7 +16,7 @@ use dialoguer::{Confirm, Editor, Input, Select};
 
 use crate::config::{setup, vocabulary};
 use crate::service::ServiceManager;
-use crate::{Config, HotkeyConfig, RestartOutcome};
+use crate::{Config, HotkeyConfig, MeetingConfig, RestartOutcome};
 
 use setup::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
@@ -108,6 +108,7 @@ pub fn run_config_menu() -> Result<()> {
             "Recording hooks",
             "Command mode (LLM)",
             "Custom LLM commands",
+            "Meeting mode",
             "Show full config (masked)",
             "Open in $EDITOR",
             "─────────",
@@ -137,8 +138,9 @@ pub fn run_config_menu() -> Result<()> {
             11 => edit_media_hooks(&mut config)?,
             12 => edit_llm(&mut config)?,
             13 => edit_llm_commands(&mut config)?,
-            14 => show_config(&config),
-            15 => {
+            14 => edit_meeting(&mut config)?,
+            15 => show_config(&config),
+            16 => {
                 if open_in_editor(&mut config)? {
                     // External edit already wrote the file; reload and skip the
                     // normal save path so we don't clobber formatting/comments
@@ -146,17 +148,17 @@ pub fn run_config_menu() -> Result<()> {
                     println!("  {GREEN}Applied edits from $EDITOR.{RESET}");
                 }
             }
-            16 => {
+            17 => {
                 // separator — no-op
             }
-            17 => {
+            18 => {
                 if save_and_restart(&config, fresh, &vocabulary_baseline)? {
                     return Ok(());
                 }
                 // Validation failed — fall through to next loop iteration,
                 // preserving the in-memory `config` so the user can fix it.
             }
-            18 => {
+            19 => {
                 println!("\n  {DIM}Discarded changes.{RESET}");
                 return Ok(());
             }
@@ -455,11 +457,39 @@ fn edit_audio_device(config: &mut Config) -> Result<()> {
     println!("  Current: {}", config.audio.device);
 
     let devices = list_input_devices();
+    // Every spelling of "default" lands on the preset, not on "manual".
+    let current = if is_default_name(&config.audio.device) {
+        "default".to_string()
+    } else {
+        config.audio.device.clone()
+    };
+    let picked = select_input_device(
+        "Input device (restart the daemon to apply)",
+        &[("System default".to_string(), Some("default".to_string()))],
+        &devices,
+        Some(&current),
+        "Audio device name (\"default\" to use system default)",
+    )?;
+    config.audio.device = picked.unwrap_or_else(|| "default".to_string());
+    Ok(())
+}
+
+/// Pick an input device: a few fixed `presets` (label, stored value, where
+/// `None` means "unset the key"), then every detected device, then manual
+/// entry. `current` preselects the matching row; a value that matches neither
+/// a preset nor a device preselects manual entry.
+fn select_input_device(
+    prompt: &str,
+    presets: &[(String, Option<String>)],
+    devices: &[crate::audio::device::InputDeviceInfo],
+    current: Option<&str>,
+    manual_prompt: &str,
+) -> Result<Option<String>> {
     if devices.is_empty() {
-        println!("  {YELLOW}No input devices detected.{RESET}");
+        println!("  {YELLOW}No matching devices detected.{RESET}");
     }
 
-    let mut items = vec!["System default".to_string()];
+    let mut items: Vec<String> = presets.iter().map(|(label, _)| label.clone()).collect();
     items.extend(devices.iter().map(|d| {
         let monitor = if d.is_monitor() {
             " [system audio]"
@@ -469,37 +499,161 @@ fn edit_audio_device(config: &mut Config) -> Result<()> {
         format!("{}  ({}){monitor}", d.description, d.id)
     }));
     items.push("Enter a name manually".to_string());
+    let manual = items.len() - 1;
 
-    let current = config.audio.device.trim();
-    let default = if is_default_name(current) {
-        0
+    let default = if let Some(i) = presets.iter().position(|(_, v)| v.as_deref() == current) {
+        i
     } else {
-        devices
-            .iter()
-            .position(|d| d.id == current)
-            .map(|i| i + 1)
-            .unwrap_or(items.len() - 1)
+        current
+            .and_then(|c| devices.iter().position(|d| d.id == c))
+            .map(|i| i + presets.len())
+            .unwrap_or(manual)
     };
 
     let choice = Select::new()
-        .with_prompt("Input device (restart the daemon to apply)")
+        .with_prompt(prompt)
         .items(&items)
         .default(default)
         .interact()
         .context("failed to read audio device choice")?;
 
-    config.audio.device = if choice == 0 {
-        "default".to_string()
-    } else if let Some(d) = devices.get(choice - 1) {
-        d.id.clone()
+    Ok(if let Some((_, value)) = presets.get(choice) {
+        value.clone()
+    } else if let Some(d) = devices.get(choice - presets.len()) {
+        Some(d.id.clone())
     } else {
-        Input::new()
-            .with_prompt("Audio device name (\"default\" to use system default)")
-            .default(config.audio.device.clone())
+        let name: String = Input::new()
+            .with_prompt(manual_prompt)
+            .default(current.unwrap_or("default").to_string())
             .interact_text()
-            .context("failed to read audio device")?
+            .context("failed to read audio device")?;
+        Some(name.trim().to_string())
+    })
+}
+
+/// Batch backends meeting mode can transcribe with. The realtime backends
+/// are left out on purpose: they only stream, and a meeting is transcribed
+/// from files after it ends. `deepgram-streaming` is left out because a
+/// meeting uses Deepgram's REST API either way.
+const MEETING_BACKENDS: [&str; 5] = ["groq", "openai", "deepgram", "asr-sidecar", "local-whisper"];
+
+fn edit_meeting(config: &mut Config) -> Result<()> {
+    use crate::audio::device::list_input_devices;
+
+    println!("\n  {BOLD}Meeting mode{RESET}");
+    println!(
+        "  {DIM}Records your mic and the system audio as separate tracks, then\n   \
+         transcribes them after the meeting. Start and stop it with\n   \
+         `whisrs meeting` or the [hotkeys] meeting binding.{RESET}"
+    );
+
+    let mut meeting = MeetingConfig::effective(config);
+
+    // Backend.
+    let mut backend_items = vec![format!("Same as dictation ({})", config.general.backend)];
+    backend_items.extend(MEETING_BACKENDS.iter().map(|b| b.to_string()));
+    let backend_default = match meeting.backend.as_deref() {
+        None => 0,
+        Some(b) => MEETING_BACKENDS
+            .iter()
+            .position(|m| *m == b)
+            .map(|i| i + 1)
+            .unwrap_or(0),
     };
+    let choice = Select::new()
+        .with_prompt("Transcription backend for meetings (batch backends only)")
+        .items(&backend_items)
+        .default(backend_default)
+        .interact()
+        .context("failed to read meeting backend")?;
+    meeting.backend = if choice == 0 {
+        None
+    } else {
+        Some(MEETING_BACKENDS[choice - 1].to_string())
+    };
+
+    // Speaker name.
+    meeting.user_name = prompt_optional_string(
+        "Your name in transcripts, defaults to your login name",
+        &meeting.user_name,
+    )?;
+
+    // Devices.
+    let devices = list_input_devices();
+    let (monitors, mics): (Vec<_>, Vec<_>) = devices.into_iter().partition(|d| d.is_monitor());
+
+    meeting.mic_device = select_input_device(
+        "Microphone",
+        &[
+            (
+                format!("Same as [audio] device ({})", config.audio.device),
+                None,
+            ),
+            ("System default".to_string(), Some("default".to_string())),
+        ],
+        &mics,
+        meeting.mic_device.as_deref(),
+        "Microphone device name",
+    )?;
+
+    // `"default"` is stored as unset: both mean the default monitor.
+    let system_current = match meeting.system_device.as_deref() {
+        Some("default") => None,
+        other => other,
+    };
+    meeting.system_device = select_input_device(
+        "System audio (what the other side says)",
+        &[
+            ("Default monitor (what you hear)".to_string(), None),
+            ("None (mic only)".to_string(), Some("none".to_string())),
+        ],
+        &monitors,
+        system_current,
+        "System audio source name (usually ends in .monitor)",
+    )?;
+
+    // Limits and storage.
+    meeting.max_duration_minutes = Input::new()
+        .with_prompt("Stop recording automatically after (minutes, 1-2160)")
+        .default(meeting.max_duration_minutes)
+        .validate_with(|v: &u32| {
+            if (1..=2160).contains(v) {
+                Ok(())
+            } else {
+                Err("must be between 1 and 2160")
+            }
+        })
+        .interact_text()
+        .context("failed to read max duration")?;
+
+    meeting.audio_retention_days = Input::new()
+        .with_prompt("Keep meeting audio for (days; 0 = delete once transcribed, -1 = forever)")
+        .default(meeting.audio_retention_days)
+        .interact_text()
+        .context("failed to read audio retention")?;
+
+    meeting.dir = prompt_optional_string(
+        "Meetings folder, defaults to ~/.local/share/whisrs/meetings",
+        &meeting.dir,
+    )?;
+
+    config.meeting = apply_meeting_edit(config.meeting.take(), meeting);
     Ok(())
+}
+
+/// Decide what to store after the meeting editor ran. An existing
+/// `[meeting]` section is always kept (even if every value is back at its
+/// default); a config without one only gains it when the user changed
+/// something, so walking through the editor does not add an empty section.
+fn apply_meeting_edit(
+    current: Option<MeetingConfig>,
+    edited: MeetingConfig,
+) -> Option<MeetingConfig> {
+    if current.is_some() || edited != MeetingConfig::default() {
+        Some(edited)
+    } else {
+        None
+    }
 }
 
 fn edit_key_delay(config: &mut Config) -> Result<()> {
@@ -592,6 +746,7 @@ fn edit_hotkeys(config: &mut Config) -> Result<()> {
     hotkeys.cancel = prompt_optional_string("Cancel hotkey", &hotkeys.cancel)?;
     hotkeys.command = prompt_optional_string("Command-mode hotkey", &hotkeys.command)?;
     hotkeys.speak = prompt_optional_string("Read-aloud hotkey", &hotkeys.speak)?;
+    hotkeys.meeting = prompt_optional_string("Meeting hotkey", &hotkeys.meeting)?;
 
     // Drop the whole section if every field is empty — keeps the TOML clean.
     config.hotkeys = if any_hotkey_set(&hotkeys) {
@@ -612,8 +767,13 @@ fn any_hotkey_set(hotkeys: &HotkeyConfig) -> bool {
         cancel,
         command,
         speak,
+        meeting,
     } = hotkeys;
-    toggle.is_some() || cancel.is_some() || command.is_some() || speak.is_some()
+    toggle.is_some()
+        || cancel.is_some()
+        || command.is_some()
+        || speak.is_some()
+        || meeting.is_some()
 }
 
 /// Prompt for a value that may be unset, seeded with the current one.
@@ -1279,8 +1439,8 @@ mod tests {
             .collect();
         assert_eq!(
             chains.len(),
-            17,
-            "the scan found {} `Input` chains, not 17. Fewer means a \
+            19,
+            "the scan found {} `Input` chains, not 19. Fewer means a \
              constructor spelling the needle misses, which makes this test \
              vacuous; more means a prompt was added — audit its chain against \
              the rules below, then bump this number",
@@ -1309,6 +1469,7 @@ mod tests {
             cancel: Some("b".into()),
             command: Some("c".into()),
             speak: Some("d".into()),
+            meeting: Some("e".into()),
         };
         let json = serde_json::to_value(&all_set).expect("HotkeyConfig serializes");
         json.as_object()
@@ -1316,6 +1477,64 @@ mod tests {
             .keys()
             .cloned()
             .collect()
+    }
+
+    /// Walking through the meeting editor without changing anything must not
+    /// add a `[meeting]` section; any change, or an existing section, keeps it.
+    #[test]
+    fn meeting_section_is_written_only_when_used() {
+        assert_eq!(apply_meeting_edit(None, MeetingConfig::default()), None);
+
+        let changed = MeetingConfig {
+            user_name: Some("Ada".into()),
+            ..Default::default()
+        };
+        assert_eq!(apply_meeting_edit(None, changed.clone()), Some(changed));
+
+        assert_eq!(
+            apply_meeting_edit(Some(MeetingConfig::default()), MeetingConfig::default()),
+            Some(MeetingConfig::default())
+        );
+    }
+
+    /// The menu labels and the `match selection` arms are two hand-kept lists;
+    /// pin that the meeting row lands on its own handler.
+    #[test]
+    fn meeting_menu_row_dispatches_to_edit_meeting() {
+        let source = include_str!("edit.rs");
+        let body = source
+            .split("pub fn run_config_menu(")
+            .nth(1)
+            .expect("edit.rs defines run_config_menu")
+            .split("\n}\n")
+            .next()
+            .expect("run_config_menu has a body");
+        let labels: Vec<&str> = body
+            .split("let choices = &[")
+            .nth(1)
+            .expect("menu choices")
+            .split("];")
+            .next()
+            .expect("menu choices end")
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix('"'))
+            .filter_map(|l| l.strip_suffix("\","))
+            .collect();
+        let index = labels
+            .iter()
+            .position(|l| *l == "Meeting mode")
+            .expect("menu has a Meeting mode row");
+        assert!(
+            body.contains(&format!("{index} => edit_meeting(&mut config)?")),
+            "Meeting mode is row {index} but that arm does not call edit_meeting"
+        );
+        let last = labels.len() - 1;
+        assert!(
+            body.contains(&format!(
+                "{last} => {{\n                println!(\"\\n  {{DIM}}Discarded"
+            )),
+            "the last row ({last}) must be Discard & exit"
+        );
     }
 
     /// The editor rewrites the whole `[hotkeys]` table from the struct, so a
@@ -1892,6 +2111,7 @@ mod tests {
                 "cancel" => hotkeys.cancel = Some("Super+Shift+Escape".into()),
                 "command" => hotkeys.command = Some("Super+Shift+C".into()),
                 "speak" => hotkeys.speak = Some("Super+Shift+R".into()),
+                "meeting" => hotkeys.meeting = Some("Super+Shift+M".into()),
                 other => panic!("unhandled hotkey field `{other}` — add it to this test"),
             }
             assert!(

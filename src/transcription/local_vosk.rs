@@ -42,6 +42,19 @@ impl TranscriptionBackend for VoskBackend {
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
     }
+
+    // Unreachable for the same reason as `transcribe`: there is no backend yet.
+    async fn transcribe_segments(
+        &self,
+        _audio: &[u8],
+        _config: &TranscriptionConfig,
+    ) -> anyhow::Result<super::Transcript> {
+        anyhow::bail!("Vosk backend is not yet implemented")
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]
