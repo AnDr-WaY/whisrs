@@ -136,7 +136,10 @@ Record a meeting and turn it into a transcript. Captures the microphone
 and the system audio (the default output's monitor) as two separate tracks,
 then transcribes them after
 .B stop
-into a Markdown transcript with \(lqme\(rq and \(lqothers\(rq speakers.
+into a Markdown transcript whose speaker labels are your name
+.RB ( [meeting]
+.BR user_name )
+and \(lqOthers\(rq.
 Each meeting lives in its own folder under the meetings directory (see
 .BR FILES ),
 named by its id
@@ -185,9 +188,10 @@ Copy the transcript to the clipboard.
 .TP
 \fBretry\fR \fIID\fR
 Transcribe the meeting again, for example after a failure. A meeting whose
-transcription was interrupted three times (a crash or restart each time) is
-marked failed rather than resumed at startup; retry starts it over. Chunks
-already transcribed with the same backend are reused.
+transcription was interrupted three times (by a crash each time) is marked
+failed instead of being resumed at startup; retry resets that count and
+queues it again. Chunks already transcribed with the same backend and
+settings are reused.
 .RE
 .IP
 .BR list ,

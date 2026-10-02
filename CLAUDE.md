@@ -223,7 +223,8 @@ Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": 
 a `History` variant carrying log entries, and a `Meeting` variant carrying the meeting status.
 
 Adding a command means a new `Command` variant plus a daemon handler. Never put logic in
-`src/cli/main.rs` — it is a thin socket client.
+`src/cli/main.rs` — it is a thin socket client. One read-only exception: `whisrs meeting
+list/show/path` read the meetings folder directly, which keeps transcript bodies off IPC.
 
 ## Configuration
 
@@ -239,7 +240,9 @@ Meeting mode: the `[meeting]` section (`backend`, `user_name`, `mic_device`, `sy
 `max_duration_minutes`, `audio_retention_days`, `dir`) plus `[hotkeys] meeting`. Meetings live in
 `~/.local/share/whisrs/meetings/<id>/` (`meeting.json`, `<id>.md`, `audio/`, and a `.cache/` of
 finished chunks kept until the transcript is written or the audio is deleted). The meeting backend
-must be a batch one (`deepgram-streaming` maps to `deepgram`; realtime backends are refused).
+must be file-capable, a backend that can transcribe a recorded file: groq, openai, deepgram,
+asr-sidecar or local-whisper (`deepgram-streaming` maps to `deepgram`; realtime backends are
+refused).
 
 Environment variable overrides:
 - `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key` (also used by the `deepgram` TTS backend)

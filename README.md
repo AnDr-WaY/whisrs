@@ -15,7 +15,7 @@
 
 **Voice for the Linux desktop, written in Rust: dictation, read-aloud, and voice-driven LLM commands.**
 
-Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source.
+Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. Record meetings too: your mic and the system audio become a timestamped Markdown transcript, kept in its own folder.
 
 ![whisrs demo: dictation, read aloud, and command mode](assets/demo.gif)
 
@@ -237,6 +237,8 @@ whisrs command   # Command mode: select text + speak instruction → LLM rewrite
 whisrs llm-command <name>      # Toggle a named [[llm_commands]] entry (see config.toml)
 whisrs llm-command-set <name>  # Reprogram a named LLM command from the current selection
 whisrs speak     # Read the selected text aloud (alias: whisrs read; press again to stop)
+whisrs meeting start -t "Standup"   # Record a meeting (mic + system audio); stop | cancel | status
+whisrs meeting show last            # Print the latest meeting transcript (list | path | copy | retry)
 whisrs log       # Show recent transcription history
 whisrs log -n 5  # Show last 5 entries
 whisrs log --clear  # Clear all history

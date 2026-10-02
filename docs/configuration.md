@@ -390,13 +390,15 @@ response_format = "wav"     # audio format requested from the API
 # tracks, then transcribes them after the meeting. Every key is optional;
 # see "Meeting mode" below for how it works.
 [meeting]
-# backend = "groq"            # default: [general] backend. Batch backends only:
-#                             #   groq | openai | deepgram | asr-sidecar | local-whisper.
+# backend = "groq"            # default: [general] backend. A backend that can transcribe
+#                             #   a recorded file: groq | openai | deepgram | asr-sidecar |
+#                             #   local-whisper.
 #                             #   deepgram-streaming uses Deepgram's REST API here.
 #                             #   openai-realtime and openai-compatible-realtime are rejected.
 # user_name = "Ada"           # your label in transcripts; default: your full name
 #                             #   from the system account, else $USER
-# mic_device = "..."          # default: [audio] device
+# mic_device = "alsa_input.usb-..."  # a source name from whisrs config or pactl list short sources
+#                             #   default: [audio] device
 # system_device = "default"   # "default" = monitor of the default output,
 #                             #   "none" = mic only, or a source name ending in .monitor
 max_duration_minutes = 180    # recording stops by itself after this long (1 to 2160)
@@ -559,16 +561,18 @@ give a cleaner transcript and avoid the occasional miss.
 
 **Dictation keeps working.** A meeting records in the background, so
 `whisrs toggle`, command mode and read-aloud work as usual while it runs. The
-tray shows a ring icon while a meeting records (as long as you are not
-dictating at that moment).
+tray shows a red ring while a meeting records and an amber ring while it is
+transcribed (as long as you are not dictating at that moment).
 
 **Backends.** A meeting is transcribed from its recording after it ends, so it
-needs a batch backend: groq, openai, deepgram, asr-sidecar or local-whisper.
+needs a backend that can transcribe a recorded file: groq, openai, deepgram,
+asr-sidecar or local-whisper.
 `backend` defaults to `[general] backend`. With `deepgram-streaming` the meeting
 goes to Deepgram's REST API. The realtime backends (`openai-realtime`,
 `openai-compatible-realtime`) cannot transcribe a recording: setting one as
-`[meeting] backend` is a config error, and inheriting one from `[general]`
-gives a startup warning, since meetings would record but fail to transcribe.
+`[meeting] backend` is a config error. Inheriting one from `[general]` gives a
+startup warning when `[meeting]` or `[hotkeys] meeting` is set, since meetings
+would record but fail to transcribe.
 
 **Devices.** `mic_device` defaults to `[audio] device`. `system_device`
 defaults to the monitor of your default output device, found when the meeting
@@ -584,19 +588,23 @@ title, for example `2026-10-02_0930_standup/`:
 
 ```
 2026-10-02_0930_standup/
-├── meeting.json          # status, tracks, speakers and the timed transcript
+├── meeting.json                 # status, tracks, speakers and the timed transcript
 ├── 2026-10-02_0930_standup.md   # the readable transcript
 └── audio/
-    ├── mic.wav
-    └── system.wav
+    ├── mic.wav                  # your microphone
+    └── system.wav               # the system audio
 ```
+
+Folders are created private (0700) and `meeting.json` is 0600; an existing
+`dir` keeps its own permissions.
 
 `whisrs meeting list` shows them, `whisrs meeting show last` prints the latest
 transcript and `whisrs meeting copy last` copies it.
 
 **Audio retention.** `audio_retention_days` controls how long the `audio/`
-folder of a transcribed meeting is kept: `7` (the default) deletes it a week
-later, `0` deletes it as soon as the transcript is written, and a negative
+folder of a transcribed meeting is kept: `7` (the default) deletes it at the first
+cleanup after a week (cleanup runs when the daemon starts and after each
+meeting is transcribed), `0` deletes it as soon as the transcript is written, and a negative
 value keeps it forever. The transcript and `meeting.json` are never deleted. A
 meeting whose transcription failed always keeps its audio, so you can fix the
 cause (a missing API key, a network error) and run `whisrs meeting retry`.

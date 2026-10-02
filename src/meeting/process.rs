@@ -407,7 +407,9 @@ async fn transcribe_with_retry(
         .await
         .map_err(|err| {
             if err.downcast_ref::<RateLimitExhausted>().is_some() {
-                err.context("the finished parts are saved, so a later retry resumes")
+                err.context(
+                    "chunks finished before the failure are saved; retry resumes from the failed chunk",
+                )
             } else {
                 err
             }
@@ -1164,7 +1166,7 @@ mod tests {
         assert_eq!(backend.calls.load(Ordering::Relaxed), 43);
         let text = format!("{err:#}");
         assert!(
-            text.contains("HTTP 429") && text.contains("later retry resumes"),
+            text.contains("HTTP 429") && text.contains("retry resumes from the failed chunk"),
             "{text}"
         );
     }

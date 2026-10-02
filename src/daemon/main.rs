@@ -31,7 +31,7 @@ use crate::context::{DaemonContext, DaemonState};
 use crate::dictation::{handle_cancel, handle_toggle};
 use crate::factory::create_backend;
 use crate::injection::{prime_modifier_probe, warm_keyboard};
-use crate::meeting::{handle_meeting, MeetingRuntime};
+use crate::meeting::{error_already_notified, handle_meeting, MeetingRuntime};
 use crate::notify::send_notification;
 use crate::speak::handle_speak;
 #[cfg(feature = "hooks")]
@@ -163,7 +163,9 @@ async fn main() -> Result<()> {
                         if let Response::Error { message } =
                             handle_meeting(ctx, action, title, id).await
                         {
-                            if notify {
+                            // A stop that saved but could not queue the
+                            // meeting has notified already.
+                            if notify && !error_already_notified(&message) {
                                 send_notification("whisrs", &format!("Meeting: {message}"));
                             }
                         }

@@ -7,6 +7,7 @@
 //! out on a separate watch channel that only the tray reads, so a meeting
 //! never animates the overlay or fires recording hooks.
 
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
+use futures_util::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -69,6 +71,17 @@ const MAX_ATTEMPTS: u32 = 3;
 
 /// Longest error text put in a notification.
 const NOTIFY_ERROR_MAX: usize = 200;
+
+/// Start of the error a stop returns when it saved the meeting but could
+/// not queue it. [`stop`] notifies it itself, since a compositor-bound
+/// `whisrs meeting toggle` shows nobody its stderr.
+const NOT_TRANSCRIBED: &str = "meeting stopped but not transcribed";
+
+/// Whether a meeting error was already notified where it happened, so the
+/// hotkey and tray dispatcher does not toast it a second time.
+pub(crate) fn error_already_notified(message: &str) -> bool {
+    message.starts_with(NOT_TRANSCRIBED)
+}
 
 /// A meeting that is recording, processing or queued, as shown in status.
 #[derive(Debug, Clone, PartialEq)]
@@ -565,7 +578,17 @@ async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()
             tokio::time::sleep(Duration::from_secs(u64::from(minutes) * 60)).await;
             info!("meeting {id} reached the {minutes} minute limit, stopping");
             if let Err(e) = stop(&ctx, Some(&id), EndReason::MaxDuration).await {
-                warn!("failed to stop meeting {id} at its time limit: {e:#}");
+                let message = format!("{e:#}");
+                warn!("failed to stop meeting {id} at its time limit: {message}");
+                if !error_already_notified(&message) {
+                    notify(
+                        &ctx,
+                        &format!(
+                            "Meeting: failed to stop at the time limit: {}",
+                            truncate_preview(&message, NOTIFY_ERROR_MAX)
+                        ),
+                    );
+                }
             }
         })
     };
@@ -776,7 +799,7 @@ async fn stop(
     if !stuck.is_empty() {
         // Processing now would read a file that is still being written.
         let message = format!(
-            "meeting stopped but not transcribed: the {} track was still being written {} s \
+            "{NOT_TRANSCRIBED}: the {} track was still being written {} s \
              after the stop; retry with: whisrs meeting retry {}",
             stuck.join(" and "),
             (STOP_TIMEOUT + STOP_GRACE).as_secs(),
@@ -788,8 +811,13 @@ async fn stop(
         context.meeting.update(|v| v.recording = None);
         written?;
         error!("meeting {}: {message}", meta.id);
-        // No notification here: the error goes back to the caller, and the
-        // hotkey and tray path notifies it, so one stop gives one toast.
+        // Notified here for every caller (CLI, hotkey, tray, time limit);
+        // they skip it via [`error_already_notified`], so one stop gives one
+        // toast.
+        notify(
+            context,
+            &format!("Meeting: {}", truncate_preview(&message, NOTIFY_ERROR_MAX)),
+        );
         bail!(message);
     }
     let written = store::write_meta(&dir, &meta);
@@ -943,12 +971,23 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedMeeting) {
     if let Err(e) = count_attempt(&dir) {
         error!("failed to record a processing attempt for meeting {id}: {e:#}");
     }
-    let result = process_meeting(
+    // A panic in a backend or in the processing itself must not leave the
+    // meeting shown as processing forever, nor kill the worker and with it
+    // every later meeting. Caught in this task (not a spawned one) so a
+    // shutdown that aborts the worker still drops the work with it.
+    let result = AssertUnwindSafe(process_meeting(
         &dir,
         &context.config,
         Some(Arc::clone(&context.transcription_backend)),
-    )
-    .await;
+    ))
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|panic| {
+        Err(anyhow::anyhow!(
+            "processing crashed: {}",
+            panic_message(&*panic)
+        ))
+    });
     match result {
         Ok(meta) => {
             let md = store::transcript_path(&dir, &meta.id);
@@ -975,6 +1014,15 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedMeeting) {
     }
     context.meeting.update(|v| v.processing = None);
     sweep(context).await;
+}
+
+/// The text of a caught panic's payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 fn count_attempt(dir: &Path) -> Result<()> {
@@ -1074,6 +1122,84 @@ fn recover_dir(dir: &Path, reset_attempts: bool) -> Result<MeetingMeta> {
     Ok(meta)
 }
 
+/// Recover one interrupted meeting and queue it. It is reserved in the
+/// queue before anything on disk is touched, like a retry: a retry that
+/// already holds it makes this skip it, and a retry arriving meanwhile is
+/// refused, so the two never repair or requeue it twice.
+async fn recover_one(context: &Arc<DaemonContext>, dir: PathBuf) {
+    let meta = match store::read_meta(&dir) {
+        Ok(meta) => meta,
+        Err(e) => {
+            warn!("failed to recover meeting {}: {e:#}", dir.display());
+            return;
+        }
+    };
+    let active = ActiveMeeting::from_meta(&dir, &meta);
+    if context.meeting.reserve(&active).is_err() {
+        info!(
+            "meeting {} is already queued (retried meanwhile); not recovering it",
+            meta.id
+        );
+        return;
+    }
+    let id = meta.id;
+    let repair_dir = dir.clone();
+    let recovered = tokio::task::spawn_blocking(move || recover_interrupted(&repair_dir))
+        .await
+        .context("meeting recovery panicked")
+        .and_then(|r| r);
+    let meta = match recovered {
+        Ok(Some(meta)) => meta,
+        Ok(None) => {
+            // A retry finished it between the listing and the reservation.
+            context.meeting.unreserve(&id);
+            return;
+        }
+        Err(e) => {
+            context.meeting.unreserve(&id);
+            warn!("failed to recover meeting {}: {e:#}", dir.display());
+            return;
+        }
+    };
+    if meta.status == MeetingState::Failed {
+        context.meeting.unreserve(&id);
+        warn!(
+            "not resuming meeting {id}: {}",
+            meta.error.as_deref().unwrap_or_default()
+        );
+        notify(
+            context,
+            &format!(
+                "Meeting transcription stopped after {} interrupted attempts. \
+                 Retry with: whisrs meeting retry {id}",
+                meta.attempts
+            ),
+        );
+        return;
+    }
+    info!("resuming interrupted meeting {id} ({:?})", meta.end_reason);
+    if let Err(e) = context
+        .meeting
+        .dispatch(ActiveMeeting::from_meta(&dir, &meta))
+    {
+        warn!("failed to queue meeting {id}: {e:#}");
+    }
+}
+
+/// [`recover_dir`] for a meeting still interrupted on disk. `None` when it
+/// no longer is (a retry processed it after the startup listing), so a
+/// finished meeting is never flipped back to processing. Blocking.
+fn recover_interrupted(dir: &Path) -> Result<Option<MeetingMeta>> {
+    let meta = store::read_meta(dir)?;
+    if !matches!(
+        meta.status,
+        MeetingState::Recording | MeetingState::Processing
+    ) {
+        return Ok(None);
+    }
+    recover_dir(dir, false).map(Some)
+}
+
 /// At startup: requeue every meeting a crash, reboot or shutdown left
 /// recording or processing, then apply audio retention. Spawned, so the
 /// IPC server comes up without waiting for it.
@@ -1092,50 +1218,12 @@ pub(crate) async fn recover_on_startup(context: Arc<DaemonContext>) {
             .unwrap_or_default();
         (interrupted, recording)
     };
-    let recovered = tokio::task::spawn_blocking(move || {
-        interrupted
-            .into_iter()
-            .filter(|dir| recording.as_ref() != Some(dir))
-            .filter_map(|dir| match recover_dir(&dir, false) {
-                Ok(meta) => Some((dir, meta)),
-                Err(e) => {
-                    warn!("failed to recover meeting {}: {e:#}", dir.display());
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
-
     // Oldest first, so they are processed in the order they happened.
-    for (dir, meta) in recovered.into_iter().rev() {
-        if meta.status == MeetingState::Failed {
-            warn!(
-                "not resuming meeting {}: {}",
-                meta.id,
-                meta.error.as_deref().unwrap_or_default()
-            );
-            notify(
-                &context,
-                &format!(
-                    "Meeting transcription stopped after {} interrupted attempts. \
-                     Retry with: whisrs meeting retry {}",
-                    meta.attempts, meta.id
-                ),
-            );
+    for dir in interrupted.into_iter().rev() {
+        if recording.as_ref() == Some(&dir) {
             continue;
         }
-        info!(
-            "resuming interrupted meeting {} ({:?})",
-            meta.id, meta.end_reason
-        );
-        if let Err(e) = context
-            .meeting
-            .enqueue(ActiveMeeting::from_meta(&dir, &meta))
-        {
-            warn!("failed to queue meeting {}: {e:#}", meta.id);
-        }
+        recover_one(&context, dir).await;
     }
     sweep(&context).await;
 }
@@ -1199,13 +1287,23 @@ async fn stop_worker(runtime: &MeetingRuntime) {
         return;
     };
     worker.abort();
-    if tokio::time::timeout(WORKER_ABORT_TIMEOUT, worker)
-        .await
-        .is_err()
-    {
-        // Still running: giving the attempt back could race its writes.
-        warn!("the meeting processing worker did not stop in time");
-        return;
+    match tokio::time::timeout(WORKER_ABORT_TIMEOUT, worker).await {
+        Err(_) => {
+            // Still running: giving the attempt back could race its writes.
+            warn!("the meeting processing worker did not stop in time");
+            return;
+        }
+        // Only an attempt this abort interrupted is given back. A worker
+        // that panicked was not interrupted by the shutdown: its attempt is
+        // the crash the crash-loop guard counts.
+        Ok(Err(e)) if e.is_cancelled() => {}
+        Ok(Err(e)) => {
+            warn!("the meeting processing worker had failed: {e}");
+            return;
+        }
+        // The queue closed and the worker ended on its own: nothing was
+        // interrupted.
+        Ok(Ok(())) => return,
     }
     // Read only now, with the task gone, so the view is final.
     let processing = runtime
@@ -1879,6 +1977,137 @@ mod tests {
         recover_on_startup(Arc::clone(&context)).await;
         assert!(queue.try_recv().is_err());
         assert_eq!(store::read_meta(&dir).unwrap(), meta);
+    }
+
+    /// A backend that panics mid-transcription.
+    struct PanickingBackend;
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for PanickingBackend {
+        async fn transcribe(&self, _audio: &[u8], _config: &TranscriptionConfig) -> Result<String> {
+            unreachable!("meetings ask for segments")
+        }
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> Result<Transcript> {
+            panic!("backend exploded");
+        }
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_processing_fails_the_meeting_and_keeps_the_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_meeting(tmp.path());
+        let (context, queue) = test_context(tmp.path(), Arc::new(PanickingBackend));
+        recover_on_startup(Arc::clone(&context)).await;
+        let worker = tokio::spawn(run_worker(Arc::clone(&context), queue));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store::read_meta(&dir).unwrap().status != MeetingState::Failed
+            || context.meeting.status().phase != MeetingPhase::Idle
+        {
+            assert!(Instant::now() < deadline, "the panic was never handled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let meta = store::read_meta(&dir).unwrap();
+        let error = meta.error.as_deref().unwrap_or_default();
+        assert!(
+            error.starts_with("processing crashed: ") && error.contains("backend exploded"),
+            "{error}"
+        );
+        assert_eq!(meta.attempts, 1);
+        assert!(!worker.is_finished(), "the worker survives the panic");
+
+        // And it still takes work: a retry is processed (and panics) again.
+        retry(&context, "last").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store::read_meta(&dir).unwrap().status != MeetingState::Failed {
+            assert!(Instant::now() < deadline, "the retry was never processed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_a_worker_panic_keeps_the_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_meeting(tmp.path());
+        let (context, mut queue) = test_context(tmp.path(), working_backend());
+        recover_on_startup(Arc::clone(&context)).await;
+        let item = queue.try_recv().unwrap();
+        context.meeting.update(|v| {
+            v.queued.clear();
+            v.processing = Some(item.meeting.clone());
+        });
+        count_attempt(&dir).unwrap();
+
+        let worker = tokio::spawn(async { panic!("worker died") });
+        while !worker.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        context.meeting.set_worker(worker);
+        stop_worker(&context.meeting).await;
+        assert_eq!(
+            store::read_meta(&dir).unwrap().attempts,
+            1,
+            "a panic is not an interruption"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_skips_a_meeting_a_retry_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_meeting(tmp.path());
+        let (context, mut queue) = test_context(tmp.path(), working_backend());
+        let before = store::read_meta(&dir).unwrap();
+        // A retry reserved it and is repairing it.
+        context
+            .meeting
+            .reserve(&ActiveMeeting::from_meta(&dir, &before))
+            .unwrap();
+
+        recover_on_startup(Arc::clone(&context)).await;
+        assert!(queue.try_recv().is_err(), "not queued twice");
+        assert_eq!(
+            store::read_meta(&dir).unwrap(),
+            before,
+            "not repaired twice"
+        );
+        assert_eq!(context.meeting.status().queued, vec![before.id.clone()]);
+
+        // A meeting recovery holds refuses a retry.
+        context.meeting.unreserve(&before.id);
+        recover_on_startup(Arc::clone(&context)).await;
+        let err = retry(&context, "last").await.unwrap_err();
+        assert!(err.to_string().contains("already queued"), "{err:#}");
+        assert!(queue.try_recv().is_ok());
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[test]
+    fn recovery_leaves_a_finished_meeting_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_meeting(tmp.path());
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.status = MeetingState::Done;
+        store::write_meta(&dir, &meta).unwrap();
+        assert!(recover_interrupted(&dir).unwrap().is_none());
+        assert_eq!(store::read_meta(&dir).unwrap(), meta);
+    }
+
+    #[test]
+    fn a_not_transcribed_stop_is_notified_once() {
+        let message = format!("{NOT_TRANSCRIBED}: the microphone track was still being written");
+        assert!(error_already_notified(&message));
+        assert!(!error_already_notified("no meeting is recording"));
     }
 
     #[tokio::test]
