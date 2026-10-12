@@ -1114,6 +1114,16 @@ mod tests {
         assert_ne!(fp, fingerprint_of(&prompted));
         let vocab = base.replace("language", "vocabulary = [\"whisrs\"]\nlanguage");
         assert_ne!(fp, fingerprint_of(&vocab));
+        // Phrase cuts and flash attention change what whisper decodes.
+        let silence = format!("{base}phrase_silence_ms = 900\n");
+        assert_ne!(fp, fingerprint_of(&silence));
+        let flash = format!("{base}flash_attn = true\n");
+        assert_ne!(fp, fingerprint_of(&flash));
+        // Segmentation does not: meetings always decode phrase by phrase.
+        for mode in ["none", "window", "silence"] {
+            let segmented = format!("{base}segmentation = \"{mode}\"\n");
+            assert_eq!(fp, fingerprint_of(&segmented), "segmentation = {mode}");
+        }
 
         // The sidecar URL is part of its identity.
         let sidecar = "[general]\nbackend = \"asr-sidecar\"\n\

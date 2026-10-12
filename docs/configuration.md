@@ -294,7 +294,8 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 #   minute of speech with large-v3-turbo on a GPU, longer on CPU). It also
 #   makes [general] llm_post_process and [input] paste apply to dictation.
 #   A very long recording is still a single decode, not reset per phrase
-#   like "silence".
+#   like "silence". Meetings ignore this setting and always decode in
+#   phrases.
 # segmentation = "silence"
 # phrase_silence_ms: continuous silence (ms) that ends a phrase in "silence"
 # mode (ignored by "window" and "none"). Lower = snappier output, higher =
@@ -574,6 +575,11 @@ goes to Deepgram's REST API. The realtime backends (`openai-realtime`,
 `[meeting] backend` is a config error. Inheriting one from `[general]` gives a
 startup warning when `[meeting]` or `[hotkeys] meeting` is set, since meetings
 would record but fail to transcribe.
+
+With `local-whisper`, a meeting is always decoded in short phrases (at most
+about 28 seconds each) whatever `[local-whisper] segmentation` says, `"none"`
+included, so long recordings do not fall into whisper's repetition loop.
+`flash_attn` applies to meetings as it does to dictation.
 
 **Devices.** `mic_device` defaults to `[audio] device`. `system_device`
 defaults to the monitor of your default output device, found when the meeting

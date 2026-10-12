@@ -356,6 +356,21 @@ impl LocalWhisperBackend {
         decode_phrase(ctx, create_state(ctx)?, buffer, false, config, &text_tx).await?;
         Ok(())
     }
+
+    /// Cut a meeting chunk into phrases of at most ~28 s with the same
+    /// splitter as silence-mode dictation.
+    ///
+    /// `segmentation` is not consulted: it picks how dictation streams, and
+    /// `"none"` would hand whisper.cpp a whole chunk (up to ten minutes) in one
+    /// `full()` call, where it carries text across its 30 s windows even with
+    /// `no_context(true)`: the repetition loop of #55.
+    fn meeting_phrases(&self, samples: &[i16]) -> Vec<super::phrase_split::Phrase> {
+        let mut splitter =
+            PhraseSplitter::new(SAMPLE_RATE, SILENCE_THRESHOLD, self.phrase_silence_ms);
+        let mut phrases = splitter.feed(samples);
+        phrases.extend(splitter.flush());
+        phrases
+    }
 }
 
 /// Convert i16 PCM samples to f32 in the range [-1.0, 1.0].
@@ -728,7 +743,8 @@ impl TranscriptionBackend for LocalWhisperBackend {
     }
 
     // Native timestamps from whisper's segments, decoded phrase by phrase
-    // (see `decode_meeting_phrases` for why never a whole chunk at once).
+    // (see `decode_meeting_phrases` for why never a whole chunk at once, and
+    // `meeting_phrases` for why `segmentation` does not apply).
     async fn transcribe_segments(
         &self,
         audio: &[u8],
@@ -742,10 +758,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
         })?;
 
         let samples = decode_wav_samples(audio)?;
-        let mut splitter =
-            PhraseSplitter::new(SAMPLE_RATE, SILENCE_THRESHOLD, self.phrase_silence_ms);
-        let mut phrases = splitter.feed(&samples);
-        phrases.extend(splitter.flush());
+        let phrases = self.meeting_phrases(&samples);
         debug!(
             "local whisper: {} phrase(s) in a {:.1}s meeting chunk",
             phrases.len(),
@@ -860,6 +873,31 @@ mod tests {
         // Unknown values fall back to the default.
         assert_eq!(SegmentationMode::parse("bogus"), SegmentationMode::Silence);
         assert_eq!(SegmentationMode::default(), SegmentationMode::Silence);
+    }
+
+    /// Meetings decode in short phrases on every segmentation mode, `"none"`
+    /// included: 70 s of unbroken speech (no pause to cut at) still comes out
+    /// as phrases no longer than the splitter's hard cap.
+    #[test]
+    fn meeting_phrases_stay_short_whatever_the_segmentation() {
+        let speech: Vec<i16> = (0..70 * SAMPLE_RATE)
+            .map(|i| if i % 2 == 0 { 8000 } else { -8000 })
+            .collect();
+        for mode in ["none", "silence", "window"] {
+            let backend = LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
+                .with_segmentation(mode, 400);
+            let phrases = backend.meeting_phrases(&speech);
+            assert!(phrases.len() >= 3, "{mode}: {} phrase(s)", phrases.len());
+            for phrase in &phrases {
+                assert!(
+                    phrase.samples.len() <= 28 * SAMPLE_RATE,
+                    "{mode}: a {:.1} s phrase",
+                    phrase.samples.len() as f64 / SAMPLE_RATE as f64
+                );
+            }
+            let covered: usize = phrases.iter().map(|p| p.samples.len()).sum();
+            assert!(covered >= 69 * SAMPLE_RATE, "{mode}: speech was dropped");
+        }
     }
 
     #[test]
