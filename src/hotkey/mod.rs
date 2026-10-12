@@ -567,6 +567,27 @@ mod tests {
         );
     }
 
+    /// `[hotkeys] meeting` takes the same forms as the other fields, the
+    /// bare ScrollLock/Pause/F13-F24 bindings included.
+    #[test]
+    fn meeting_hotkey_accepts_a_bare_binding() {
+        let config = HotkeyConfig {
+            meeting: Some("ScrollLock".to_string()),
+            ..Default::default()
+        };
+        let actions = build_actions(&config, &[]);
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].binding.modifiers.is_empty());
+        assert_eq!(actions[0].binding.trigger, Key::KEY_SCROLLLOCK);
+        assert!(matches!(
+            actions[0].command,
+            Command::Meeting {
+                action: MeetingAction::Toggle,
+                ..
+            }
+        ));
+    }
+
     /// Each field is wired to its own command — a mis-ordered `fixed` table
     /// would silently send one key's press through another's handler.
     #[test]
