@@ -62,7 +62,7 @@ src/
 │                           #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ├── history.rs              # Dictation history (whisrs log)
 ├── llm.rs                  # LLM calls for command mode
-├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated text
+├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and meeting text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
 ├── daemon/meeting.rs       # Meeting sessions, processing queue/worker, recovery, shutdown
@@ -234,7 +234,7 @@ Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realti
 
 TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
 
-Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, after filler removal (`src/replacements.rs`).
+Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every meeting transcript segment, after filler removal (`src/replacements.rs`).
 
 Meeting mode: the `[meeting]` section (`backend`, `user_name`, `mic_device`, `system_device`,
 `max_duration_minutes`, `audio_retention_days`, `dir`) plus `[hotkeys] meeting`. Meetings live in

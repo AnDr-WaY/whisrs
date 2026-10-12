@@ -672,7 +672,8 @@ every time, map the wrong text to the right one:
 "whisper s" = "whisrs"
 ```
 
-Every dictation is rewritten before it is typed, copied or logged. Keys match
+Every dictation is rewritten before it is typed, copied or logged, and so is
+every line of a meeting transcript. Keys match
 ignoring case, on whole words, with any spaces or hyphens between the words,
 so "Package-build" matches too. Quote every key: unquoted,
 `node.js = "Node.js"` is a nested table in TOML, so config.toml fails to

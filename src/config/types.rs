@@ -63,7 +63,8 @@ pub struct Config {
     #[serde(default)]
     pub llm_commands: Vec<llm::LlmCommandConfig>,
     /// Word/phrase replacements applied to every dictation before it is
-    /// typed: `"package build" = "PKGBUILD"`. Matching rules are in
+    /// typed, and to every line of a meeting transcript:
+    /// `"package build" = "PKGBUILD"`. Matching rules are in
     /// [`crate::replacements`]. Empty by default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub replacements: BTreeMap<String, String>,
@@ -2087,7 +2088,8 @@ impl Config {
         if let Err(e) = crate::replacements::Replacer::new(&self.replacements) {
             warnings.push(ConfigWarning {
                 message: format!(
-                    "[replacements] could not be compiled, so dictation will fail: {e}"
+                    "[replacements] could not be compiled, so dictation and meeting \
+                     transcription will fail: {e}"
                 ),
             });
         }

@@ -28,6 +28,7 @@ use super::split::{frame_len, split_by_energies};
 use super::store::{self, CACHE_DIR};
 use super::{MeetingMeta, MeetingState, Segment, Speaker, TrackKind, TranscriptSegment};
 use crate::audio::wav::encode_wav;
+use crate::replacements::Replacer;
 use crate::transcription::factory::{
     backend_identity, canonical_backend_name, create_backend_named, meeting_backend_name,
     meeting_transcription_config,
@@ -94,12 +95,15 @@ pub async fn process_meeting(
     } else {
         None
     };
+    let replacer = Replacer::new(&config.replacements)
+        .context("invalid [replacements] key in configuration")?;
     let filters = SegmentFilters {
         prompt: backend
             .sends_prompt(&tcfg)
             .then(|| tcfg.prompt.clone())
             .flatten(),
         filler,
+        replacer,
     };
 
     let cache = ChunkCache {
@@ -176,6 +180,9 @@ struct SegmentFilters {
     /// one (then nothing can echo it).
     prompt: Option<String>,
     filler: Option<FillerFilter>,
+    /// `[replacements]`, applied after filler removal as on the dictation
+    /// paths.
+    replacer: Option<Replacer>,
 }
 
 impl SegmentFilters {
@@ -194,6 +201,10 @@ impl SegmentFilters {
         let text = match &self.filler {
             Some(filter) => filter.apply(text),
             None => text.to_string(),
+        };
+        let text = match &self.replacer {
+            Some(replacer) => replacer.apply(text.trim()),
+            None => text,
         };
         let text = text.trim();
         (!text.is_empty()).then(|| text.to_string())
@@ -848,6 +859,46 @@ mod tests {
         assert!(md.contains("**[00:00:03] Others:** hello from them"));
         // Persisted, not just returned.
         assert_eq!(store::read_meta(tmp.path()).unwrap(), meta);
+    }
+
+    /// `[replacements]` reach meeting transcripts, after filler removal like
+    /// dictation: the key below only matches once "uh" is gone, and a segment
+    /// a replacement empties is dropped rather than kept as a blank line.
+    #[tokio::test]
+    async fn replacements_apply_to_segments_after_filler_removal() {
+        let backend = FakeBackend::new(
+            &[
+                (3000, "um, edit the package uh build file"),
+                (6000, "drop me"),
+            ],
+            None,
+        );
+        let (tmp, _) = meeting(&[
+            (TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)]))),
+            (TrackKind::System, 0, Some(track(4.0, &[(2.5, 1.0, 6000)]))),
+        ]);
+        let mut cfg = config();
+        cfg.replacements = [
+            ("package build".to_string(), "PKGBUILD".to_string()),
+            ("drop me".to_string(), String::new()),
+        ]
+        .into();
+        let meta = process_meeting(
+            tmp.path(),
+            &cfg,
+            Some(backend as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap();
+
+        let lines: Vec<_> = meta
+            .segments
+            .iter()
+            .map(|s| (s.speaker.as_str(), s.text.as_str()))
+            .collect();
+        assert_eq!(lines, [("me", "edit the PKGBUILD file")]);
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(md.contains("edit the PKGBUILD file"), "{md}");
     }
 
     #[tokio::test]
