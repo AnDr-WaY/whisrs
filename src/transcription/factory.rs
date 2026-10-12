@@ -410,11 +410,34 @@ pub fn meeting_backend_name(config: &Config) -> anyhow::Result<String> {
 /// prompt and vocabulary, with that backend's model. Same shape as the
 /// dictation batch config, which uses `[general] backend`'s model instead.
 pub fn meeting_transcription_config(name: &str, config: &Config) -> TranscriptionConfig {
+    let model = model_for_backend(name, config);
+    let model = match canonical_backend_name(name) {
+        "openai" => openai_meeting_model(model),
+        _ => model,
+    };
     TranscriptionConfig {
         language: config.general.language.clone(),
-        model: model_for_backend(name, config),
+        model,
         prompt: transcription_prompt(config.general.prompt.as_deref(), &config.general.vocabulary),
         keyterms: config.general.vocabulary.clone(),
+    }
+}
+
+/// The model a meeting on the `openai` REST backend sends, given
+/// `[openai] model`.
+///
+/// `[openai] model` is shared with `openai-realtime`, and its realtime-only
+/// models (gpt-live-transcribe, gpt-realtime-whisper) are refused by the file
+/// endpoint, `/v1/audio/transcriptions`. Without this, someone dictating with
+/// one of them could not run meetings on `openai` at all, since there is no
+/// separate meeting model to set. Those map to gpt-transcribe, the model
+/// OpenAI points recorded audio at; every other model is sent as written.
+fn openai_meeting_model(model: String) -> String {
+    let realtime_only = ["gpt-live-transcribe", "gpt-realtime-whisper"];
+    if realtime_only.iter().any(|m| model.eq_ignore_ascii_case(m)) {
+        "gpt-transcribe".to_string()
+    } else {
+        model
     }
 }
 
@@ -837,10 +860,20 @@ mod tests {
                 backend: sidecar(),
                 chunk_secs: Some(600),
             },
+            // Built the way the factory builds a GPT Live Transcribe setup
+            // (`[openai] languages`): language hints do not make it a batch
+            // backend.
             MeetingCase {
                 name: "openai-realtime",
                 resolves_to: None,
-                backend: Box::new(OpenAIRealtimeBackend::new(String::new())),
+                backend: Box::new(openai_realtime_backend(
+                    &toml::from_str(
+                        "[general]\nbackend = \"openai-realtime\"\n\
+                         [openai]\napi_key = \"\"\nmodel = \"gpt-live-transcribe\"\n\
+                         languages = [\"en\", \"de\"]\n",
+                    )
+                    .unwrap(),
+                )),
                 chunk_secs: None,
             },
             MeetingCase {
@@ -942,6 +975,40 @@ mod tests {
             err.contains("unknown meeting backend"),
             "no silent groq fallback: {err}"
         );
+    }
+
+    /// A realtime-only `[openai] model` (what an openai-realtime dictation
+    /// setup holds) still lets meetings run on `openai`: the meeting request
+    /// carries gpt-transcribe, while dictation keeps the configured model.
+    #[test]
+    fn meeting_on_openai_maps_realtime_only_models_to_gpt_transcribe() {
+        for (configured, sent) in [
+            ("gpt-live-transcribe", "gpt-transcribe"),
+            ("GPT-Live-Transcribe", "gpt-transcribe"),
+            ("gpt-realtime-whisper", "gpt-transcribe"),
+            ("gpt-transcribe", "gpt-transcribe"),
+            ("gpt-4o-transcribe", "gpt-4o-transcribe"),
+            ("whisper-1", "whisper-1"),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "[general]\nbackend = \"openai-realtime\"\n[meeting]\nbackend = \"openai\"\n\
+                 [openai]\napi_key = \"k\"\nmodel = \"{configured}\"\n\
+                 languages = [\"ru\", \"en\"]\n"
+            ))
+            .unwrap();
+            let name = meeting_backend_name(&config).unwrap();
+            assert_eq!(name, "openai");
+            assert_eq!(
+                meeting_transcription_config(&name, &config).model,
+                sent,
+                "[openai] model = {configured}"
+            );
+            assert_eq!(
+                model_for_backend(&config.general.backend, &config),
+                configured,
+                "dictation keeps [openai] model as written"
+            );
+        }
     }
 
     #[test]

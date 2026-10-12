@@ -576,6 +576,12 @@ goes to Deepgram's REST API. The realtime backends (`openai-realtime`,
 startup warning when `[meeting]` or `[hotkeys] meeting` is set, since meetings
 would record but fail to transcribe.
 
+With `openai`, meetings use `[openai] model`, except that the realtime-only
+models (`gpt-live-transcribe`, `gpt-realtime-whisper`) become `gpt-transcribe`,
+since OpenAI's file endpoint refuses them. So an `openai-realtime` dictation
+setup can keep its model and still set `[meeting] backend = "openai"`.
+`[openai] languages` does not apply to meetings; they use `[general] language`.
+
 With `local-whisper`, a meeting is always decoded in short phrases (at most
 about 28 seconds each) whatever `[local-whisper] segmentation` says, `"none"`
 included, so long recordings do not fall into whisper's repetition loop.
