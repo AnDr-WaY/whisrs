@@ -9,12 +9,16 @@ use super::NotifyFn;
 use crate::meeting::{MeetingAction, MeetingPhase, MeetingStatus};
 use crate::service::{RestartOutcome, ServiceManager};
 use crate::{Command, State};
+use icons::IconSet;
 
-/// Speech-bubble tray icons, one set per state, at several sizes so HiDPI
-/// panels get a sharp render instead of an upscaled 16x16.
+/// Speech-bubble tray icons, one set per dictation state plus two for a
+/// meeting, at several sizes so HiDPI panels get a sharp render instead of an
+/// upscaled 16x16. Dictation states fill the bubble; a meeting outlines it in
+/// the matching color (red while recording, amber while transcribing), so the
+/// two read apart at a glance.
 ///
 /// The PNGs in `src/tray/icons/` are rendered from the SVGs next to them:
-/// `rsvg-convert -w N -h N <state>.svg -o <state>-N.png` for each size.
+/// `rsvg-convert -w N -h N <name>.svg -o <name>-N.png` for each size.
 mod icons {
     use std::sync::OnceLock;
 
@@ -22,7 +26,7 @@ mod icons {
 
     use crate::State;
 
-    macro_rules! state_pngs {
+    macro_rules! set_pngs {
         ($name:literal) => {
             [
                 include_bytes!(concat!("icons/", $name, "-16.png")).as_slice(),
@@ -33,13 +37,53 @@ mod icons {
         };
     }
 
-    fn pngs(state: State) -> [&'static [u8]; 4] {
-        match state {
-            State::Idle => state_pngs!("idle"),
-            State::Recording => state_pngs!("recording"),
-            State::Transcribing => state_pngs!("transcribing"),
-            State::Synthesizing => state_pngs!("synthesizing"),
-            State::Speaking => state_pngs!("speaking"),
+    /// One icon design, in all its sizes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum IconSet {
+        Idle,
+        Recording,
+        Transcribing,
+        Synthesizing,
+        Speaking,
+        /// A meeting is recording while dictation is idle.
+        MeetingRecording,
+        /// A meeting is being transcribed while dictation is idle.
+        MeetingProcessing,
+    }
+
+    impl IconSet {
+        /// Every set, in declaration order (the cache index is `set as usize`).
+        pub const ALL: [IconSet; 7] = [
+            IconSet::Idle,
+            IconSet::Recording,
+            IconSet::Transcribing,
+            IconSet::Synthesizing,
+            IconSet::Speaking,
+            IconSet::MeetingRecording,
+            IconSet::MeetingProcessing,
+        ];
+
+        /// The set for a dictation state.
+        pub fn for_state(state: State) -> Self {
+            match state {
+                State::Idle => IconSet::Idle,
+                State::Recording => IconSet::Recording,
+                State::Transcribing => IconSet::Transcribing,
+                State::Synthesizing => IconSet::Synthesizing,
+                State::Speaking => IconSet::Speaking,
+            }
+        }
+
+        fn pngs(self) -> [&'static [u8]; 4] {
+            match self {
+                IconSet::Idle => set_pngs!("idle"),
+                IconSet::Recording => set_pngs!("recording"),
+                IconSet::Transcribing => set_pngs!("transcribing"),
+                IconSet::Synthesizing => set_pngs!("synthesizing"),
+                IconSet::Speaking => set_pngs!("speaking"),
+                IconSet::MeetingRecording => set_pngs!("meeting-recording"),
+                IconSet::MeetingProcessing => set_pngs!("meeting-processing"),
+            }
         }
     }
 
@@ -76,66 +120,12 @@ mod icons {
         }
     }
 
-    /// All sizes for `state`, decoded once and cached for the daemon's lifetime.
-    pub fn for_state(state: State) -> Vec<Icon> {
-        static CACHE: OnceLock<[Vec<Icon>; 5]> = OnceLock::new();
-        let cache = CACHE.get_or_init(|| {
-            [
-                State::Idle,
-                State::Recording,
-                State::Transcribing,
-                State::Synthesizing,
-                State::Speaking,
-            ]
-            .map(|s| pngs(s).iter().map(|b| decode(b)).collect())
-        });
-        let index = match state {
-            State::Idle => 0,
-            State::Recording => 1,
-            State::Transcribing => 2,
-            State::Synthesizing => 3,
-            State::Speaking => 4,
-        };
-        cache[index].clone()
-    }
-
-    /// Generate a 16x16 "record" icon: an outer ring plus a center dot in
-    /// the given ARGB color, so a meeting reads differently from the solid
-    /// dictation dots at a glance.
-    pub fn ring_icon(argb: u32) -> Vec<u8> {
-        let size = 16;
-        let center = size as f32 / 2.0;
-        let (outer, inner, dot) = (7.0_f32, 5.0_f32, 3.0_f32);
-        let [a, r, g, b] = argb.to_be_bytes();
-        let mut pixels = Vec::with_capacity(size * size * 4);
-
-        for y in 0..size {
-            for x in 0..size {
-                let dx = x as f32 + 0.5 - center;
-                let dy = y as f32 + 0.5 - center;
-                let dist = (dx * dx + dy * dy).sqrt();
-
-                // Coverage of the ring and of the dot, each anti-aliased
-                // over one pixel at its edges.
-                let ring =
-                    (outer + 0.5 - dist).clamp(0.0, 1.0) * (dist - inner + 0.5).clamp(0.0, 1.0);
-                let center_dot = (dot + 0.5 - dist).clamp(0.0, 1.0);
-                let coverage = ring.max(center_dot);
-                let alpha = (coverage * a as f32) as u8;
-                pixels.extend_from_slice(&[alpha, r, g, b]);
-            }
-        }
-        pixels
-    }
-
-    /// Meeting recording while dictation is idle (red ring).
-    pub fn meeting_recording() -> Vec<u8> {
-        ring_icon(0xFF_E0_40_40)
-    }
-
-    /// Meeting being transcribed while dictation is idle (amber ring).
-    pub fn meeting_processing() -> Vec<u8> {
-        ring_icon(0xFF_E0_A0_20)
+    /// All sizes of `set`, decoded once and cached for the daemon's lifetime.
+    pub fn get(set: IconSet) -> Vec<Icon> {
+        static CACHE: OnceLock<[Vec<Icon>; 7]> = OnceLock::new();
+        let cache = CACHE
+            .get_or_init(|| IconSet::ALL.map(|s| s.pngs().iter().map(|b| decode(b)).collect()));
+        cache[set as usize].clone()
     }
 }
 
@@ -231,19 +221,12 @@ impl ksni::Tray for WhisrsTray {
         // A meeting only takes over the icon while dictation is idle:
         // dictating during a meeting is normal and its state matters more in
         // the moment.
-        let ring = match (self.state.current, self.state.meeting.phase) {
-            (State::Idle, MeetingPhase::Recording) => Some(icons::meeting_recording()),
-            (State::Idle, MeetingPhase::Processing) => Some(icons::meeting_processing()),
-            _ => None,
+        let set = match (self.state.current, self.state.meeting.phase) {
+            (State::Idle, MeetingPhase::Recording) => IconSet::MeetingRecording,
+            (State::Idle, MeetingPhase::Processing) => IconSet::MeetingProcessing,
+            (state, _) => IconSet::for_state(state),
         };
-        match ring {
-            Some(data) => vec![Icon {
-                width: 16,
-                height: 16,
-                data,
-            }],
-            None => icons::for_state(self.state.current),
-        }
+        icons::get(set)
     }
 
     fn tool_tip(&self) -> ToolTip {
@@ -628,6 +611,11 @@ mod tests {
         }
     }
 
+    /// Every size's pixmap, for comparing whole icon sets.
+    fn pixmaps(icons: &[Icon]) -> Vec<&[u8]> {
+        icons.iter().map(|i| i.data.as_slice()).collect()
+    }
+
     /// The meeting shows in the icon and tooltip only while dictation is
     /// idle; a dictation in progress keeps its own icon, and the meeting is
     /// still named in the tooltip.
@@ -635,33 +623,68 @@ mod tests {
     fn dictation_state_wins_the_icon_during_a_meeting() {
         let (cmd_tx, _rx) = mpsc::channel(1);
         let idle = tray_with(cmd_tx.clone(), State::Idle, recording_meeting(Some("x")));
-        assert_eq!(idle.icon_pixmap()[0].data, icons::meeting_recording());
+        assert_eq!(
+            pixmaps(&idle.icon_pixmap()),
+            pixmaps(&icons::get(IconSet::MeetingRecording))
+        );
         assert_eq!(
             idle.tool_tip().description,
             "Meeting recording since 09:30 (x)"
         );
 
-        let dictating = tray_with(cmd_tx, State::Recording, recording_meeting(Some("x")));
+        let processing = MeetingStatus {
+            phase: MeetingPhase::Processing,
+            ..Default::default()
+        };
+        let idle_processing = tray_with(cmd_tx.clone(), State::Idle, processing.clone());
         assert_eq!(
-            dictating.icon_pixmap()[0].data,
-            icons::for_state(State::Recording)[0].data
+            pixmaps(&idle_processing.icon_pixmap()),
+            pixmaps(&icons::get(IconSet::MeetingProcessing))
+        );
+
+        let dictating = tray_with(
+            cmd_tx.clone(),
+            State::Recording,
+            recording_meeting(Some("x")),
+        );
+        assert_eq!(
+            pixmaps(&dictating.icon_pixmap()),
+            pixmaps(&icons::get(IconSet::Recording))
         );
         assert!(dictating
             .tool_tip()
             .description
             .ends_with("Meeting recording since 09:30 (x)"));
+
+        let transcribing = tray_with(cmd_tx, State::Transcribing, processing);
+        assert_eq!(
+            pixmaps(&transcribing.icon_pixmap()),
+            pixmaps(&icons::get(IconSet::Transcribing))
+        );
     }
 
+    /// No two icon sets share a pixmap at any size, so a meeting never looks
+    /// like a dictation state (or the other meeting phase) on the panel.
     #[test]
-    fn meeting_icons_are_distinct_from_dictation_icons() {
-        let ring = icons::meeting_recording();
-        assert_eq!(ring.len(), 16 * 16 * 4);
-        assert_ne!(ring, icons::for_state(State::Recording)[0].data);
-        assert_ne!(
-            icons::meeting_processing(),
-            icons::for_state(State::Transcribing)[0].data
-        );
-        assert_ne!(ring, icons::meeting_processing());
+    fn every_icon_set_is_distinct_at_every_size() {
+        let sets: Vec<(IconSet, Vec<Icon>)> =
+            IconSet::ALL.iter().map(|&s| (s, icons::get(s))).collect();
+        for (i, (a, a_icons)) in sets.iter().enumerate() {
+            for (b, b_icons) in &sets[i + 1..] {
+                for (x, y) in a_icons.iter().zip(b_icons) {
+                    assert_ne!(x.data, y.data, "{a:?} and {b:?} match at {}px", x.width);
+                }
+            }
+        }
+    }
+
+    /// `IconSet::ALL` lists every set in declaration order, which is what
+    /// `icons::get` indexes its cache by.
+    #[test]
+    fn icon_set_cache_index_is_the_declaration_order() {
+        for (i, set) in IconSet::ALL.iter().enumerate() {
+            assert_eq!(*set as usize, i, "{set:?}");
+        }
     }
 
     /// `activate()` (left-click on the tray icon) is the only tray-driven
@@ -683,9 +706,10 @@ mod tests {
         );
     }
 
-    /// Every state ships every size, and each decodes to a full ARGB pixmap
-    /// that is not blank. Catches a missing or mis-rendered PNG at test time
-    /// rather than as a panic in the running tray.
+    /// Every icon set (each dictation state and both meeting phases) ships
+    /// every size, and each decodes to a full ARGB pixmap that is not blank.
+    /// Catches a missing or mis-rendered PNG at test time rather than as a
+    /// panic in the running tray.
     #[test]
     fn every_state_has_all_icon_sizes() {
         for state in [
@@ -695,20 +719,23 @@ mod tests {
             State::Synthesizing,
             State::Speaking,
         ] {
-            let set = icons::for_state(state);
-            let sizes: Vec<i32> = set.iter().map(|i| i.width).collect();
-            assert_eq!(sizes, [16, 22, 32, 48], "{state:?}");
-            for icon in &set {
-                assert_eq!(icon.width, icon.height, "{state:?} icon is square");
+            assert!(IconSet::ALL.contains(&IconSet::for_state(state)));
+        }
+        for set in IconSet::ALL {
+            let icons = icons::get(set);
+            let sizes: Vec<i32> = icons.iter().map(|i| i.width).collect();
+            assert_eq!(sizes, [16, 22, 32, 48], "{set:?}");
+            for icon in &icons {
+                assert_eq!(icon.width, icon.height, "{set:?} icon is square");
                 assert_eq!(
                     icon.data.len(),
                     (icon.width * icon.height * 4) as usize,
-                    "{state:?} {}px pixmap length",
+                    "{set:?} {}px pixmap length",
                     icon.width
                 );
                 assert!(
                     icon.data.as_chunks::<4>().0.iter().any(|p| p[0] > 0),
-                    "{state:?} {}px icon is fully transparent",
+                    "{set:?} {}px icon is fully transparent",
                     icon.width
                 );
             }
