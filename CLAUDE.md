@@ -86,6 +86,7 @@ src/
 │   ├── factory.rs          # Build a backend by name; model, alias and meeting backend rules
 │   ├── verbose_json.rs     # Whisper verbose_json parsing (segment timestamps)
 │   ├── retry.rs            # 429/503 backoff for long jobs (one retry layer per request)
+│   ├── flac.rs             # Meeting chunks as FLAC for Deepgram, Groq, OpenAI whisper-1 (WAV fallback)
 │   ├── deepgram.rs         # Deepgram Nova API (REST + WebSocket streaming)
 │   ├── groq.rs             # Groq Whisper API (chunked HTTP, timestamp dedup)
 │   ├── openai_realtime.rs  # OpenAI Realtime API (WebSocket, true streaming)
