@@ -1885,11 +1885,12 @@ mod tests {
             fp,
             fingerprint_of(&base.replace("base.en.bin", "small.en.bin"))
         );
-        // So do a prompt and vocabulary.
-        let prompted = base.replace("language", "prompt = \"Standup\"\nlanguage");
-        assert_ne!(fp, fingerprint_of(&prompted));
+        // So does the vocabulary. The dictation prompt is not sent with a
+        // meeting, so it does not.
         let vocab = base.replace("language", "vocabulary = [\"whisrs\"]\nlanguage");
         assert_ne!(fp, fingerprint_of(&vocab));
+        let prompted = base.replace("language", "prompt = \"Standup\"\nlanguage");
+        assert_eq!(fp, fingerprint_of(&prompted));
         // Phrase cuts and flash attention change what whisper decodes.
         let silence = format!("{base}phrase_silence_ms = 900\n");
         assert_ne!(fp, fingerprint_of(&silence));

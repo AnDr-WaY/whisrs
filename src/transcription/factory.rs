@@ -406,9 +406,12 @@ pub fn meeting_backend_name(config: &Config) -> anyhow::Result<String> {
     }
 }
 
-/// The request config for a meeting on backend `name`: `[general]` language,
-/// prompt and vocabulary, with that backend's model. Same shape as the
-/// dictation batch config, which uses `[general] backend`'s model instead.
+/// The request config for a meeting on backend `name`: `[general]` language
+/// and vocabulary, with that backend's model. Same shape as the dictation
+/// batch config, which uses `[general] backend`'s model and also sends
+/// `[general] prompt`. A meeting does not: the prompt is an instruction for
+/// dictation ("Transcribe in the language spoken", a style), and the
+/// vocabulary still goes as the hint, keyterms or hotwords as before.
 pub fn meeting_transcription_config(name: &str, config: &Config) -> TranscriptionConfig {
     let model = model_for_backend(name, config);
     let model = match canonical_backend_name(name) {
@@ -418,7 +421,7 @@ pub fn meeting_transcription_config(name: &str, config: &Config) -> Transcriptio
     TranscriptionConfig {
         language: config.general.language.clone(),
         model,
-        prompt: transcription_prompt(config.general.prompt.as_deref(), &config.general.vocabulary),
+        prompt: transcription_prompt(None, &config.general.vocabulary),
         keyterms: config.general.vocabulary.clone(),
     }
 }
@@ -1015,6 +1018,7 @@ mod tests {
     fn meeting_request_uses_the_meeting_backends_model() {
         let config: Config = toml::from_str(
             "[general]\nbackend = \"groq\"\nlanguage = \"de\"\nvocabulary = [\"whisrs\"]\n\
+             prompt = \"Transcribe in the language spoken.\"\n\
              [meeting]\nbackend = \"openai\"\n\
              [openai]\napi_key = \"k\"\nmodel = \"whisper-1\"\n",
         )
@@ -1023,7 +1027,15 @@ mod tests {
         let request = meeting_transcription_config(&name, &config);
         assert_eq!(request.model, "whisper-1");
         assert_eq!(request.language, "de");
+        // The vocabulary, without the dictation prompt.
         assert_eq!(request.prompt.as_deref(), Some("whisrs"));
         assert_eq!(request.keyterms, ["whisrs"]);
+
+        let no_vocabulary: Config = toml::from_str(
+            "[general]\nbackend = \"groq\"\nprompt = \"Transcribe in the language spoken.\"\n",
+        )
+        .unwrap();
+        let request = meeting_transcription_config("groq", &no_vocabulary);
+        assert_eq!(request.prompt, None, "nothing to send");
     }
 }
