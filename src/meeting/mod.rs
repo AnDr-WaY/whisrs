@@ -4,6 +4,7 @@
 //! [`store`]): `meeting.json` holds [`MeetingMeta`], `audio/` holds one WAV
 //! per track, and `<id>.md` is the rendered transcript.
 
+pub mod echo;
 pub mod process;
 pub mod recorder;
 pub mod render;

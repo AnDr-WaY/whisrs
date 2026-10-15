@@ -71,7 +71,8 @@ src/
 │   ├── store.rs            #   Meetings folder: create, list, resolve ids, retention sweep
 │   ├── recorder.rs         #   Per-track WAV writer with periodic header flushes
 │   ├── wav_repair.rs       #   Fix WAV headers a crash left unfinalized
-│   ├── process.rs          #   Chunk, transcribe (cached, rate-limit retry), merge, write
+│   ├── echo.rs             #   Remove speaker echo from the mic track (system track as reference)
+│   ├── process.rs          #   Echo-cancel, chunk, transcribe (cached, rate-limit retry), merge, write
 │   ├── split.rs            #   Cut long tracks into backend-sized chunks at silence
 │   └── render.rs           #   Markdown transcript rendering
 ├── audio/

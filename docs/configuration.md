@@ -557,8 +557,10 @@ labeled "Others". There is no per-person speaker detection on the other side
 yet.
 
 **Headphones are recommended.** With speakers, the other side leaks into your
-microphone. whisrs drops those echoed lines from your track, but headphones
-give a cleaner transcript and avoid the occasional miss.
+microphone. whisrs filters that echo out of your track before transcribing it,
+using the system audio as the reference. Echoed lines that still get through
+are dropped, but headphones give a cleaner transcript and avoid the occasional
+miss.
 
 **Dictation keeps working.** A meeting records in the background, so
 `whisrs toggle`, command mode and read-aloud work as usual while it runs. The
