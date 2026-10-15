@@ -98,6 +98,18 @@ const SEGMENT_SAMPLE_RATE: usize = 16_000;
 /// local-whisper default so both phrase paths cut alike.
 const FALLBACK_PHRASE_SILENCE_MS: u64 = 400;
 
+/// The longest silence a meeting phrase may hold. A meeting chunk joins its
+/// speech regions with a second of digital silence
+/// ([`crate::meeting::speech::JOIN_GAP`]), so a longer `phrase_silence_ms`
+/// would decode two regions, possibly minutes apart, as one phrase.
+pub const MEETING_PHRASE_SILENCE_MAX_MS: u64 = 900;
+
+/// `[local-whisper] phrase_silence_ms` as meetings apply it: capped at
+/// [`MEETING_PHRASE_SILENCE_MAX_MS`].
+pub fn meeting_phrase_silence_ms(configured: u64) -> u64 {
+    configured.min(MEETING_PHRASE_SILENCE_MAX_MS)
+}
+
 /// A transient HTTP failure worth retrying later: 429 (rate limited) or 503
 /// (overloaded). Cloud backends return it inside their `anyhow::Error` so a
 /// long job such as a meeting can back off and resume, while dictation just

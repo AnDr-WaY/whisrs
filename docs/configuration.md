@@ -299,7 +299,8 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 #   phrases.
 # segmentation = "silence"
 # phrase_silence_ms: continuous silence (ms) that ends a phrase in "silence"
-# mode (ignored by "window" and "none" for dictation; meetings always use it).
+# mode (ignored by "window" and "none" for dictation; meetings always use it,
+# capped at 900 ms so every gap between the speech they send ends a phrase).
 # Lower = snappier output, higher = fewer mid-sentence splits.
 # phrase_silence_ms = 400
 # flash_attn: enable whisper.cpp flash attention (default false). It can cut

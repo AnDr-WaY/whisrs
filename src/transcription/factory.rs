@@ -354,8 +354,9 @@ pub fn canonical_backend_name(name: &str) -> &str {
 }
 
 /// What decides backend `name`'s output beyond its [`TranscriptionConfig`]:
-/// for local whisper the model file, the phrase cut (`phrase_silence_ms`)
-/// and `flash_attn` (which can change the decoded text slightly); the
+/// for local whisper the model file, the phrase cut (`phrase_silence_ms`,
+/// as meetings cap it: [`super::meeting_phrase_silence_ms`]) and
+/// `flash_attn` (which can change the decoded text slightly); the
 /// endpoint for the ASR sidecar. Empty for cloud backends, whose model is in
 /// the request. Meetings key their chunk cache on it, so changing it
 /// re-transcribes.
@@ -369,7 +370,9 @@ pub fn backend_identity(name: &str, config: &Config) -> String {
             let settings = local_whisper_settings(config);
             format!(
                 "model_path={}\nphrase_silence_ms={}\nflash_attn={}",
-                settings.model_path, settings.phrase_silence_ms, settings.flash_attn
+                settings.model_path,
+                super::meeting_phrase_silence_ms(settings.phrase_silence_ms),
+                settings.flash_attn
             )
         }
         "asr-sidecar" => format!("url={}", asr_sidecar_url(config)),

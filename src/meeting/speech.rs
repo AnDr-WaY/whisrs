@@ -34,9 +34,10 @@ const MERGE_FRAMES: usize = 10;
 /// dictation gate's shortest recording.
 const MIN_SPEECH_MS: usize = 300;
 
-/// Digital silence between packed regions (1 s): longer than the default
-/// `phrase_silence_ms` (400 ms), so local whisper's phrase split and
-/// Deepgram's utterances both break at every join.
+/// Digital silence between packed regions (1 s): longer than the phrase
+/// cut local whisper uses for meetings (`phrase_silence_ms`, capped at
+/// 900 ms there) and than Deepgram's utterance split, so both break at
+/// every join.
 pub const JOIN_GAP: usize = RATE;
 
 /// Activity from frame RMS ([`audio_silence_gate::rms_energy`] scale): a
@@ -191,6 +192,40 @@ impl TimeMap {
         }
     }
 
+    /// How many samples of piece `piece` condensed samples `start..end`
+    /// cover; an empty span counts 1 inside the piece.
+    fn overlap(&self, piece: usize, start: usize, end: usize) -> usize {
+        let p = self.pieces[piece];
+        let (lo, hi) = (p.condensed, p.condensed + p.len);
+        if end > start {
+            hi.min(end).saturating_sub(lo.max(start))
+        } else {
+            usize::from(lo <= start && start < hi)
+        }
+    }
+
+    /// The piece condensed samples `start..end` belong to, with how much of
+    /// it they cover: the piece they overlap most, the one holding their
+    /// midpoint on a tie or when they overlap none (overlap 0: all of it
+    /// lies in a gap, or past the end).
+    fn piece_of(&self, start: usize, end: usize) -> (usize, usize) {
+        let middle = self.locate(start + end.saturating_sub(start) / 2);
+        let mut best = (middle, self.overlap(middle, start, end));
+        let first = self
+            .pieces
+            .partition_point(|p| p.condensed + p.len <= start);
+        let last = self
+            .pieces
+            .partition_point(|p| p.condensed < end.max(start + 1));
+        for i in first..last {
+            let overlap = self.overlap(i, start, end);
+            if overlap > best.1 {
+                best = (i, overlap);
+            }
+        }
+        best
+    }
+
     /// Condensed time `ms` on the track's timeline through piece `piece`,
     /// clamped into that piece.
     fn to_track(&self, ms: u64, piece: usize) -> u64 {
@@ -201,38 +236,46 @@ impl TimeMap {
 
     /// `seg`, timed in this chunk's condensed audio, timed on the track.
     ///
-    /// A segment whose words all fall in one piece is mapped through it. One
-    /// whose words span several pieces (a backend that ran two regions into
-    /// one sentence across a join) is split, each word going to the piece
-    /// holding its midpoint, or the nearer piece when it lies in a gap. The
-    /// split keeps the backend's punctuated text when it has one token per
-    /// word, else uses the words' own text. Without word timings start and
-    /// end are mapped on their own, and an end that lands in a later piece
-    /// is clamped to the end of the start's piece, so the segment never
-    /// spans the silence the join stood for.
+    /// Each word goes to the piece it overlaps most. A segment whose words
+    /// all fall in one piece is mapped through it. One whose words span
+    /// several pieces (a backend that ran two regions into one sentence
+    /// across a join) is split there. The split keeps the backend's
+    /// punctuated text when it has one token per word, else joins the
+    /// words' own text the way the backend's text joins them ([`join_words`]).
+    /// A word wholly inside a gap lies on the digital silence of a join and
+    /// is dropped, with its token. Without word timings the segment is
+    /// mapped through the piece it overlaps most (its midpoint's on a tie),
+    /// both ends clamped into it, so it never spans the silence a join stood
+    /// for, nor lands a minute early because it starts in a gap.
     pub fn map_segment(&self, seg: Segment) -> Vec<Segment> {
         if self.pieces.is_empty() {
             return Vec::new();
         }
+        let span = |start_ms: u64, end_ms: u64| {
+            self.piece_of(ms_to_samples(start_ms), ms_to_samples(end_ms))
+        };
         let words = match &seg.words {
             Some(words) if !words.is_empty() => words.clone(),
             _ => {
-                // Both ends through the start's piece: an end past it is
-                // clamped to its end.
-                let piece = self.locate(ms_to_samples(seg.start_ms));
+                let (piece, _) = span(seg.start_ms, seg.end_ms);
                 let start_ms = self.to_track(seg.start_ms, piece);
-                let end_ms = self.to_track(seg.end_ms, piece);
+                let end_ms = self.to_track(seg.end_ms, piece).max(start_ms);
                 return vec![Segment {
                     start_ms,
-                    end_ms: end_ms.max(start_ms),
+                    end_ms,
                     words: None,
                     ..seg
                 }];
             }
         };
-        let homes: Vec<usize> = words
+        // (word index, piece) of every word on sound.
+        let placed: Vec<(usize, usize)> = words
             .iter()
-            .map(|w| self.locate(ms_to_samples((w.start_ms + w.end_ms) / 2)))
+            .enumerate()
+            .filter_map(|(i, w)| {
+                let (piece, overlap) = span(w.start_ms, w.end_ms);
+                (overlap > 0).then_some((i, piece))
+            })
             .collect();
         let map_word = |w: &Word, piece: usize| {
             let start_ms = self.to_track(w.start_ms, piece);
@@ -242,8 +285,8 @@ impl TimeMap {
                 ..w.clone()
             }
         };
-        if homes.iter().all(|&h| h == homes[0]) {
-            let piece = homes[0];
+        if placed.len() == words.len() && placed.iter().all(|&(_, p)| p == placed[0].1) {
+            let piece = placed[0].1;
             let start_ms = self.to_track(seg.start_ms, piece);
             return vec![Segment {
                 start_ms,
@@ -255,41 +298,69 @@ impl TimeMap {
 
         let tokens: Vec<&str> = seg.text.split_whitespace().collect();
         let keep_tokens = tokens.len() == words.len();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < words.len() {
-            let piece = homes[i];
-            let mut j = i;
-            while j < words.len() && homes[j] == piece {
-                j += 1;
-            }
-            let text = if keep_tokens {
-                tokens[i..j].join(" ")
-            } else {
-                let texts: Vec<&str> = words[i..j].iter().map(|w| w.text.as_str()).collect();
-                texts.join(" ")
-            };
-            let mapped: Vec<Word> = words[i..j].iter().map(|w| map_word(w, piece)).collect();
-            let start_ms = mapped[0].start_ms;
-            let end_ms = mapped[mapped.len() - 1].end_ms.max(start_ms);
-            out.push(Segment {
-                start_ms,
-                end_ms,
-                text,
-                speaker: seg.speaker.clone(),
-                words: Some(mapped),
-            });
-            i = j;
-        }
-        out
+        placed
+            .chunk_by(|a, b| a.1 == b.1)
+            .map(|group| {
+                let piece = group[0].1;
+                let text = if keep_tokens {
+                    let kept: Vec<&str> = group.iter().map(|&(i, _)| tokens[i]).collect();
+                    kept.join(" ")
+                } else {
+                    join_words(
+                        &seg.text,
+                        group.iter().map(|&(i, _)| words[i].text.as_str()),
+                    )
+                };
+                let mapped: Vec<Word> = group
+                    .iter()
+                    .map(|&(i, _)| map_word(&words[i], piece))
+                    .collect();
+                let start_ms = mapped[0].start_ms;
+                let end_ms = mapped[mapped.len() - 1].end_ms.max(start_ms);
+                Segment {
+                    start_ms,
+                    end_ms,
+                    text,
+                    speaker: seg.speaker.clone(),
+                    words: Some(mapped),
+                }
+            })
+            .collect()
     }
 }
 
-/// The on-disk form of a mic's near-end mask: the track's sample count
-/// (little-endian u64), then one bit per [`FRAME`], least significant bit
-/// first.
+/// `words` joined the way the backend's own `text` joins them: with a
+/// space, or with none where the text runs two of them together, or holds
+/// no space at all (Chinese, Japanese).
+fn join_words<'a>(text: &str, words: impl IntoIterator<Item = &'a str>) -> String {
+    let unspaced = !text.contains(char::is_whitespace);
+    let mut out = String::new();
+    let mut previous: Option<&str> = None;
+    for word in words {
+        if let Some(previous) = previous {
+            let spaced = text.contains(&format!("{previous} {word}"));
+            let glued = !spaced && (unspaced || text.contains(&format!("{previous}{word}")));
+            if !glued {
+                out.push(' ');
+            }
+        }
+        out.push_str(word);
+        previous = Some(word);
+    }
+    out
+}
+
+/// Version of the near-end detector a cached mask came from: bump it with
+/// any change to the detector, so a retry recomputes masks an older one
+/// cached.
+const MASK_VERSION: u8 = 1;
+
+/// The on-disk form of a mic's near-end mask: [`MASK_VERSION`], the track's
+/// sample count (little-endian u64), then one bit per [`FRAME`], least
+/// significant bit first.
 pub fn encode_mask(samples: usize, active: &[bool]) -> Vec<u8> {
-    let mut out = (samples as u64).to_le_bytes().to_vec();
+    let mut out = vec![MASK_VERSION];
+    out.extend((samples as u64).to_le_bytes());
     out.extend(active.chunks(8).map(|bits| {
         bits.iter()
             .enumerate()
@@ -299,9 +370,14 @@ pub fn encode_mask(samples: usize, active: &[bool]) -> Vec<u8> {
 }
 
 /// Read back [`encode_mask`] for a track of `samples` samples, or `None`
-/// when it was written for another length or is cut short.
+/// when it was written for another length, by another detector version, or
+/// is cut short.
 pub fn decode_mask(bytes: &[u8], samples: usize) -> Option<Vec<bool>> {
-    let (head, bits) = bytes.split_at_checked(8)?;
+    let (&version, rest) = bytes.split_first()?;
+    if version != MASK_VERSION {
+        return None;
+    }
+    let (head, bits) = rest.split_at_checked(8)?;
     if u64::from_le_bytes(head.try_into().ok()?) != samples as u64 {
         return None;
     }
@@ -521,7 +597,12 @@ mod tests {
         let out = map.map_segment(seg);
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].start_ms, out[0].end_ms), (60_000, 61_200));
-        // A word in the gap goes to the nearer piece.
+    }
+
+    #[test]
+    fn a_word_on_the_silence_of_a_join_is_dropped() {
+        let map = two_pieces();
+        // "there" lies wholly in the 2-3 s gap: digital silence.
         let seg = segment(
             100,
             2700,
@@ -529,18 +610,68 @@ mod tests {
             Some(vec![word(100, 500, "hi"), word(2100, 2300, "there")]),
         );
         let out = map.map_segment(seg);
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].words.as_ref().unwrap()[1].end_ms, 2500);
+        let lines: Vec<(u64, u64, &str)> = out
+            .iter()
+            .map(|s| (s.start_ms, s.end_ms, s.text.as_str()))
+            .collect();
+        assert_eq!(lines, [(600, 1000, "hi")]);
+        assert_eq!(out[0].words.as_ref().unwrap().len(), 1);
+        // A segment of nothing but such words goes entirely.
+        let seg = segment(
+            2100,
+            2800,
+            "Thank you.",
+            Some(vec![word(2100, 2800, "Thank you.")]),
+        );
+        assert!(map.map_segment(seg).is_empty());
+        // Past the end of the condensed audio is no sound either.
+        let seg = segment(5100, 5600, "bye", Some(vec![word(5100, 5600, "bye")]));
+        assert!(map.map_segment(seg).is_empty());
     }
 
     #[test]
-    fn without_words_the_end_is_clamped_to_the_start_piece() {
+    fn without_words_a_segment_maps_through_the_piece_it_overlaps_most() {
         let map = two_pieces();
+        // Mostly in the first piece: the end is clamped to its end.
         let out = map.map_segment(segment(500, 4000, "yeah so", None));
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].start_ms, out[0].end_ms), (1000, 2500));
         let out = map.map_segment(segment(3500, 4000, "so", None));
         assert_eq!((out[0].start_ms, out[0].end_ms), (60_500, 61_000));
+        // Starts at the end of the first piece but is mostly the second:
+        // not a minute early.
+        let out = map.map_segment(segment(1700, 4600, "about the release", None));
+        assert_eq!((out[0].start_ms, out[0].end_ms), (60_000, 61_600));
+        // Wholly in the gap: its midpoint decides (a tie goes earlier).
+        let out = map.map_segment(segment(2100, 2900, "um", None));
+        assert_eq!((out[0].start_ms, out[0].end_ms), (2500, 2500));
+    }
+
+    #[test]
+    fn word_text_joins_the_way_the_backend_wrote_it() {
+        let map = two_pieces();
+        // Three words, one token: the text runs them together.
+        let seg = segment(
+            200,
+            4200,
+            "好的。我们开始吧",
+            Some(vec![
+                word(200, 600, "好的。"),
+                word(3100, 3500, "我们"),
+                word(3500, 4200, "开始吧"),
+            ]),
+        );
+        let texts: Vec<String> = map.map_segment(seg).into_iter().map(|s| s.text).collect();
+        assert_eq!(texts, ["好的。", "我们开始吧"]);
+        assert_eq!(
+            join_words("ok so we use whisrs 来开会", ["whisrs", "来开会"]),
+            "whisrs 来开会"
+        );
+        assert_eq!(
+            join_words("用whisrs开会", ["用", "whisrs", "开会"]),
+            "用whisrs开会"
+        );
+        assert_eq!(join_words("Yeah, so", ["yeah", "so"]), "yeah so");
     }
 
     #[test]
@@ -548,10 +679,14 @@ mod tests {
         let len = 3 * SEC + 5;
         let active: Vec<bool> = (0..frame_count(len)).map(|i| i % 3 == 0).collect();
         let bytes = encode_mask(len, &active);
-        assert_eq!(bytes.len(), 8 + 4);
+        assert_eq!(bytes.len(), 1 + 8 + 4);
         assert_eq!(decode_mask(&bytes, len), Some(active));
         assert_eq!(decode_mask(&bytes, len + FRAME), None);
         assert_eq!(decode_mask(&bytes[..bytes.len() - 1], len), None);
         assert_eq!(decode_mask(&[], len), None);
+        // A mask from another detector version is not reused.
+        let mut older = bytes.clone();
+        older[0] = MASK_VERSION.wrapping_sub(1);
+        assert_eq!(decode_mask(&older, len), None);
     }
 }

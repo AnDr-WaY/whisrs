@@ -363,10 +363,15 @@ impl LocalWhisperBackend {
     /// `segmentation` is not consulted: it picks how dictation streams, and
     /// `"none"` would hand whisper.cpp a whole chunk (up to ten minutes) in one
     /// `full()` call, where it carries text across its 30 s windows even with
-    /// `no_context(true)`: the repetition loop of #55.
+    /// `no_context(true)`: the repetition loop of #55. `phrase_silence_ms` is
+    /// capped ([`super::meeting_phrase_silence_ms`]), so every join between
+    /// the chunk's speech regions ends a phrase.
     fn meeting_phrases(&self, samples: &[i16]) -> Vec<super::phrase_split::Phrase> {
-        let mut splitter =
-            PhraseSplitter::new(SAMPLE_RATE, SILENCE_THRESHOLD, self.phrase_silence_ms);
+        let mut splitter = PhraseSplitter::new(
+            SAMPLE_RATE,
+            SILENCE_THRESHOLD,
+            super::meeting_phrase_silence_ms(self.phrase_silence_ms),
+        );
         let mut phrases = splitter.feed(samples);
         phrases.extend(splitter.flush());
         phrases
@@ -898,6 +903,33 @@ mod tests {
             let covered: usize = phrases.iter().map(|p| p.samples.len()).sum();
             assert!(covered >= 69 * SAMPLE_RATE, "{mode}: speech was dropped");
         }
+    }
+
+    /// Two speech regions a second of silence apart, as a meeting chunk
+    /// joins them, are two phrases however long `phrase_silence_ms` is.
+    #[test]
+    fn meeting_phrases_break_at_every_join() {
+        let region: Vec<i16> = (0..16 * SAMPLE_RATE / 10)
+            .map(|i| if i % 8 < 4 { 8000 } else { -8000 })
+            .collect();
+        let join = crate::meeting::speech::JOIN_GAP;
+        let chunk: Vec<i16> = region
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(0, join))
+            .chain(region.iter().copied())
+            .collect();
+        for silence_ms in [400, 900, 1000, 5000] {
+            let backend = LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
+                .with_segmentation("silence", silence_ms);
+            let phrases = backend.meeting_phrases(&chunk);
+            assert_eq!(phrases.len(), 2, "phrase_silence_ms = {silence_ms}");
+            assert!(phrases[1].start_sample as usize >= region.len() + join / 2);
+        }
+        assert!(
+            super::super::MEETING_PHRASE_SILENCE_MAX_MS < (join * 1000 / SAMPLE_RATE) as u64,
+            "the cap must stay under the join"
+        );
     }
 
     #[test]

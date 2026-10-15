@@ -272,9 +272,12 @@ enum EchoStep {
 }
 
 /// Reuse `out` and its mask when an earlier attempt finished both (each the
-/// mic's length), else run [`cancel_echo`] into a temporary file, write the
-/// mask (atomically, 0600), and rename the track into place, so a crash
-/// never leaves a partial track to reuse. Blocking.
+/// mic's length, the mask from this detector version), else run
+/// [`cancel_echo`] into a temporary file, rename the track into place, and
+/// only then write the mask (atomically, 0600). A stale mask is removed
+/// first, so a crash at any point leaves at most a track without a mask,
+/// which is made again, never a mask beside a track it was not made from.
+/// Blocking.
 fn cancel_into_cache(
     mic: &Path,
     system: &Path,
@@ -295,17 +298,22 @@ fn cancel_into_cache(
     fs::create_dir_all(cache_dir)
         .with_context(|| format!("failed to create {}", cache_dir.display()))?;
     fs::set_permissions(cache_dir, fs::Permissions::from_mode(0o700))?;
+    match fs::remove_file(&mask_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context(format!("failed to delete {}", mask_path.display())),
+    }
     let mut tmp_name = out.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
     let tmp = out.with_file_name(tmp_name);
     let outcome = cancel_echo(mic, system, timeline_lag, &tmp).and_then(|outcome| {
         if let EchoOutcome::Cancelled(done) = &outcome {
+            fs::rename(&tmp, out)
+                .with_context(|| format!("failed to rename {} into place", tmp.display()))?;
             write_private(
                 &mask_path,
                 &speech::encode_mask(mic_len as usize, &done.near_end),
             )?;
-            fs::rename(&tmp, out)
-                .with_context(|| format!("failed to rename {} into place", tmp.display()))?;
         }
         Ok(outcome)
     });
@@ -449,6 +457,32 @@ fn read_condensed(path: &Path, map: &TimeMap) -> anyhow::Result<Vec<i16>> {
     Ok(out)
 }
 
+/// Where a track holds speech, per [`speech::FRAME`]: its frame energy at
+/// the gate's level, and for the echo-cancelled mic also its near-end mask.
+/// The mask alone passes the canceller's in-band floor, which hiss from a
+/// noisy mic can clear while the far side is quiet; the energy gate is the
+/// one every other track is held to, so the cancelled mic is held to it too.
+fn speech_activity(near_end: Option<&[bool]>, energies: &[f64], stem: &str) -> Vec<bool> {
+    let energy = speech::energy_mask(energies);
+    match near_end {
+        Some(mask) if mask.len() == energy.len() => mask
+            .iter()
+            .zip(&energy)
+            .map(|(&near, &loud)| near && loud)
+            .collect(),
+        Some(mask) => {
+            warn!(
+                "{stem} near-end mask has {} frames for a track of {}; finding speech by \
+                 energy alone",
+                mask.len(),
+                energy.len()
+            );
+            energy
+        }
+        None => energy,
+    }
+}
+
 /// The track being transcribed.
 struct TrackJob<'a> {
     path: &'a Path,
@@ -480,10 +514,7 @@ async fn transcribe_track(
         blocking(move || scan_track(&path)).await?
     };
     let stem = job.kind.file_stem();
-    let active = match job.near_end {
-        Some(mask) if mask.len() == scan.energies.len() => mask.to_vec(),
-        _ => speech::energy_mask(&scan.energies),
-    };
+    let active = speech_activity(job.near_end, &scan.energies, stem);
     let regions = speech::regions(&active, scan.len);
     if regions.is_empty() {
         debug!("{stem} track holds no speech; skipping");
@@ -620,7 +651,7 @@ struct CachedChunk {
 /// backend's segments before filtering, relative to the chunk, so a config
 /// change to the filters still applies on reuse. An entry is reused only
 /// when its fingerprint matches exactly: another backend, model file,
-/// language, prompt or vocabulary ignores it.
+/// language or vocabulary ignores it (meetings send no other prompt).
 struct ChunkCache {
     dir: PathBuf,
     fingerprint: String,
@@ -1331,7 +1362,7 @@ mod tests {
     /// into one condensed chunk.
     fn condensed(path: &Path, near_end: Option<&[bool]>) -> Vec<i16> {
         let scan = scan_track(path).unwrap();
-        let active = near_end.map_or_else(|| speech::energy_mask(&scan.energies), <[bool]>::to_vec);
+        let active = speech_activity(near_end, &scan.energies, "test");
         let regions = speech::regions(&active, scan.len);
         let chunks = speech::pack(&regions, &scan.energies, None);
         assert_eq!(chunks.len(), 1, "{} regions", regions.len());
@@ -1459,6 +1490,112 @@ mod tests {
         assert_eq!(meta.status, MeetingState::Done);
         assert!(meta.segments.is_empty());
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// A hissy mic (white noise at -54 dBFS) clears the near-end detector's
+    /// in-band floor whenever the far side is quiet; the energy gate keeps
+    /// those stretches from being sent as speech.
+    #[tokio::test]
+    async fn mic_hiss_is_not_sent_as_speech() {
+        let len = fixtures::at(30.0);
+        let mut system = fixtures::speech(len, &[(1.0, 8.0), (20.0, 27.0)], 0.1, 31);
+        let near = fixtures::speech(len, &[(10.0, 12.0), (15.0, 16.0)], 0.01, 32);
+        let mut mic = fixtures::mix(&fixtures::echo(&system, 1000, 33), &near);
+        fixtures::add_noise(&mut mic, 0.002, 34);
+        fixtures::add_noise(&mut system, 1e-4, 35);
+        let (tmp, _) = meeting(&[
+            (TrackKind::Mic, 0, Some(fixtures::quantize(&mic))),
+            (TrackKind::System, 0, Some(fixtures::quantize(&system))),
+        ]);
+        let backend = Arc::new(RecordingBackend::default());
+        run_recording(tmp.path(), &backend).await.unwrap();
+        // The user's 3 s, padded (2.6 + 1.6 s) and 1 s apart: not the 12 s
+        // of hiss between the far side's turns.
+        let sent = backend.sent.lock().unwrap()[0].len();
+        assert!(
+            (4 * RATE..6 * RATE).contains(&sent),
+            "{:.1} s of mic sent",
+            sent as f64 / RATE as f64
+        );
+    }
+
+    /// A backend that runs a whole chunk into one sentence, with a word per
+    /// [`FakeBackend`] segment: like Whisper running two regions together
+    /// across a join.
+    struct OneSentence(Arc<FakeBackend>);
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for OneSentence {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> anyhow::Result<String> {
+            unreachable!("meetings ask for segments")
+        }
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+        async fn transcribe_segments(
+            &self,
+            audio: &[u8],
+            config: &TranscriptionConfig,
+        ) -> anyhow::Result<Transcript> {
+            let parts = self.0.transcribe_segments(audio, config).await?.segments;
+            let (Some(first), Some(last)) = (parts.first(), parts.last()) else {
+                return Ok(Transcript { segments: parts });
+            };
+            let texts: Vec<&str> = parts.iter().map(|s| s.text.as_str()).collect();
+            let sentence = Segment {
+                start_ms: first.start_ms,
+                end_ms: last.end_ms,
+                text: texts.join(" "),
+                speaker: None,
+                words: Some(
+                    parts
+                        .iter()
+                        .map(|s| crate::meeting::Word {
+                            start_ms: s.start_ms,
+                            end_ms: s.end_ms,
+                            text: s.text.clone(),
+                            speaker: None,
+                        })
+                        .collect(),
+                ),
+            };
+            Ok(Transcript {
+                segments: vec![sentence],
+            })
+        }
+        fn max_segment_chunk_secs(&self, config: &TranscriptionConfig) -> Option<u32> {
+            self.0.max_segment_chunk_secs(config)
+        }
+    }
+
+    /// One sentence across a join comes back as two segments at the times
+    /// each part was said, words and track offset included.
+    #[tokio::test]
+    async fn a_sentence_across_a_join_is_split_by_its_words() {
+        let fake = FakeBackend::new(&[(3000, "First."), (4000, "Second.")], Some(600));
+        let samples = track(120.0, &[(30.0, 1.0, 3000), (90.0, 1.0, 4000)]);
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 250, Some(samples))]);
+        let meta = process_meeting(
+            tmp.path(),
+            &config(),
+            Some(Arc::new(OneSentence(fake.clone())) as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fake.calls.load(Ordering::Relaxed), 1);
+        let lines: Vec<_> = meta
+            .segments
+            .iter()
+            .map(|s| (s.start_ms, s.end_ms, s.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [(30_250, 31_250, "First."), (90_250, 91_250, "Second.")]
+        );
     }
 
     /// The system track has no near-end detector: its speech is found by
@@ -1632,6 +1769,9 @@ mod tests {
             .join(CACHE_DIR)
             .join("mic-echo-cancelled.wav.tmp");
         assert!(!leftover.exists(), "temporary left behind");
+        // The mask is written only beside the track it was made from.
+        let mask = tmp.path().join(CACHE_DIR).join(ECHO_CANCELLED_MASK);
+        assert!(!mask.exists(), "a mask without its track");
     }
 
     /// A system track listed in `meeting.json` but missing on disk is not an
@@ -1758,7 +1898,8 @@ mod tests {
         println!("{done:?} in {:.2?}", started.elapsed());
 
         let scan = scan_track(&out).unwrap();
-        let regions = speech::regions(&done.near_end, scan.len);
+        let active = speech_activity(Some(&done.near_end), &scan.energies, "mic");
+        let regions = speech::regions(&active, scan.len);
         let mut words: Vec<(f64, f64)> = labels["results"]["utterances"]
             .as_array()
             .unwrap()
@@ -1781,13 +1922,14 @@ mod tests {
                 .take_while(|w| w.0 <= t)
                 .any(|w| t <= w.1);
         }
-        let padded = |at: usize| {
+        let padded = |mask: &[bool], at: usize| {
             let f = at / speech::FRAME;
-            let lo = f.saturating_sub(3);
-            done.near_end[lo..(f + 4).min(done.near_end.len())]
+            mask[f.saturating_sub(3)..(f + 4).min(mask.len())]
                 .iter()
                 .any(|&a| a)
         };
+        let detector_alone = |at: usize| padded(&done.near_end, at);
+        let with_energy = |at: usize| padded(&active, at);
         let in_regions = |at: usize| regions.iter().any(|r| r.contains(&at));
         let share = |kept: &dyn Fn(usize) -> bool, want: bool| {
             let picked: Vec<usize> = (0..frames).filter(|&i| labelled[i] == want).collect();
@@ -1799,7 +1941,11 @@ mod tests {
             labelled.iter().filter(|&&l| l).count()
         );
         for (name, kept) in [
-            ("padded mask", &padded as &dyn Fn(usize) -> bool),
+            (
+                "near-end mask alone, padded",
+                &detector_alone as &dyn Fn(usize) -> bool,
+            ),
+            ("near-end and energy, padded", &with_energy),
             ("final regions", &in_regions),
         ] {
             println!(
@@ -1894,6 +2040,11 @@ mod tests {
         // Phrase cuts and flash attention change what whisper decodes.
         let silence = format!("{base}phrase_silence_ms = 900\n");
         assert_ne!(fp, fingerprint_of(&silence));
+        // Meetings cap the phrase cut at 900 ms, so longer ones decode alike.
+        for longer in [1200, 5000] {
+            let cut = format!("{base}phrase_silence_ms = {longer}\n");
+            assert_eq!(fingerprint_of(&silence), fingerprint_of(&cut), "{longer}");
+        }
         let flash = format!("{base}flash_attn = true\n");
         assert_ne!(fp, fingerprint_of(&flash));
         // Segmentation does not: meetings always decode phrase by phrase.
