@@ -566,16 +566,28 @@ struct RawSegment {
     avg_logprob: Option<f64>,
 }
 
-/// Decode `audio` and return whisper's own segments with their timing and
-/// confidence. Same parameters as [`run_whisper_inference`].
+/// Decode a meeting window and return whisper's own segments with their
+/// timing and confidence. Dictation's parameters ([`full_params`]), with one
+/// change: `n_max_text_ctx` 0.
+///
+/// A window fits one 30 s mel window, but `full()` can still take a second
+/// pass: it seeks to the last timestamp it decoded and runs on over the
+/// rest, and that pass is conditioned on the first pass's text
+/// (`no_context` clears the carried text only when the call starts). That
+/// is the carried context of the #55 repetition loop. With `n_max_text_ctx`
+/// 0 no pass takes any prompt; in this whisper.cpp that includes the
+/// initial prompt, so meetings send local whisper none (see
+/// `crate::transcription::factory::meeting_transcription_config`).
 fn run_whisper_segments(
     state: &mut whisper_rs::WhisperState,
     audio: &[f32],
     language: &str,
     prompt: Option<&str>,
 ) -> anyhow::Result<Vec<RawSegment>> {
+    let mut params = full_params(language, prompt);
+    params.set_n_max_text_ctx(0);
     state
-        .full(full_params(language, prompt), audio)
+        .full(params, audio)
         .map_err(|e| anyhow::anyhow!("whisper inference failed: {e}"))?;
 
     let mut out = Vec::new();
@@ -613,15 +625,46 @@ fn run_whisper_segments(
     Ok(out)
 }
 
+/// Whisper's segments for one decode window, placed on the chunk: blank and
+/// no-speech segments dropped, times clamped into the window (its decoded
+/// buffer may have been padded) and moved by its start, and the first kept
+/// segment of a window that starts at a forced cut lowercased, since it
+/// continues a sentence.
+fn place_window_segments(raw: Vec<RawSegment>, window: &DecodeWindow) -> Vec<Segment> {
+    let window_start_ms = samples_to_ms(window.range.start as u64);
+    let window_len_ms = samples_to_ms(window.range.len() as u64);
+    let mut out = Vec::new();
+    for seg in raw {
+        let text = seg.text.trim();
+        if text.is_empty() || is_no_speech(Some(seg.no_speech_prob), seg.avg_logprob) {
+            continue;
+        }
+        let text = if window.continuation && out.is_empty() {
+            decapitalize_first(text)
+        } else {
+            text.to_string()
+        };
+        let start = seg.start_ms.min(window_len_ms);
+        let end = seg.end_ms.clamp(start, window_len_ms);
+        out.push(Segment {
+            start_ms: window_start_ms + start,
+            end_ms: window_start_ms + end,
+            text,
+            speaker: None,
+            words: None,
+        });
+    }
+    out
+}
+
 /// Decode a meeting chunk window by window on one reused state, one
 /// `full()` call per [`DecodeWindow`].
 ///
 /// Windows group the phrases of the same [`PhraseSplitter`] as streaming
-/// dictation, at most ~28 s each, so no single `full()` call sees more than
-/// one 30 s window: whisper.cpp carries text context across its 30 s windows
-/// inside one call even with `no_context(true)`, which is the repetition
-/// loop of issue #55. Whisper's own segments are kept, timed from the
-/// window's start.
+/// dictation, at most ~28 s each, so each fits one 30 s mel window and a
+/// call never decodes on into a second one. Passes inside a window take no
+/// carried text ([`run_whisper_segments`]). Whisper's own segments are
+/// kept, placed by [`place_window_segments`].
 fn decode_meeting_windows(
     ctx: &whisper_rs::WhisperContext,
     samples: &[i16],
@@ -636,46 +679,20 @@ fn decode_meeting_windows(
 
     for window in windows {
         let window_start_ms = samples_to_ms(window.range.start as u64);
-        let window_len_ms = samples_to_ms(window.range.len() as u64);
         let mut buf = samples[window.range.clone()].to_vec();
         // whisper.cpp silently produces nothing for <1 s buffers; pad with silence.
         if buf.len() < MIN_DECODE_SAMPLES {
             buf.resize(MIN_DECODE_SAMPLES, 0);
         }
-        let raw = match run_whisper_segments(&mut state, &i16_to_f32(&buf), language, prompt) {
-            Ok(raw) => raw,
+        match run_whisper_segments(&mut state, &i16_to_f32(&buf), language, prompt) {
+            Ok(raw) => segments.extend(place_window_segments(raw, window)),
             Err(e) => {
                 warn!("whisper meeting window at {window_start_ms} ms failed: {e}");
                 failures += 1;
                 // Same recovery as streaming: free the failed state first.
                 drop(state);
                 state = create_state(ctx)?;
-                continue;
             }
-        };
-
-        let mut first = true;
-        for seg in raw {
-            let text = seg.text.trim();
-            if text.is_empty() || is_no_speech(Some(seg.no_speech_prob), seg.avg_logprob) {
-                continue;
-            }
-            let text = if window.continuation && first {
-                decapitalize_first(text)
-            } else {
-                text.to_string()
-            };
-            first = false;
-            // Clamp into the real window: the tail may be zero padding.
-            let start = seg.start_ms.min(window_len_ms);
-            let end = seg.end_ms.clamp(start, window_len_ms);
-            segments.push(Segment {
-                start_ms: window_start_ms + start,
-                end_ms: window_start_ms + end,
-                text,
-                speaker: None,
-                words: None,
-            });
         }
     }
 
@@ -911,6 +928,58 @@ mod tests {
             let covered: usize = phrases.iter().map(|p| p.samples.len()).sum();
             assert!(covered >= 69 * SAMPLE_RATE, "{mode}: speech was dropped");
         }
+    }
+
+    fn raw(start_ms: u64, end_ms: u64, text: &str, no_speech_prob: f64) -> RawSegment {
+        RawSegment {
+            start_ms,
+            end_ms,
+            text: text.to_string(),
+            no_speech_prob,
+            avg_logprob: Some(-1.5),
+        }
+    }
+
+    /// A window's segments land on the chunk: moved by the window's start,
+    /// clamped into it, blank and no-speech ones dropped, and a forced-cut
+    /// window's first kept line lowercased (only that one).
+    #[test]
+    fn window_segments_are_placed_on_the_chunk() {
+        let window = DecodeWindow {
+            range: 16_000..16_000 + 20 * SAMPLE_RATE,
+            continuation: true,
+            phrases: 3,
+        };
+        let placed = place_window_segments(
+            vec![
+                raw(0, 900, " ", 0.0),
+                raw(900, 1_800, " Thanks for watching.", 0.9),
+                raw(2_000, 6_500, " And then We shipped it.", 0.1),
+                raw(7_000, 9_000, " Then the tests.", 0.1),
+                // Ends in the zero padding past the window.
+                raw(19_000, 30_000, " Done.", 0.1),
+            ],
+            &window,
+        );
+        let lines: Vec<(u64, u64, &str)> = placed
+            .iter()
+            .map(|s| (s.start_ms, s.end_ms, s.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (3_000, 7_500, "and then We shipped it."),
+                (8_000, 10_000, "Then the tests."),
+                (20_000, 21_000, "Done."),
+            ]
+        );
+        // A window that starts fresh keeps its capital.
+        let fresh = DecodeWindow {
+            continuation: false,
+            ..window
+        };
+        let placed = place_window_segments(vec![raw(0, 500, " Yes.", 0.0)], &fresh);
+        assert_eq!(placed[0].text, "Yes.");
     }
 
     /// Two speech regions a second of silence apart, as a meeting chunk

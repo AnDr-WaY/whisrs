@@ -415,16 +415,26 @@ pub fn meeting_backend_name(config: &Config) -> anyhow::Result<String> {
 /// `[general] prompt`. A meeting does not: the prompt is an instruction for
 /// dictation ("Transcribe in the language spoken", a style), and the
 /// vocabulary still goes as the hint, keyterms or hotwords as before.
+///
+/// Local whisper gets no prompt at all: its meeting windows decode with
+/// `n_max_text_ctx` 0, so no pass is conditioned on earlier text, and in
+/// this whisper.cpp that leaves the initial prompt unused too. Sending none
+/// keeps the prompt-echo filter and the chunk cache honest about it.
 pub fn meeting_transcription_config(name: &str, config: &Config) -> TranscriptionConfig {
     let model = model_for_backend(name, config);
-    let model = match canonical_backend_name(name) {
+    let canonical = canonical_backend_name(name);
+    let model = match canonical {
         "openai" => openai_meeting_model(model),
         _ => model,
+    };
+    let prompt = match canonical {
+        "local-whisper" => None,
+        _ => transcription_prompt(None, &config.general.vocabulary),
     };
     TranscriptionConfig {
         language: config.general.language.clone(),
         model,
-        prompt: transcription_prompt(None, &config.general.vocabulary),
+        prompt,
         keyterms: config.general.vocabulary.clone(),
     }
 }
@@ -1044,6 +1054,14 @@ mod tests {
         assert_eq!(
             meeting_model_label("local-whisper", &config, &request),
             "ggml-large-v3-turbo-q5_0.bin"
+        );
+        // Its meeting windows take no prompt, so none is sent.
+        let with_vocabulary: Config =
+            toml::from_str("[general]\nbackend = \"local-whisper\"\nvocabulary = [\"whisrs\"]\n")
+                .unwrap();
+        assert_eq!(
+            meeting_transcription_config("local", &with_vocabulary).prompt,
+            None
         );
         assert_eq!(
             meeting_model_label("local", &config, &request),

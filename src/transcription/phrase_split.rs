@@ -30,8 +30,9 @@
 //! - [`PhraseSplitter::flush`] emits the trailing in-progress phrase at end of
 //!   stream (if it carries enough speech) exactly once.
 //!
-//! Meetings then group consecutive phrases into decode windows
-//! ([`decode_windows`]): one decoder call per window instead of per phrase.
+//! Local whisper meetings then group consecutive phrases into decode
+//! windows ([`decode_windows`]): one `full()` call per window instead of per
+//! phrase.
 
 use std::ops::Range;
 
@@ -52,15 +53,17 @@ const MAX_PHRASE_SECS: usize = 20;
 const HARD_MAX_PHRASE_SECS: usize = 28;
 /// How far back to look for the quietest frame when force-splitting.
 const QUIET_SEARCH_MS: usize = 2000;
-/// Longest decode window: the hard phrase ceiling, so a window too stays
-/// inside whisper's 30 s mel window and one `full()` call never carries text
-/// from one 30 s window into the next (the repetition loop of #55).
+/// Longest decode window: the hard phrase ceiling, so a window fits in one
+/// 30 s mel window. That bounds the audio, not the decoder passes: whisper
+/// can still take a second pass over the rest of a window, which is why
+/// meeting windows decode without carried text (`n_max_text_ctx` 0).
 pub const MAX_DECODE_WINDOW_SECS: usize = HARD_MAX_PHRASE_SECS;
 /// A run of at least this much exact-zero audio is a join: the second of
 /// digital silence a condensed meeting chunk puts between two speech regions
-/// (`crate::meeting::speech::JOIN_GAP`), of which a phrase's padding may take
-/// 100 ms at either end. A microphone never records that many exact zeros
-/// (its noise floor keeps flipping the low bits); a system track can, when
+/// (`crate::meeting::speech::JOIN_GAP`). The runs are found in the raw
+/// samples, so a join always shows its full second; the threshold sits a
+/// little under it. A microphone never records that many exact zeros (its
+/// noise floor keeps flipping the low bits); a system track can, when
 /// nothing plays, and then grouping merely stops there as at a join.
 const JOIN_ZERO_MS: usize = 900;
 
@@ -108,17 +111,19 @@ pub fn decode_windows(
     let max_len = MAX_DECODE_WINDOW_SECS * sample_rate;
     let joins = zero_runs(samples, JOIN_ZERO_MS * sample_rate / 1000);
     let mut windows: Vec<DecodeWindow> = Vec::new();
-    // Start of the last phrase added to the current window.
-    let mut last_start = 0usize;
     for phrase in phrases {
         let start = phrase.start_sample as usize;
         let end = start + phrase.samples.len();
         if let Some(window) = windows.last_mut() {
-            let joined = joins.iter().any(|j| j.start < end && j.end > last_start);
+            // A join between them reaches past the window's end into this
+            // phrase. Measured from the window's end, not its last phrase's
+            // start: a phrase's leading pad may lie in the join before it.
+            let joined = joins
+                .iter()
+                .any(|j| j.start < end && j.end > window.range.end);
             if !joined && end.saturating_sub(window.range.start) <= max_len {
                 window.range.end = window.range.end.max(end);
                 window.phrases += 1;
-                last_start = start;
                 continue;
             }
         }
@@ -127,7 +132,6 @@ pub fn decode_windows(
             continuation: phrase.continuation,
             phrases: 1,
         });
-        last_start = start;
     }
     windows
 }
@@ -908,10 +912,11 @@ mod tests {
             }
             next += window.phrases;
         }
-        // The sentence and its pause, in one window that ends at the join.
+        // The sentence and its pause, in one window that ends at the join;
+        // the 40 s of turns after it, in two.
         assert_eq!(windows[0].phrases, 2);
         assert!(windows[0].range.end <= join_at);
-        assert!(windows.len() >= 3, "40 s of turns need two windows");
+        assert_eq!(windows.len(), 3, "{windows:?}");
     }
 
     #[test]
@@ -929,6 +934,22 @@ mod tests {
         let phrases = phrases_of(&audio);
         assert_eq!(decode_windows(&audio, &phrases, RATE).len(), 2);
         assert!(decode_windows(&[], &[], RATE).is_empty());
+    }
+
+    /// The first phrase after a join has its leading pad in the join's
+    /// zeros; that join lies before it, not between it and the next phrase.
+    #[test]
+    fn a_join_before_a_window_does_not_split_it() {
+        let mut audio = voice(1.0);
+        audio.extend(std::iter::repeat_n(0i16, RATE));
+        audio.extend(voice(1.0));
+        audio.extend(pause(2.0));
+        audio.extend(voice(1.0));
+        let phrases = phrases_of(&audio);
+        assert_eq!(phrases.len(), 3);
+        let windows = decode_windows(&audio, &phrases, RATE);
+        let counts: Vec<usize> = windows.iter().map(|w| w.phrases).collect();
+        assert_eq!(counts, [1, 2], "{windows:?}");
     }
 
     #[test]

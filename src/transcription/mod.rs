@@ -87,8 +87,9 @@ pub struct Transcript {
 /// WAV is 32 KB/s, so 10 minutes is ~19 MB with headroom.
 pub const UPLOAD_CHUNK_SECS: u32 = 600;
 
-/// Chunk length for local decoding. whisper.cpp still decodes phrase by
-/// phrase inside a chunk; the cap only bounds how much audio sits in memory.
+/// Chunk length for local decoding. whisper.cpp still decodes a chunk in
+/// windows of at most ~28 s; the cap only bounds how much audio sits in
+/// memory.
 pub const LOCAL_CHUNK_SECS: u32 = 600;
 
 /// Sample rate of the WAV handed to [`TranscriptionBackend::transcribe_segments`].
@@ -222,20 +223,22 @@ pub(crate) fn decode_wav_samples(audio: &[u8]) -> anyhow::Result<Vec<i16>> {
 
 /// Phrase fallback for backends that return no timestamps.
 ///
-/// Splits the chunk at pauses with [`phrase_split::PhraseSplitter`], groups
-/// consecutive phrases into windows of at most ~28 s that never cross a join
-/// ([`phrase_split::decode_windows`]), sends each window through the
-/// backend's plain [`TranscriptionBackend::transcribe`], and returns one
-/// segment per non-empty window, timed by where the window sits in the
-/// chunk. One request per window rather than per phrase: every request has
-/// a fixed cost (a model pass, a round trip), and a text-only backend gives
-/// no inner timing to lose. Not a trait default on purpose: each backend
-/// that relies on it calls it explicitly from its own `transcribe_segments`.
+/// Splits the chunk at pauses with [`phrase_split::PhraseSplitter`], sends each
+/// phrase through the backend's plain [`TranscriptionBackend::transcribe`], and
+/// returns one segment per non-empty phrase, timed by where the phrase sits in
+/// the chunk. Not a trait default on purpose: each backend that relies on it
+/// calls it explicitly from its own `transcribe_segments`.
 ///
-/// Each window request waits out rate limits on its own
-/// ([`retry::retry_rate_limited`], [`retry::RATE_LIMIT_BUDGET`] per window),
-/// so a 429 on one window does not resend the windows already done. A
-/// window still failing when its retries run out fails the chunk with a
+/// One request per phrase, unlike local whisper's decode windows
+/// ([`phrase_split::decode_windows`]): a text-only backend returns no inner
+/// timing, so a phrase's place is all that orders its line against the other
+/// channel, and the models behind it (Parakeet, Moonshine) do not pad every
+/// call to 30 s the way whisper does, so grouping would buy little.
+///
+/// Each phrase request waits out rate limits on its own
+/// ([`retry::retry_rate_limited`], [`retry::RATE_LIMIT_BUDGET`] per phrase),
+/// so a 429 on one phrase does not resend the phrases already done. A phrase
+/// still limited when its budget runs out fails the chunk with a
 /// [`retry::RateLimitExhausted`], which the caller's own retry layer does
 /// not retry again.
 pub async fn segments_by_phrase<B>(
@@ -256,17 +259,10 @@ where
     );
     let mut phrases = splitter.feed(&samples);
     phrases.extend(splitter.flush());
-    let windows = phrase_split::decode_windows(&samples, &phrases, SEGMENT_SAMPLE_RATE);
-    tracing::debug!(
-        "phrase fallback: {} phrase(s) in {} request(s)",
-        phrases.len(),
-        windows.len()
-    );
-    drop(phrases);
 
     let mut segments = Vec::new();
-    for window in windows {
-        let wav = encode_wav(&samples[window.range.clone()])?;
+    for phrase in phrases {
+        let wav = encode_wav(&phrase.samples)?;
         let text = retry::retry_rate_limited(retry::RATE_LIMIT_BUDGET, || {
             backend.transcribe(&wav, config)
         })
@@ -276,8 +272,8 @@ where
             continue;
         }
         segments.push(Segment {
-            start_ms: samples_to_ms(window.range.start as u64),
-            end_ms: samples_to_ms(window.range.end as u64),
+            start_ms: samples_to_ms(phrase.start_sample),
+            end_ms: samples_to_ms(phrase.start_sample + phrase.samples.len() as u64),
             text: text.to_string(),
             speaker: None,
             words: None,
@@ -550,10 +546,10 @@ mod tests {
         assert!(t.segments.iter().all(|s| s.text.ends_with("samples")));
     }
 
-    /// Phrases a recorded pause apart (room noise, not digital silence) go
-    /// out as one request covering both and the pause between them.
+    /// Phrases a recorded pause apart (room noise, not digital silence)
+    /// still go out one request each, each with its own place.
     #[tokio::test]
-    async fn phrase_fallback_sends_nearby_phrases_together() {
+    async fn phrase_fallback_sends_each_phrase_alone() {
         let room = |secs: f64| -> Vec<i16> {
             let n = (secs * SEGMENT_SAMPLE_RATE as f64) as usize;
             (0..n).map(|i| [3, -2, 1, -3][i % 4]).collect()
@@ -566,16 +562,8 @@ mod tests {
         let wav = crate::audio::wav::encode_wav(&audio).unwrap();
 
         let t = EchoLength.transcribe_segments(&wav, &cfg()).await.unwrap();
-        assert_eq!(t.segments.len(), 1, "{t:?}");
-        assert_eq!(t.segments[0].start_ms, 900);
-        assert!(t.segments[0].end_ms > 5000 && t.segments[0].end_ms <= 5200);
-        // Both phrases and the pause: 0.9 s to ~5.1 s, about 4.2 s of audio.
-        let sent: usize = t.segments[0]
-            .text
-            .trim_end_matches(" samples")
-            .parse()
-            .unwrap();
-        assert!((66_000..=68_000).contains(&sent), "{sent}");
+        let starts: Vec<u64> = t.segments.iter().map(|s| s.start_ms).collect();
+        assert_eq!(starts, [900, 3400], "{t:?}");
     }
 
     #[tokio::test]

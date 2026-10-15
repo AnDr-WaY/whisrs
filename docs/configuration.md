@@ -39,7 +39,8 @@ prompt = "Speech is in English or Spanish. Transcribe in the language spoken; ne
                             # with gpt-realtime-whisper)
                             # `whisrsd` warns at startup if either key targets a backend
                             # that discards it. `whisrs config` warns the same on save.
-                            # Meetings never send the prompt, only the vocabulary.
+                            # Meetings never send the prompt, only the vocabulary
+                            # (and local-whisper meetings neither).
 tray = true                 # system tray icon (requires SNI host like waybar)
 overlay = false             # on-screen recording overlay (Hyprland/Sway, GNOME extension)
 
@@ -590,7 +591,9 @@ since OpenAI's file endpoint refuses them. So an `openai-realtime` dictation
 setup can keep its model and still set `[meeting] backend = "openai"`.
 `[openai] languages` does not apply to meetings; they use `[general] language`.
 Meetings send `[general] vocabulary` as the hint, but not `[general] prompt`,
-which is an instruction for dictation.
+which is an instruction for dictation. A `local-whisper` meeting takes
+neither: it decodes without any prompt, so no decoded text is carried
+forward within a stretch of speech, which can make whisper repeat itself.
 
 With `local-whisper`, a meeting is always decoded in short phrases (at most
 about 28 seconds each) whatever `[local-whisper] segmentation` says, `"none"`
