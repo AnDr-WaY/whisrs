@@ -246,7 +246,8 @@ impl TimeMap {
     /// is dropped, with its token. Without word timings the segment is
     /// mapped through the piece it overlaps most (its midpoint's on a tie),
     /// both ends clamped into it, so it never spans the silence a join stood
-    /// for, nor lands a minute early because it starts in a gap.
+    /// for, nor lands a minute early because it starts in a gap; one that
+    /// overlaps no piece lies wholly on a join's silence and is dropped.
     pub fn map_segment(&self, seg: Segment) -> Vec<Segment> {
         if self.pieces.is_empty() {
             return Vec::new();
@@ -257,7 +258,12 @@ impl TimeMap {
         let words = match &seg.words {
             Some(words) if !words.is_empty() => words.clone(),
             _ => {
-                let (piece, _) = span(seg.start_ms, seg.end_ms);
+                let (piece, overlap) = span(seg.start_ms, seg.end_ms);
+                if overlap == 0 {
+                    // Wholly on the digital silence of a join, like a word
+                    // there: nothing was said.
+                    return Vec::new();
+                }
                 let start_ms = self.to_track(seg.start_ms, piece);
                 let end_ms = self.to_track(seg.end_ms, piece).max(start_ms);
                 return vec![Segment {
@@ -642,9 +648,17 @@ mod tests {
         // not a minute early.
         let out = map.map_segment(segment(1700, 4600, "about the release", None));
         assert_eq!((out[0].start_ms, out[0].end_ms), (60_000, 61_600));
-        // Wholly in the gap: its midpoint decides (a tie goes earlier).
-        let out = map.map_segment(segment(2100, 2900, "um", None));
-        assert_eq!((out[0].start_ms, out[0].end_ms), (2500, 2500));
+        // Touching a piece by a millisecond is enough to keep it.
+        let out = map.map_segment(segment(1999, 2900, "yes", None));
+        assert_eq!((out[0].start_ms, out[0].end_ms), (2499, 2500));
+        // Wholly on a join's silence, or past the end of the audio: a
+        // hallucination there (a sidecar's "Thank you.") is dropped.
+        assert!(map
+            .map_segment(segment(2100, 2900, "Thank you.", None))
+            .is_empty());
+        assert!(map
+            .map_segment(segment(5100, 5600, "Bye.", None))
+            .is_empty());
     }
 
     #[test]

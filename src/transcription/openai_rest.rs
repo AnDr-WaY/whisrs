@@ -384,8 +384,8 @@ mod tests {
         assert!(headers.contains("filename=\"audio.wav\""), "{headers}");
         assert!(data.starts_with(b"RIFF"));
     }
-    /// A Cloudflare origin timeout (524) on a meeting chunk is retried like
-    /// a rate limit, with short stand-ins for the server-error waits.
+    /// A Cloudflare origin timeout (524) on a meeting chunk is retried on the
+    /// server-error schedule, here with short stand-ins for its waits.
     #[tokio::test]
     async fn a_524_is_retried_until_the_chunk_goes_through() {
         let config = config_for("whisper-1");

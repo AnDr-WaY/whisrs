@@ -120,6 +120,13 @@ impl AsrSidecarBackend {
                 Ok(err_resp) => format!("ASR sidecar error ({code}): {}", err_resp.message()),
                 Err(_) => format!("ASR sidecar error ({code}): {body}"),
             };
+            // A local sidecar answers 500 for an uncaught exception, which a
+            // retry rarely fixes and which would cost three more inference
+            // runs. Gateway errors in front of it (502, 504, 520 to 524)
+            // stay retryable.
+            if code == 500 {
+                return Err(anyhow::anyhow!(message));
+            }
             return Err(super::http_error(code, retry_after, message));
         }
         Ok(body)
@@ -543,8 +550,8 @@ mod tests {
         assert_eq!(t.segments[0].start_ms, 1000);
         assert!(!backend.no_segments.load(Ordering::Relaxed));
     }
-    /// A Cloudflare origin timeout (524) on a meeting chunk is retried like
-    /// a rate limit, with short stand-ins for the server-error waits.
+    /// A Cloudflare origin timeout (524) on a meeting chunk is retried on the
+    /// server-error schedule, here with short stand-ins for its waits.
     #[tokio::test]
     async fn a_524_is_retried_until_the_chunk_goes_through() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -563,6 +570,56 @@ mod tests {
         let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
         let quick = [std::time::Duration::from_millis(1); 3];
         let config = test_config();
+        let t = retry_transient(RATE_LIMIT_BUDGET, &quick, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap();
+        assert_eq!(t.segments[0].text, "ok");
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+    /// A 500 from the sidecar (an exception in its own code) is not
+    /// retried; a 502 from a proxy in front of it is.
+    #[tokio::test]
+    async fn a_500_is_final_but_a_502_is_retried() {
+        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
+        let config = test_config();
+        let quick = [std::time::Duration::from_millis(1); 3];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![(500, r#"{"detail": "CUDA out of memory"}"#)],
+        ));
+        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let err = retry_transient(RATE_LIMIT_BUDGET, &quick, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(server.await.unwrap().len(), 1);
+        assert!(
+            err.to_string().starts_with("ASR sidecar error (500)"),
+            "{err}"
+        );
+        assert!(err
+            .downcast_ref::<crate::transcription::RetryableHttpError>()
+            .is_none());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![
+                (502, "Bad Gateway"),
+                (
+                    200,
+                    r#"{"text": "ok", "segments": [{"start": 1.0, "end": 2.0, "text": "ok"}]}"#,
+                ),
+            ],
+        ));
+        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
         let t = retry_transient(RATE_LIMIT_BUDGET, &quick, || {
             backend.transcribe_segments(&wav, &config)
         })
