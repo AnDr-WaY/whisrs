@@ -1,9 +1,9 @@
 //! Groq Whisper API transcription backend.
 //!
-//! Sends WAV audio to Groq's `/openai/v1/audio/transcriptions` endpoint
-//! and returns the transcribed text. Supports chunked pseudo-streaming
-//! by splitting audio at silence boundaries and sending each chunk
-//! independently.
+//! Sends WAV audio (FLAC for meeting chunks) to Groq's
+//! `/openai/v1/audio/transcriptions` endpoint and returns the transcribed
+//! text. Supports chunked pseudo-streaming by splitting audio at silence
+//! boundaries and sending each chunk independently.
 
 use asr_dedup::{TextDedup, TimestampDedup, Word as AsrWord};
 use async_trait::async_trait;
@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use crate::audio::wav::encode_wav;
 use crate::audio::AudioChunk;
 
+use super::flac::{meeting_upload, UploadFormat};
 use super::verbose_json::parse_verbose_segments;
 use super::{Transcript, TranscriptionBackend, TranscriptionConfig, UPLOAD_CHUNK_SECS};
 
@@ -43,6 +44,8 @@ const MIN_SILENCE_SAMPLES: usize = 16_000 * 300 / 1000;
 pub struct GroqBackend {
     client: reqwest::Client,
     api_key: String,
+    /// [`GROQ_TRANSCRIPTION_URL`]; tests point it at a local server.
+    url: String,
 }
 
 impl GroqBackend {
@@ -51,6 +54,7 @@ impl GroqBackend {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            url: GROQ_TRANSCRIPTION_URL.to_string(),
         }
     }
 
@@ -60,24 +64,27 @@ impl GroqBackend {
         wav_data: &[u8],
         config: &TranscriptionConfig,
     ) -> anyhow::Result<GroqTranscriptionResponse> {
-        let body = self.post(wav_data, config, &["word"]).await?;
+        let body = self
+            .post(wav_data, UploadFormat::WAV, config, &["word"])
+            .await?;
         let parsed: GroqTranscriptionResponse = serde_json::from_str(&body)?;
         Ok(parsed)
     }
 
-    /// POST `audio` as a `verbose_json` request with the given
+    /// POST `audio`, in `format`, as a `verbose_json` request with the given
     /// `timestamp_granularities[]` and return the raw success body.
     async fn post(
         &self,
         audio: &[u8],
+        format: UploadFormat,
         config: &TranscriptionConfig,
         granularities: &[&str],
     ) -> anyhow::Result<String> {
         let response = self
             .client
-            .post(GROQ_TRANSCRIPTION_URL)
+            .post(&self.url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(build_form(audio, config, granularities)?)
+            .multipart(build_form(audio, format, config, granularities)?)
             .send()
             .await?;
 
@@ -119,15 +126,17 @@ fn check_audio_size(audio: &[u8]) -> anyhow::Result<()> {
 
 /// The multipart form for one transcription request.
 ///
-/// Dictation asks for `word` timestamps only; meetings add `segment`.
+/// Dictation sends WAV and asks for `word` timestamps only; meetings send
+/// FLAC and add `segment`.
 fn build_form(
     audio: &[u8],
+    format: UploadFormat,
     config: &TranscriptionConfig,
     granularities: &[&str],
 ) -> anyhow::Result<multipart::Form> {
     let file_part = multipart::Part::bytes(audio.to_vec())
-        .file_name("audio.wav")
-        .mime_str("audio/wav")?;
+        .file_name(format.file_name)
+        .mime_str(format.mime)?;
 
     let mut form = multipart::Form::new()
         .part("file", file_part)
@@ -204,7 +213,9 @@ impl TranscriptionBackend for GroqBackend {
             config.language
         );
 
-        let body = self.post(audio, config, &["word"]).await?;
+        let body = self
+            .post(audio, UploadFormat::WAV, config, &["word"])
+            .await?;
         let parsed: GroqTranscriptionResponse = serde_json::from_str(&body)?;
 
         if !parsed.words.is_empty() {
@@ -343,18 +354,24 @@ impl TranscriptionBackend for GroqBackend {
 
     // Native timestamps: verbose_json segments, parsed by
     // `verbose_json::parse_verbose_segments` (no-speech heuristic included).
+    // The chunk goes up as FLAC.
     async fn transcribe_segments(
         &self,
         audio: &[u8],
         config: &TranscriptionConfig,
     ) -> anyhow::Result<Transcript> {
-        check_audio_size(audio)?;
+        let upload = meeting_upload(audio).await;
+        check_audio_size(&upload.bytes)?;
         debug!(
-            "sending {} bytes to Groq API for segments (model={})",
+            "sending {} bytes ({}, WAV was {}) to Groq API for segments (model={})",
+            upload.bytes.len(),
+            upload.format.mime,
             audio.len(),
             config.model
         );
-        let body = self.post(audio, config, &["segment", "word"]).await?;
+        let body = self
+            .post(&upload.bytes, upload.format, config, &["segment", "word"])
+            .await?;
         parse_verbose_segments(&body)
     }
 
@@ -374,6 +391,7 @@ pub fn parse_response(body: &str) -> anyhow::Result<GroqTranscriptionResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcription::test_server::serve_once;
 
     #[test]
     fn groq_sends_the_prompt() {
@@ -487,8 +505,14 @@ mod tests {
         };
         // reqwest's Form is opaque; building must at least succeed for both
         // the dictation and meeting shapes.
-        assert!(build_form(&[1, 2, 3], &config, &["word"]).is_ok());
-        assert!(build_form(&[1, 2, 3], &config, &["segment", "word"]).is_ok());
+        assert!(build_form(&[1, 2, 3], UploadFormat::WAV, &config, &["word"]).is_ok());
+        let meeting = build_form(
+            &[1, 2, 3],
+            UploadFormat::FLAC,
+            &config,
+            &["segment", "word"],
+        );
+        assert!(meeting.is_ok());
     }
 
     #[test]
@@ -503,5 +527,48 @@ mod tests {
         let secs = backend.max_segment_chunk_secs(&config).unwrap() as usize;
         // 16 kHz mono i16 plus a 44-byte header.
         assert!(secs * 32_000 + 44 <= MAX_FILE_SIZE);
+    }
+
+    /// A backend that posts to the local server on `listener`.
+    fn local_backend(listener: &tokio::net::TcpListener) -> GroqBackend {
+        GroqBackend {
+            url: format!("http://{}/transcriptions", listener.local_addr().unwrap()),
+            ..GroqBackend::new("test-key".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn meeting_chunks_upload_as_flac_and_dictation_as_wav() {
+        let config = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+        };
+        let wav = encode_wav(&[300i16; 16_000]).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"text": "hi", "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}"#,
+        ));
+        let t = backend.transcribe_segments(&wav, &config).await.unwrap();
+        assert_eq!(t.segments.len(), 1);
+        let request = server.await.unwrap();
+        let (headers, data) = request.file_part();
+        assert!(headers.contains("filename=\"audio.flac\""), "{headers}");
+        assert!(headers.contains("Content-Type: audio/flac"), "{headers}");
+        assert!(data.starts_with(b"fLaC"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(listener, r#"{"text": "hi"}"#));
+        assert_eq!(backend.transcribe(&wav, &config).await.unwrap(), "hi");
+        let request = server.await.unwrap();
+        let (headers, data) = request.file_part();
+        assert!(headers.contains("filename=\"audio.wav\""), "{headers}");
+        assert!(headers.contains("Content-Type: audio/wav"), "{headers}");
+        assert!(data.starts_with(&wav));
     }
 }

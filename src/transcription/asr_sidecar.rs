@@ -280,7 +280,7 @@ impl TranscriptionBackend for AsrSidecarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use crate::transcription::test_server::serve_once;
     use tokio::net::TcpListener;
 
     fn test_config() -> TranscriptionConfig {
@@ -290,51 +290,6 @@ mod tests {
             prompt: None,
             keyterms: Vec::new(),
         }
-    }
-
-    /// One-shot HTTP server: accepts a single connection, reads the whole
-    /// request, answers `200 OK` with `body`, and hands back the request head
-    /// so a test can assert on what was actually put on the wire.
-    async fn serve_once(listener: TcpListener, body: &'static str) -> String {
-        let (mut stream, _) = listener.accept().await.unwrap();
-
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let head_end = loop {
-            let n = stream.read(&mut chunk).await.unwrap();
-            assert!(n > 0, "client closed before sending a request head");
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos + 4;
-            }
-        };
-        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-
-        // Drain the multipart body first: replying while the client is still
-        // writing surfaces as a connection reset instead of a parsed response.
-        let content_length: usize = head
-            .to_ascii_lowercase()
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length:"))
-            .and_then(|value| value.trim().parse().ok())
-            .expect(
-                "reqwest must send content-length for a multipart body with known part lengths",
-            );
-        while buf.len() < head_end + content_length {
-            let n = stream.read(&mut chunk).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-        }
-
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-        stream.flush().await.unwrap();
-        head
     }
 
     #[tokio::test]
@@ -354,7 +309,7 @@ mod tests {
         assert_eq!(text, "ok");
 
         // reqwest lowercases header names on the wire, so compare lowercased.
-        let head = server.await.unwrap().to_ascii_lowercase();
+        let head = server.await.unwrap().head.to_ascii_lowercase();
         assert!(
             head.contains("authorization: bearer sk-test-key"),
             "request head is missing the bearer token: {head}"
@@ -374,7 +329,7 @@ mod tests {
             .unwrap();
         assert_eq!(text, "ok");
 
-        let head = server.await.unwrap().to_ascii_lowercase();
+        let head = server.await.unwrap().head.to_ascii_lowercase();
         assert!(
             !head.contains("authorization:"),
             "unauthenticated request must not carry an authorization header: {head}"
@@ -396,7 +351,7 @@ mod tests {
             .unwrap();
         assert_eq!(text, "ok");
 
-        let head = server.await.unwrap();
+        let head = server.await.unwrap().head;
         assert!(
             head.starts_with("POST /transcribe HTTP/1.1\r\n"),
             "expected the trailing slash to be trimmed off the request line: {head}"

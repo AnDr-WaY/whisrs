@@ -57,12 +57,15 @@ pub mod local_whisper {
     }
 }
 pub mod factory;
+mod flac;
 pub mod openai_compatible_realtime;
 pub mod openai_realtime;
 pub mod openai_realtime_protocol;
 pub mod openai_rest;
 pub mod phrase_split;
 pub mod retry;
+#[cfg(test)]
+mod test_server;
 pub mod verbose_json;
 
 use async_trait::async_trait;

@@ -1,13 +1,15 @@
 //! OpenAI REST API transcription backend (non-streaming).
 //!
-//! Sends WAV audio to OpenAI's `/v1/audio/transcriptions` endpoint via
-//! multipart HTTP POST. Same pattern as the Groq backend.
+//! Sends WAV audio (FLAC for whisper-1 meeting chunks) to OpenAI's
+//! `/v1/audio/transcriptions` endpoint via multipart HTTP POST. Same pattern
+//! as the Groq backend.
 
 use async_trait::async_trait;
 use reqwest::multipart;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use super::flac::{meeting_upload, UploadFormat};
 use super::verbose_json::parse_verbose_segments;
 use super::{
     segments_by_phrase, Transcript, TranscriptionBackend, TranscriptionConfig, UPLOAD_CHUNK_SECS,
@@ -23,6 +25,8 @@ const OPENAI_TRANSCRIPTION_URL: &str = "https://api.openai.com/v1/audio/transcri
 pub struct OpenAIRestBackend {
     client: reqwest::Client,
     api_key: String,
+    /// [`OPENAI_TRANSCRIPTION_URL`]; tests point it at a local server.
+    url: String,
 }
 
 impl OpenAIRestBackend {
@@ -31,6 +35,7 @@ impl OpenAIRestBackend {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            url: OPENAI_TRANSCRIPTION_URL.to_string(),
         }
     }
 
@@ -48,10 +53,12 @@ impl OpenAIRestBackend {
 }
 
 impl OpenAIRestBackend {
-    /// POST one transcription request and return the raw success body.
+    /// POST one transcription request with `audio` in `format` and return
+    /// the raw success body.
     async fn post(
         &self,
         audio: &[u8],
+        format: UploadFormat,
         config: &TranscriptionConfig,
         response_format: &str,
         granularities: &[&str],
@@ -59,8 +66,8 @@ impl OpenAIRestBackend {
         let api_key = self.resolve_api_key()?;
 
         let file_part = multipart::Part::bytes(audio.to_vec())
-            .file_name("audio.wav")
-            .mime_str("audio/wav")?;
+            .file_name(format.file_name)
+            .mime_str(format.mime)?;
 
         let mut form = multipart::Form::new()
             .part("file", file_part)
@@ -79,7 +86,7 @@ impl OpenAIRestBackend {
 
         let response = self
             .client
-            .post(OPENAI_TRANSCRIPTION_URL)
+            .post(&self.url)
             .header("Authorization", format!("Bearer {api_key}"))
             .multipart(form)
             .send()
@@ -170,7 +177,9 @@ impl TranscriptionBackend for OpenAIRestBackend {
         } else {
             "json"
         };
-        let body = self.post(audio, config, response_format, &[]).await?;
+        let body = self
+            .post(audio, UploadFormat::WAV, config, response_format, &[])
+            .await?;
 
         let parsed: OpenAITranscriptionResponse = serde_json::from_str(&body)?;
         let text = parsed.text.trim().to_string();
@@ -190,24 +199,35 @@ impl TranscriptionBackend for OpenAIRestBackend {
         true
     }
 
-    // whisper-1: verbose_json segments. Everything else: one request per
-    // phrase via the shared fallback, with the same prompt on each.
+    // whisper-1: verbose_json segments, the chunk sent as FLAC. Everything
+    // else: one WAV request per phrase via the shared fallback, with the same
+    // prompt on each.
     async fn transcribe_segments(
         &self,
         audio: &[u8],
         config: &TranscriptionConfig,
     ) -> anyhow::Result<Transcript> {
-        check_audio_size(audio)?;
         if !model_has_timestamps(&config.model) {
+            check_audio_size(audio)?;
             return segments_by_phrase(self, audio, config).await;
         }
+        let upload = meeting_upload(audio).await;
+        check_audio_size(&upload.bytes)?;
         debug!(
-            "sending {} bytes to OpenAI API for segments (model={})",
+            "sending {} bytes ({}, WAV was {}) to OpenAI API for segments (model={})",
+            upload.bytes.len(),
+            upload.format.mime,
             audio.len(),
             config.model
         );
         let body = self
-            .post(audio, config, "verbose_json", &["segment", "word"])
+            .post(
+                &upload.bytes,
+                upload.format,
+                config,
+                "verbose_json",
+                &["segment", "word"],
+            )
             .await?;
         parse_verbose_segments(&body)
     }
@@ -220,6 +240,7 @@ impl TranscriptionBackend for OpenAIRestBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcription::test_server::serve_once;
 
     #[tokio::test]
     async fn transcribe_rejects_empty_audio() {
@@ -286,5 +307,80 @@ mod tests {
         };
         let err = backend.transcribe_segments(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
+    }
+
+    /// A backend that posts to the local server on `listener`.
+    fn local_backend(listener: &tokio::net::TcpListener) -> OpenAIRestBackend {
+        OpenAIRestBackend {
+            url: format!("http://{}/transcriptions", listener.local_addr().unwrap()),
+            ..OpenAIRestBackend::new("test-key".to_string())
+        }
+    }
+
+    fn config_for(model: &str) -> TranscriptionConfig {
+        TranscriptionConfig {
+            language: "en".to_string(),
+            model: model.to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn whisper_meeting_chunks_upload_as_flac_and_dictation_as_wav() {
+        let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"text": "hi", "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}"#,
+        ));
+        let t = backend
+            .transcribe_segments(&wav, &config_for("whisper-1"))
+            .await
+            .unwrap();
+        assert_eq!(t.segments.len(), 1);
+        let request = server.await.unwrap();
+        let (headers, data) = request.file_part();
+        assert!(headers.contains("filename=\"audio.flac\""), "{headers}");
+        assert!(headers.contains("Content-Type: audio/flac"), "{headers}");
+        assert!(data.starts_with(b"fLaC"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(listener, r#"{"text": "hi"}"#));
+        let text = backend
+            .transcribe(&wav, &config_for("whisper-1"))
+            .await
+            .unwrap();
+        assert_eq!(text, "hi");
+        let request = server.await.unwrap();
+        let (headers, data) = request.file_part();
+        assert!(headers.contains("filename=\"audio.wav\""), "{headers}");
+        assert!(headers.contains("Content-Type: audio/wav"), "{headers}");
+        assert!(data.starts_with(&wav));
+    }
+
+    #[tokio::test]
+    async fn phrase_fallback_keeps_wav() {
+        // One phrase between silences: exactly one request.
+        let mut samples = vec![0i16; 16_000];
+        samples.extend((0..16_000).map(|i| ((i as f64 * 0.17).sin() * 6000.0) as i16));
+        samples.extend(vec![0i16; 16_000]);
+        let wav = crate::audio::wav::encode_wav(&samples).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(listener, r#"{"text": "hi"}"#));
+        let t = backend
+            .transcribe_segments(&wav, &config_for("gpt-4o-mini-transcribe"))
+            .await
+            .unwrap();
+        assert_eq!(t.segments.len(), 1);
+        let request = server.await.unwrap();
+        let (headers, data) = request.file_part();
+        assert!(headers.contains("filename=\"audio.wav\""), "{headers}");
+        assert!(data.starts_with(b"RIFF"));
     }
 }

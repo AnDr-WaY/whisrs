@@ -1,7 +1,8 @@
 //! Deepgram transcription backend (REST + streaming WebSocket).
 //!
 //! Supports two modes:
-//! - **REST**: POST WAV audio to `/v1/listen` (non-streaming, simple).
+//! - **REST**: POST WAV audio (FLAC for meeting chunks) to `/v1/listen`
+//!   (non-streaming, simple).
 //! - **Streaming**: WebSocket to `wss://api.deepgram.com/v1/listen` with raw
 //!   PCM binary frames and real-time transcription results.
 
@@ -14,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioChunk;
 
+use super::flac::{meeting_upload, UploadFormat};
 use super::{secs_to_ms, Segment, Transcript, TranscriptionBackend, TranscriptionConfig, Word};
 
 /// Deepgram REST API endpoint for pre-recorded audio.
@@ -328,10 +330,13 @@ struct StreamingChannel {
 
 /// Deepgram REST transcription backend.
 ///
-/// Sends the full WAV file to `/v1/listen` and returns the complete transcript.
+/// Sends the full WAV file (FLAC for a meeting chunk) to `/v1/listen` and
+/// returns the complete transcript.
 pub struct DeepgramRestBackend {
     client: reqwest::Client,
     api_key: String,
+    /// [`DEEPGRAM_REST_URL`]; tests point it at a local server.
+    url: String,
 }
 
 impl DeepgramRestBackend {
@@ -339,14 +344,16 @@ impl DeepgramRestBackend {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            url: DEEPGRAM_REST_URL.to_string(),
         }
     }
 
-    /// POST `audio` to `/v1/listen` with the common params plus `extra`, and
-    /// return the raw success body.
+    /// POST `audio`, in `format`, to `/v1/listen` with the common params plus
+    /// `extra`, and return the raw success body.
     async fn post(
         &self,
         audio: &[u8],
+        format: UploadFormat,
         config: &TranscriptionConfig,
         extra: &[(&str, &str)],
     ) -> anyhow::Result<String> {
@@ -355,9 +362,9 @@ impl DeepgramRestBackend {
 
         let response = self
             .client
-            .post(DEEPGRAM_REST_URL)
+            .post(&self.url)
             .header("Authorization", format!("Token {api_key}"))
-            .header("Content-Type", "audio/wav")
+            .header("Content-Type", format.mime)
             .query(&params)
             .body(audio.to_vec())
             .send()
@@ -525,7 +532,7 @@ impl TranscriptionBackend for DeepgramRestBackend {
             config.language
         );
 
-        let body = self.post(audio, config, &[]).await?;
+        let body = self.post(audio, UploadFormat::WAV, config, &[]).await?;
 
         let parsed: DeepgramResponse = serde_json::from_str(&body)?;
         let text = parsed
@@ -551,7 +558,7 @@ impl TranscriptionBackend for DeepgramRestBackend {
         false
     }
 
-    // Native timestamps via `utterances=true`.
+    // Native timestamps via `utterances=true`. The chunk goes up as FLAC.
     async fn transcribe_segments(
         &self,
         audio: &[u8],
@@ -560,12 +567,17 @@ impl TranscriptionBackend for DeepgramRestBackend {
         if audio.is_empty() {
             anyhow::bail!("cannot transcribe empty audio");
         }
+        let upload = meeting_upload(audio).await;
         debug!(
-            "sending {} bytes to Deepgram REST API for utterances (model={})",
+            "sending {} bytes ({}, WAV was {}) to Deepgram REST API for utterances (model={})",
+            upload.bytes.len(),
+            upload.format.mime,
             audio.len(),
             config.model
         );
-        let body = self.post(audio, config, SEGMENT_QUERY_EXTRA).await?;
+        let body = self
+            .post(&upload.bytes, upload.format, config, SEGMENT_QUERY_EXTRA)
+            .await?;
         parse_utterances(&body)
     }
 
@@ -792,6 +804,7 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcription::test_server::serve_once;
 
     #[test]
     fn deepgram_backends_never_send_the_prompt() {
@@ -1365,5 +1378,53 @@ mod tests {
         assert_eq!(keyterm_values(&params), ["whisrs"]);
         // Dictation's params stay without it.
         assert!(!build_query_params(&config, &[]).contains(&("utterances", "true")));
+    }
+
+    /// A backend that posts to the local server on `listener`.
+    fn local_backend(listener: &tokio::net::TcpListener) -> DeepgramRestBackend {
+        DeepgramRestBackend {
+            url: format!("http://{}/v1/listen", listener.local_addr().unwrap()),
+            ..DeepgramRestBackend::new("test-key".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn meeting_chunks_upload_as_flac_and_dictation_as_wav() {
+        let config = query_config("nova-3", &[]);
+        let samples: Vec<i16> = (0..20_000)
+            .map(|i| ((i as f64 * 0.17).sin() * 6000.0) as i16)
+            .collect();
+        let wav = crate::audio::wav::encode_wav(&samples).unwrap();
+
+        // The streaming backend hands meetings to REST, so this covers both.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"results": {"utterances": [{"start": 0.0, "end": 1.0, "transcript": "hi"}]}}"#,
+        ));
+        let t = backend.transcribe_segments(&wav, &config).await.unwrap();
+        assert_eq!(t.segments.len(), 1);
+        let request = server.await.unwrap();
+        assert_eq!(request.header("content-type"), Some("audio/flac"));
+        assert!(request.body.starts_with(b"fLaC"));
+        // Lossless: the body decodes to the samples the WAV held.
+        let decoded: Vec<i16> = claxon::FlacReader::new(&request.body[..])
+            .unwrap()
+            .samples()
+            .map(|s| s.unwrap() as i16)
+            .collect();
+        assert_eq!(decoded, samples);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"results": {"channels": [{"alternatives": [{"transcript": "hi"}]}]}}"#,
+        ));
+        assert_eq!(backend.transcribe(&wav, &config).await.unwrap(), "hi");
+        let request = server.await.unwrap();
+        assert_eq!(request.header("content-type"), Some("audio/wav"));
+        assert_eq!(request.body, wav);
     }
 }
