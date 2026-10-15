@@ -429,6 +429,22 @@ pub fn meeting_transcription_config(name: &str, config: &Config) -> Transcriptio
     }
 }
 
+/// The model a meeting on backend `name` runs, for the log: the request's
+/// model, except for local whisper, whose request carries a fixed name while
+/// `[local-whisper] model_path` decides, so its file name. Nothing sent or
+/// cached depends on this.
+pub fn meeting_model_label(name: &str, config: &Config, request: &TranscriptionConfig) -> String {
+    match canonical_backend_name(name) {
+        "local-whisper" => {
+            let path = local_whisper_settings(config).model_path;
+            std::path::Path::new(&path)
+                .file_name()
+                .map_or_else(|| path.clone(), |f| f.to_string_lossy().into_owned())
+        }
+        _ => request.model.clone(),
+    }
+}
+
 /// The model a meeting on the `openai` REST backend sends, given
 /// `[openai] model`.
 ///
@@ -1015,6 +1031,29 @@ mod tests {
                 "dictation keeps [openai] model as written"
             );
         }
+    }
+
+    #[test]
+    fn the_meeting_log_names_the_local_model_file() {
+        let config: Config = toml::from_str(
+            "[general]\nbackend = \"local-whisper\"\n\
+             [local-whisper]\nmodel_path = \"/m/ggml-large-v3-turbo-q5_0.bin\"\n",
+        )
+        .unwrap();
+        let request = meeting_transcription_config("local-whisper", &config);
+        assert_eq!(
+            meeting_model_label("local-whisper", &config, &request),
+            "ggml-large-v3-turbo-q5_0.bin"
+        );
+        assert_eq!(
+            meeting_model_label("local", &config, &request),
+            "ggml-large-v3-turbo-q5_0.bin"
+        );
+        // What the request carries (and the cache keys on) is unchanged.
+        assert_eq!(request.model, "base.en");
+        let groq: Config = toml::from_str("[general]\nbackend = \"groq\"\n").unwrap();
+        let request = meeting_transcription_config("groq", &groq);
+        assert_eq!(meeting_model_label("groq", &groq, &request), request.model);
     }
 
     #[test]

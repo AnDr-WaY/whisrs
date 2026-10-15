@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::phrase_split::PhraseSplitter;
+use super::phrase_split::{decode_windows, DecodeWindow, PhraseSplitter};
 use super::verbose_json::is_no_speech;
 use super::{
     decode_wav_samples, samples_to_ms, Segment, Transcript, TranscriptionBackend,
@@ -613,27 +613,31 @@ fn run_whisper_segments(
     Ok(out)
 }
 
-/// Decode a meeting chunk phrase by phrase on one reused state.
+/// Decode a meeting chunk window by window on one reused state, one
+/// `full()` call per [`DecodeWindow`].
 ///
-/// Phrases come from the same [`PhraseSplitter`] as streaming dictation, so
-/// no single `full()` call sees more than ~28 s: whisper.cpp carries text
-/// context across its 30 s windows inside one call even with
-/// `no_context(true)`, which is the repetition loop of issue #55.
-fn decode_meeting_phrases(
+/// Windows group the phrases of the same [`PhraseSplitter`] as streaming
+/// dictation, at most ~28 s each, so no single `full()` call sees more than
+/// one 30 s window: whisper.cpp carries text context across its 30 s windows
+/// inside one call even with `no_context(true)`, which is the repetition
+/// loop of issue #55. Whisper's own segments are kept, timed from the
+/// window's start.
+fn decode_meeting_windows(
     ctx: &whisper_rs::WhisperContext,
-    phrases: Vec<super::phrase_split::Phrase>,
+    samples: &[i16],
+    windows: &[DecodeWindow],
     language: &str,
     prompt: Option<&str>,
 ) -> anyhow::Result<Vec<Segment>> {
     let mut state = create_state(ctx)?;
     let mut segments = Vec::new();
     let mut failures = 0usize;
-    let total = phrases.len();
+    let total = windows.len();
 
-    for phrase in phrases {
-        let phrase_start_ms = samples_to_ms(phrase.start_sample);
-        let phrase_len_ms = samples_to_ms(phrase.samples.len() as u64);
-        let mut buf = phrase.samples;
+    for window in windows {
+        let window_start_ms = samples_to_ms(window.range.start as u64);
+        let window_len_ms = samples_to_ms(window.range.len() as u64);
+        let mut buf = samples[window.range.clone()].to_vec();
         // whisper.cpp silently produces nothing for <1 s buffers; pad with silence.
         if buf.len() < MIN_DECODE_SAMPLES {
             buf.resize(MIN_DECODE_SAMPLES, 0);
@@ -641,7 +645,7 @@ fn decode_meeting_phrases(
         let raw = match run_whisper_segments(&mut state, &i16_to_f32(&buf), language, prompt) {
             Ok(raw) => raw,
             Err(e) => {
-                warn!("whisper meeting phrase at {phrase_start_ms} ms failed: {e}");
+                warn!("whisper meeting window at {window_start_ms} ms failed: {e}");
                 failures += 1;
                 // Same recovery as streaming: free the failed state first.
                 drop(state);
@@ -656,18 +660,18 @@ fn decode_meeting_phrases(
             if text.is_empty() || is_no_speech(Some(seg.no_speech_prob), seg.avg_logprob) {
                 continue;
             }
-            let text = if phrase.continuation && first {
+            let text = if window.continuation && first {
                 decapitalize_first(text)
             } else {
                 text.to_string()
             };
             first = false;
-            // Clamp into the real phrase: the tail may be zero padding.
-            let start = seg.start_ms.min(phrase_len_ms);
-            let end = seg.end_ms.clamp(start, phrase_len_ms);
+            // Clamp into the real window: the tail may be zero padding.
+            let start = seg.start_ms.min(window_len_ms);
+            let end = seg.end_ms.clamp(start, window_len_ms);
             segments.push(Segment {
-                start_ms: phrase_start_ms + start,
-                end_ms: phrase_start_ms + end,
+                start_ms: window_start_ms + start,
+                end_ms: window_start_ms + end,
                 text,
                 speaker: None,
                 words: None,
@@ -676,7 +680,7 @@ fn decode_meeting_phrases(
     }
 
     if total > 0 && failures == total {
-        anyhow::bail!("whisper failed to decode every phrase of the chunk");
+        anyhow::bail!("whisper failed to decode every window of the chunk");
     }
     Ok(segments)
 }
@@ -747,9 +751,9 @@ impl TranscriptionBackend for LocalWhisperBackend {
         true
     }
 
-    // Native timestamps from whisper's segments, decoded phrase by phrase
-    // (see `decode_meeting_phrases` for why never a whole chunk at once, and
-    // `meeting_phrases` for why `segmentation` does not apply).
+    // Native timestamps from whisper's segments, decoded a window of phrases
+    // at a time (see `decode_meeting_windows` for why never a whole chunk at
+    // once, and `meeting_phrases` for why `segmentation` does not apply).
     async fn transcribe_segments(
         &self,
         audio: &[u8],
@@ -764,17 +768,21 @@ impl TranscriptionBackend for LocalWhisperBackend {
 
         let samples = decode_wav_samples(audio)?;
         let phrases = self.meeting_phrases(&samples);
+        let windows = decode_windows(&samples, &phrases, SAMPLE_RATE);
         debug!(
-            "local whisper: {} phrase(s) in a {:.1}s meeting chunk",
+            "local whisper: {} phrase(s) in {} decode window(s) (whisper full() calls) \
+             for a {:.1}s meeting chunk",
             phrases.len(),
+            windows.len(),
             samples.len() as f64 / SAMPLE_RATE as f64
         );
+        drop(phrases);
 
         let ctx = Arc::clone(ctx);
         let language = config.language.clone();
         let prompt = config.prompt.clone().filter(|p| !p.is_empty());
         let segments = tokio::task::spawn_blocking(move || {
-            decode_meeting_phrases(&ctx, phrases, &language, prompt.as_deref())
+            decode_meeting_windows(&ctx, &samples, &windows, &language, prompt.as_deref())
         })
         .await??;
         Ok(Transcript { segments })

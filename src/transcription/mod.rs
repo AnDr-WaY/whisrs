@@ -222,16 +222,20 @@ pub(crate) fn decode_wav_samples(audio: &[u8]) -> anyhow::Result<Vec<i16>> {
 
 /// Phrase fallback for backends that return no timestamps.
 ///
-/// Splits the chunk at pauses with [`phrase_split::PhraseSplitter`], sends each
-/// phrase through the backend's plain [`TranscriptionBackend::transcribe`], and
-/// returns one segment per non-empty phrase, timed by where the phrase sits in
-/// the chunk. Not a trait default on purpose: each backend that relies on it
-/// calls it explicitly from its own `transcribe_segments`.
+/// Splits the chunk at pauses with [`phrase_split::PhraseSplitter`], groups
+/// consecutive phrases into windows of at most ~28 s that never cross a join
+/// ([`phrase_split::decode_windows`]), sends each window through the
+/// backend's plain [`TranscriptionBackend::transcribe`], and returns one
+/// segment per non-empty window, timed by where the window sits in the
+/// chunk. One request per window rather than per phrase: every request has
+/// a fixed cost (a model pass, a round trip), and a text-only backend gives
+/// no inner timing to lose. Not a trait default on purpose: each backend
+/// that relies on it calls it explicitly from its own `transcribe_segments`.
 ///
-/// Each phrase request waits out rate limits on its own
-/// ([`retry::retry_rate_limited`], [`retry::RATE_LIMIT_BUDGET`] per phrase),
-/// so a 429 on one phrase does not resend the phrases already done. A phrase
-/// still limited when its budget runs out fails the chunk with a
+/// Each window request waits out rate limits on its own
+/// ([`retry::retry_rate_limited`], [`retry::RATE_LIMIT_BUDGET`] per window),
+/// so a 429 on one window does not resend the windows already done. A
+/// window still failing when its retries run out fails the chunk with a
 /// [`retry::RateLimitExhausted`], which the caller's own retry layer does
 /// not retry again.
 pub async fn segments_by_phrase<B>(
@@ -252,10 +256,17 @@ where
     );
     let mut phrases = splitter.feed(&samples);
     phrases.extend(splitter.flush());
+    let windows = phrase_split::decode_windows(&samples, &phrases, SEGMENT_SAMPLE_RATE);
+    tracing::debug!(
+        "phrase fallback: {} phrase(s) in {} request(s)",
+        phrases.len(),
+        windows.len()
+    );
+    drop(phrases);
 
     let mut segments = Vec::new();
-    for phrase in phrases {
-        let wav = encode_wav(&phrase.samples)?;
+    for window in windows {
+        let wav = encode_wav(&samples[window.range.clone()])?;
         let text = retry::retry_rate_limited(retry::RATE_LIMIT_BUDGET, || {
             backend.transcribe(&wav, config)
         })
@@ -265,8 +276,8 @@ where
             continue;
         }
         segments.push(Segment {
-            start_ms: samples_to_ms(phrase.start_sample),
-            end_ms: samples_to_ms(phrase.start_sample + phrase.samples.len() as u64),
+            start_ms: samples_to_ms(window.range.start as u64),
+            end_ms: samples_to_ms(window.range.end as u64),
             text: text.to_string(),
             speaker: None,
             words: None,
@@ -537,6 +548,34 @@ mod tests {
         assert!(t.segments[0].end_ms > 3000 && t.segments[0].end_ms <= 3200);
         assert!(t.segments[1].end_ms > 6500 && t.segments[1].end_ms <= 6700);
         assert!(t.segments.iter().all(|s| s.text.ends_with("samples")));
+    }
+
+    /// Phrases a recorded pause apart (room noise, not digital silence) go
+    /// out as one request covering both and the pause between them.
+    #[tokio::test]
+    async fn phrase_fallback_sends_nearby_phrases_together() {
+        let room = |secs: f64| -> Vec<i16> {
+            let n = (secs * SEGMENT_SAMPLE_RATE as f64) as usize;
+            (0..n).map(|i| [3, -2, 1, -3][i % 4]).collect()
+        };
+        let mut audio = room(1.0);
+        audio.extend(tone(1.0));
+        audio.extend(room(1.5));
+        audio.extend(tone(1.5));
+        audio.extend(room(1.0));
+        let wav = crate::audio::wav::encode_wav(&audio).unwrap();
+
+        let t = EchoLength.transcribe_segments(&wav, &cfg()).await.unwrap();
+        assert_eq!(t.segments.len(), 1, "{t:?}");
+        assert_eq!(t.segments[0].start_ms, 900);
+        assert!(t.segments[0].end_ms > 5000 && t.segments[0].end_ms <= 5200);
+        // Both phrases and the pause: 0.9 s to ~5.1 s, about 4.2 s of audio.
+        let sent: usize = t.segments[0]
+            .text
+            .trim_end_matches(" samples")
+            .parse()
+            .unwrap();
+        assert!((66_000..=68_000).contains(&sent), "{sent}");
     }
 
     #[tokio::test]

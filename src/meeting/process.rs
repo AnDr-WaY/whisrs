@@ -35,7 +35,7 @@ use crate::audio::wav::encode_wav;
 use crate::replacements::Replacer;
 use crate::transcription::factory::{
     backend_identity, canonical_backend_name, create_backend_named, meeting_backend_name,
-    meeting_transcription_config,
+    meeting_model_label, meeting_transcription_config,
 };
 use crate::transcription::retry::{retry_rate_limited, RateLimitExhausted, RATE_LIMIT_BUDGET};
 use crate::transcription::{TranscriptionBackend, TranscriptionConfig};
@@ -92,7 +92,8 @@ pub async fn process_meeting(
     let tcfg = meeting_transcription_config(&name, config);
     info!(
         "processing meeting {} with {name} (model {})",
-        meta.id, tcfg.model
+        meta.id,
+        meeting_model_label(&name, config, &tcfg)
     );
 
     let filler = if config.general.remove_filler_words {
