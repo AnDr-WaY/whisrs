@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
-use audio_silence_gate::{audio_gate_reason, rms_energy, SILENCE_RMS_THRESHOLD};
+use audio_silence_gate::{rms_energy, SILENCE_RMS_THRESHOLD};
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,8 @@ use crate::{Config, MeetingConfig};
 /// Meeting tracks are recorded at this rate (and `encode_wav` writes it).
 const SAMPLE_RATE: u32 = super::SAMPLE_RATE;
 
-/// Chunks shorter than this are skipped like an accidental dictation tap.
+/// Tracks and chunks with less sound than this are skipped like an
+/// accidental dictation tap.
 const GATE_MIN_MS: u64 = 300;
 
 /// How far apart a mic segment and the system audio it echoes may be.
@@ -348,19 +349,25 @@ pub(super) fn open_track(
 struct TrackScan {
     /// Samples in the track.
     len: usize,
-    /// RMS of the whole track, as [`rms_energy`] computes it.
-    rms: f64,
     /// RMS of every whole frame ([`frame_len`]), for [`split_by_energies`].
     energies: Vec<f64>,
 }
 
 impl TrackScan {
-    /// The whole-track check of [`audio_gate_reason`]: nothing to send when
-    /// the track is empty, shorter than [`GATE_MIN_MS`], or silent.
+    /// Nothing to send: the track has less than [`GATE_MIN_MS`] of sound.
     fn is_skippable(&self) -> bool {
-        let duration_ms = self.len as u64 * 1000 / SAMPLE_RATE as u64;
-        self.len == 0 || duration_ms < GATE_MIN_MS || self.rms < SILENCE_RMS_THRESHOLD
+        too_quiet(self.energies.iter().copied())
     }
+}
+
+/// Whether frame energies ([`frame_len`] frames) hold less than
+/// [`GATE_MIN_MS`] of sound. Loud frames are counted rather than the span
+/// averaged: an hour of listening averages the few sentences the user said
+/// down to silence, the more so once the speaker echo is removed.
+fn too_quiet(energies: impl Iterator<Item = f64>) -> bool {
+    let frame_ms = frame_len(SAMPLE_RATE as usize) as u64 * 1000 / SAMPLE_RATE as u64;
+    let loud = energies.filter(|&e| e >= SILENCE_RMS_THRESHOLD).count() as u64;
+    loud * frame_ms < GATE_MIN_MS
 }
 
 /// Read a track once, computing its length and energies. Blocking.
@@ -369,11 +376,9 @@ fn scan_track(path: &Path) -> anyhow::Result<TrackScan> {
     let frame = frame_len(SAMPLE_RATE as usize);
     let mut buf = Vec::with_capacity(frame);
     let mut energies = Vec::new();
-    let mut sum_squares = 0.0f64;
     let mut len = 0usize;
     for sample in reader.samples::<i16>() {
         let sample = sample.with_context(|| format!("failed to read {}", path.display()))?;
-        sum_squares += f64::from(sample) * f64::from(sample);
         len += 1;
         buf.push(sample);
         if buf.len() == frame {
@@ -381,12 +386,7 @@ fn scan_track(path: &Path) -> anyhow::Result<TrackScan> {
             buf.clear();
         }
     }
-    let rms = if len == 0 {
-        0.0
-    } else {
-        (sum_squares / len as f64).sqrt() / f64::from(i16::MAX)
-    };
-    Ok(TrackScan { len, rms, energies })
+    Ok(TrackScan { len, energies })
 }
 
 /// Read samples `range` of a track. Blocking.
@@ -472,14 +472,9 @@ async fn transcribe_track(
                     let range = range.clone();
                     blocking(move || read_range(&path, range)).await?
                 };
-                if let Some(reason) =
-                    audio_gate_reason(&chunk, SAMPLE_RATE, GATE_MIN_MS, SILENCE_RMS_THRESHOLD)
-                {
-                    debug!(
-                        "skipping {} chunk at sample {}",
-                        reason.as_str(),
-                        range.start
-                    );
+                let frame = frame_len(SAMPLE_RATE as usize);
+                if too_quiet(chunk.chunks(frame).map(rms_energy)) {
+                    debug!("skipping a silent chunk at sample {}", range.start);
                     continue;
                 }
                 let wav = encode_wav(&chunk)?;
@@ -1111,6 +1106,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_few_words_in_a_quiet_track_are_sent() {
+        // One second of speech in two quiet minutes: far below the gate
+        // threshold on average, so a whole-track RMS check dropped it.
+        let samples = track(120.0, &[(50.0, 1.0, 300)]);
+        assert!(rms_energy(&samples) < SILENCE_RMS_THRESHOLD);
+        let backend = FakeBackend::new(&[(300, "just one question")], Some(60));
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(samples))]);
+        let meta = run(tmp.path(), backend.clone()).await;
+        let texts: Vec<_> = meta.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["just one question"]);
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            1,
+            "only the chunk holding the words is sent"
+        );
+
+        // A 200 ms click is still below the gate.
+        let backend = FakeBackend::new(&[(300, "click")], None);
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(track(120.0, &[(50.0, 0.2, 300)])))]);
+        let meta = run(tmp.path(), backend.clone()).await;
+        assert!(meta.segments.is_empty());
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn no_audio_at_all_is_an_error() {
         let (tmp, _) = meeting(&[(TrackKind::Mic, 0, None)]);
         let err = process_meeting(
@@ -1702,7 +1722,6 @@ mod tests {
 
         let scan = scan_track(&path).unwrap();
         assert_eq!(scan.len, samples.len());
-        assert_eq!(scan.rms, rms_energy(&samples));
         for cap in [10, 25, 60] {
             let expected =
                 crate::meeting::split::split_at_silence(&samples, RATE, cap, SILENCE_RMS_THRESHOLD);
