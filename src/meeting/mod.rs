@@ -8,6 +8,7 @@ pub mod echo;
 pub mod process;
 pub mod recorder;
 pub mod render;
+pub mod speech;
 pub mod split;
 pub mod store;
 pub mod wav_repair;

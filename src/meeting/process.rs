@@ -2,12 +2,13 @@
 //!
 //! [`process_meeting`] runs once a recording has stopped (and its WAVs have
 //! been repaired by the caller). The speakers' echo is first taken out of
-//! the mic track ([`super::echo`]). Each track is then cut into backend-sized
-//! chunks at silence ([`super::split`]), each chunk is transcribed into timed
-//! segments, segments are filtered and moved onto the meeting timeline, mic
-//! segments that still echo the system track are dropped, and the two
-//! channels are labelled and merged. The result lands in `meeting.json` and
-//! `<id>.md`.
+//! the mic track ([`super::echo`]). Only the speech in each track is sent
+//! ([`super::speech`]): its active stretches are packed into condensed,
+//! backend-sized chunks, each chunk is transcribed into timed segments, and
+//! the segments are mapped back, filtered and moved onto the meeting
+//! timeline. Mic segments that still echo the system track are dropped, and
+//! the two channels are labelled and merged. The result lands in
+//! `meeting.json` and `<id>.md`.
 
 use std::ffi::CStr;
 use std::fs;
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
-use audio_silence_gate::{rms_energy, SILENCE_RMS_THRESHOLD};
+use audio_silence_gate::rms_energy;
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,8 @@ use tracing::{debug, info, warn};
 
 use super::echo::{cancel_echo, EchoOutcome};
 use super::render::render_markdown;
-use super::split::{frame_len, split_by_energies};
+use super::speech::{self, TimeMap};
+use super::split::frame_len;
 use super::store::{self, CACHE_DIR};
 use super::{MeetingMeta, MeetingState, Segment, Speaker, TrackKind, TranscriptSegment};
 use crate::audio::wav::encode_wav;
@@ -42,16 +44,15 @@ use crate::{Config, MeetingConfig};
 /// Meeting tracks are recorded at this rate (and `encode_wav` writes it).
 const SAMPLE_RATE: u32 = super::SAMPLE_RATE;
 
-/// Tracks and chunks with less sound than this are skipped like an
-/// accidental dictation tap.
-const GATE_MIN_MS: u64 = 300;
-
 /// How far apart a mic segment and the system audio it echoes may be.
 pub const ECHO_TOLERANCE_MS: u64 = 1500;
 
 /// The echo-cancelled mic track, under [`CACHE_DIR`]: a retry reuses it,
 /// and it goes with the chunk cache once the transcript is written.
 const ECHO_CANCELLED_MIC: &str = "mic-echo-cancelled.wav";
+
+/// Its near-end mask ([`speech::encode_mask`]), beside it in the cache.
+const ECHO_CANCELLED_MASK: &str = "mic-echo-cancelled.mask";
 
 /// Transcribe a stopped meeting and write its transcript.
 ///
@@ -134,14 +135,19 @@ pub async fn process_meeting(
         }
         readable_tracks += 1;
         // Same length as the raw mic, so the track offset still holds.
-        let (path, track_cache) = match (&cancelled_mic, track.kind) {
-            (Some(cancelled), TrackKind::Mic) => (cancelled.clone(), &echo_cache),
-            _ => (path, &cache),
+        let (path, track_cache, near_end) = match (&cancelled_mic, track.kind) {
+            (Some(cancelled), TrackKind::Mic) => (
+                cancelled.path.clone(),
+                &echo_cache,
+                Some(cancelled.near_end.as_slice()),
+            ),
+            _ => (path, &cache, None),
         };
         let job = TrackJob {
             path: &path,
             kind: track.kind,
             offset_ms: track.offset_ms,
+            near_end,
         };
         let segments = transcribe_track(backend.as_ref(), &tcfg, &filters, track_cache, &job)
             .await
@@ -188,12 +194,19 @@ pub async fn process_meeting(
     Ok(meta)
 }
 
+/// The echo-cancelled mic and where the user speaks in it.
+struct CancelledMic {
+    path: PathBuf,
+    /// [`speech::FRAME`] activity from the canceller's near-end detector.
+    near_end: Vec<bool>,
+}
+
 /// The mic track with the speakers' echo removed ([`cancel_echo`]), or
 /// `None` to transcribe the mic as recorded: with no system track, when the
 /// system track is silent or the mic does not pick it up, and on any error,
 /// which is logged rather than failing the meeting. `audio/mic.wav` itself
 /// is never modified.
-async fn echo_cancelled_mic(dir: &Path, meta: &MeetingMeta) -> Option<PathBuf> {
+async fn echo_cancelled_mic(dir: &Path, meta: &MeetingMeta) -> Option<CancelledMic> {
     let track = |kind| meta.tracks.iter().find(|t| t.kind == kind);
     let (mic, system) = (track(TrackKind::Mic)?, track(TrackKind::System)?);
     let mic_path = dir.join(&mic.file);
@@ -215,11 +228,15 @@ async fn echo_cancelled_mic(dir: &Path, meta: &MeetingMeta) -> Option<PathBuf> {
     };
     let id = &meta.id;
     match step {
-        Ok(EchoStep::Reused) => {
+        Ok(EchoStep::Reused(near_end)) => {
             info!("meeting {id}: reusing the echo-cancelled mic track");
-            Some(out)
+            Some(CancelledMic {
+                path: out,
+                near_end,
+            })
         }
-        Ok(EchoStep::Ran(EchoOutcome::Cancelled(report))) => {
+        Ok(EchoStep::Ran(EchoOutcome::Cancelled(done))) => {
+            let report = &done.report;
             let ms = |samples: i64| samples * 1000 / i64::from(SAMPLE_RATE);
             info!(
                 "meeting {id}: removed the speaker echo from the mic track \
@@ -229,7 +246,10 @@ async fn echo_cancelled_mic(dir: &Path, meta: &MeetingMeta) -> Option<PathBuf> {
                 report.aligned_blocks,
                 report.echo_path_db
             );
-            Some(out)
+            Some(CancelledMic {
+                path: out,
+                near_end: done.near_end,
+            })
         }
         Ok(EchoStep::Ran(EchoOutcome::Skipped(reason))) => {
             info!("meeting {id}: no speaker echo to remove: {reason}");
@@ -246,14 +266,15 @@ async fn echo_cancelled_mic(dir: &Path, meta: &MeetingMeta) -> Option<PathBuf> {
 
 /// What [`cancel_into_cache`] found or did.
 enum EchoStep {
-    /// An earlier attempt finished the cancelled track.
-    Reused,
+    /// An earlier attempt finished the cancelled track and its near-end mask.
+    Reused(Vec<bool>),
     Ran(EchoOutcome),
 }
 
-/// Reuse `out` when an earlier attempt finished it (same sample count as the
-/// mic), else run [`cancel_echo`] into a temporary file and rename it into
-/// place, so a crash never leaves a partial track to reuse. Blocking.
+/// Reuse `out` and its mask when an earlier attempt finished both (each the
+/// mic's length), else run [`cancel_echo`] into a temporary file, write the
+/// mask (atomically, 0600), and rename the track into place, so a crash
+/// never leaves a partial track to reuse. Blocking.
 fn cancel_into_cache(
     mic: &Path,
     system: &Path,
@@ -261,8 +282,14 @@ fn cancel_into_cache(
     out: &Path,
 ) -> anyhow::Result<EchoStep> {
     let mic_len = open_track(mic)?.duration();
+    let mask_path = out.with_file_name(ECHO_CANCELLED_MASK);
     if open_track(out).is_ok_and(|done| done.duration() == mic_len) {
-        return Ok(EchoStep::Reused);
+        let mask = fs::read(&mask_path)
+            .ok()
+            .and_then(|bytes| speech::decode_mask(&bytes, mic_len as usize));
+        if let Some(mask) = mask {
+            return Ok(EchoStep::Reused(mask));
+        }
     }
     let cache_dir = out.parent().context("cache path has no parent")?;
     fs::create_dir_all(cache_dir)
@@ -272,7 +299,11 @@ fn cancel_into_cache(
     tmp_name.push(".tmp");
     let tmp = out.with_file_name(tmp_name);
     let outcome = cancel_echo(mic, system, timeline_lag, &tmp).and_then(|outcome| {
-        if let EchoOutcome::Cancelled(_) = outcome {
+        if let EchoOutcome::Cancelled(done) = &outcome {
+            write_private(
+                &mask_path,
+                &speech::encode_mask(mic_len as usize, &done.near_end),
+            )?;
             fs::rename(&tmp, out)
                 .with_context(|| format!("failed to rename {} into place", tmp.display()))?;
         }
@@ -349,25 +380,10 @@ pub(super) fn open_track(
 struct TrackScan {
     /// Samples in the track.
     len: usize,
-    /// RMS of every whole frame ([`frame_len`]), for [`split_by_energies`].
+    /// RMS of every frame ([`frame_len`]), the last one partial when the
+    /// track does not end on a frame: one per [`speech::FRAME`] of activity,
+    /// and what [`speech::pack`] cuts long regions by.
     energies: Vec<f64>,
-}
-
-impl TrackScan {
-    /// Nothing to send: the track has less than [`GATE_MIN_MS`] of sound.
-    fn is_skippable(&self) -> bool {
-        too_quiet(self.energies.iter().copied())
-    }
-}
-
-/// Whether frame energies ([`frame_len`] frames) hold less than
-/// [`GATE_MIN_MS`] of sound. Loud frames are counted rather than the span
-/// averaged: an hour of listening averages the few sentences the user said
-/// down to silence, the more so once the speaker echo is removed.
-fn too_quiet(energies: impl Iterator<Item = f64>) -> bool {
-    let frame_ms = frame_len(SAMPLE_RATE as usize) as u64 * 1000 / SAMPLE_RATE as u64;
-    let loud = energies.filter(|&e| e >= SILENCE_RMS_THRESHOLD).count() as u64;
-    loud * frame_ms < GATE_MIN_MS
 }
 
 /// Read a track once, computing its length and energies. Blocking.
@@ -385,6 +401,9 @@ fn scan_track(path: &Path) -> anyhow::Result<TrackScan> {
             energies.push(rms_energy(&buf));
             buf.clear();
         }
+    }
+    if !buf.is_empty() {
+        energies.push(rms_energy(&buf));
     }
     Ok(TrackScan { len, energies })
 }
@@ -412,18 +431,42 @@ async fn blocking<T: Send + 'static>(
         .context("track read panicked")?
 }
 
+/// The condensed audio of one chunk: its pieces read from the track, with
+/// [`speech::JOIN_GAP`] of digital silence between them. Blocking.
+fn read_condensed(path: &Path, map: &TimeMap) -> anyhow::Result<Vec<i16>> {
+    let mut out = Vec::with_capacity(map.condensed_len());
+    for piece in &map.pieces {
+        out.resize(piece.condensed, 0);
+        let samples = read_range(path, piece.original..piece.original + piece.len)?;
+        anyhow::ensure!(
+            samples.len() == piece.len,
+            "{} ended before sample {}",
+            path.display(),
+            piece.original + piece.len
+        );
+        out.extend(samples);
+    }
+    Ok(out)
+}
+
 /// The track being transcribed.
 struct TrackJob<'a> {
     path: &'a Path,
     kind: TrackKind,
     offset_ms: i64,
+    /// Where the user speaks, from the echo canceller, for the cancelled
+    /// mic; every other track goes by frame energy.
+    near_end: Option<&'a [bool]>,
 }
 
-/// Transcribe one track into filtered segments on the meeting timeline.
+/// Transcribe the speech in one track into filtered segments on the
+/// meeting timeline.
 ///
 /// Peak memory is one chunk: the track is scanned once for its frame
-/// energies, cut by [`split_by_energies`], and each chunk is read from disk
-/// only when it is sent. A chunk already in `cache` is not sent again.
+/// energies, its speech found ([`speech::regions`]) and packed into
+/// condensed chunks ([`speech::pack`]), and each chunk is read from disk
+/// only when it is sent. A track without speech sends nothing. A chunk
+/// already in `cache` is not sent again.
 async fn transcribe_track(
     backend: &dyn TranscriptionBackend,
     tcfg: &TranscriptionConfig,
@@ -436,63 +479,64 @@ async fn transcribe_track(
         let path = path.clone();
         blocking(move || scan_track(&path)).await?
     };
-    if scan.is_skippable() {
-        debug!("track is empty or silent; skipping");
+    let stem = job.kind.file_stem();
+    let active = match job.near_end {
+        Some(mask) if mask.len() == scan.energies.len() => mask.to_vec(),
+        _ => speech::energy_mask(&scan.energies),
+    };
+    let regions = speech::regions(&active, scan.len);
+    if regions.is_empty() {
+        debug!("{stem} track holds no speech; skipping");
         return Ok(Vec::new());
     }
-
-    let rate = SAMPLE_RATE as usize;
-    let chunks = match backend.max_segment_chunk_secs(tcfg) {
-        Some(secs) => split_by_energies(
-            &scan.energies,
-            scan.len,
-            rate,
-            secs as usize,
-            SILENCE_RMS_THRESHOLD,
-        ),
-        None => std::iter::once(0..scan.len).collect(),
-    };
-    drop(scan);
+    let chunks = speech::pack(
+        &regions,
+        &scan.energies,
+        backend
+            .max_segment_chunk_secs(tcfg)
+            .map(|secs| secs as usize),
+    );
+    let speech_samples: usize = regions.iter().map(|r| r.len()).sum();
+    info!(
+        "{stem} track: {:.1} s of speech in {} region(s) of {:.1} s, {} chunk(s)",
+        speech_samples as f64 / f64::from(SAMPLE_RATE),
+        regions.len(),
+        scan.len as f64 / f64::from(SAMPLE_RATE),
+        chunks.len()
+    );
+    drop((scan, active, regions));
 
     let mut out = Vec::new();
-    for range in chunks {
-        let raw = match cache.load(job.kind, &range) {
+    for map in chunks {
+        let raw = match cache.load(job.kind, &map) {
             Some(segments) => {
                 debug!(
-                    "reusing cached {} chunk {}..{}",
-                    job.kind.file_stem(),
-                    range.start,
-                    range.end
+                    "reusing a cached {stem} chunk from sample {}",
+                    map.pieces[0].original
                 );
                 segments
             }
             None => {
                 let chunk = {
                     let path = path.clone();
-                    let range = range.clone();
-                    blocking(move || read_range(&path, range)).await?
+                    let map = map.clone();
+                    blocking(move || read_condensed(&path, &map)).await?
                 };
-                let frame = frame_len(SAMPLE_RATE as usize);
-                if too_quiet(chunk.chunks(frame).map(rms_energy)) {
-                    debug!("skipping a silent chunk at sample {}", range.start);
-                    continue;
-                }
                 let wav = encode_wav(&chunk)?;
                 drop(chunk);
                 let transcript = transcribe_with_retry(backend, &wav, tcfg).await?;
-                if let Err(e) = cache.store(job.kind, &range, &transcript.segments) {
+                if let Err(e) = cache.store(job.kind, &map, &transcript.segments) {
                     warn!("could not cache a transcribed chunk: {e:#}");
                 }
                 transcript.segments
             }
         };
-        let chunk_ms = (range.start as u64 * 1000 / SAMPLE_RATE as u64) as i64;
         let offset_ms = job.offset_ms;
-        for seg in raw {
+        let shift = |ms: u64| (offset_ms + ms as i64).max(0) as u64;
+        for seg in raw.into_iter().flat_map(|seg| map.map_segment(seg)) {
             let Some(text) = filters.apply(&seg.text) else {
                 continue;
             };
-            let shift = |ms: u64| (offset_ms + chunk_ms + ms as i64).max(0) as u64;
             out.push(Segment {
                 start_ms: shift(seg.start_ms),
                 end_ms: shift(seg.end_ms),
@@ -551,6 +595,9 @@ fn fnv1a64(data: &[u8]) -> u64 {
 /// copied into the cache.
 fn cache_fingerprint(name: &str, config: &Config, tcfg: &TranscriptionConfig) -> String {
     let key = serde_json::json!({
+        // 2: chunks are condensed speech, keyed by their pieces, so entries
+        // from the earlier range chunking never match.
+        "chunking": 2,
         "backend": canonical_backend_name(name),
         "identity": backend_identity(name, config),
         "language": tcfg.language,
@@ -580,27 +627,29 @@ struct ChunkCache {
 }
 
 impl ChunkCache {
-    fn path(&self, kind: TrackKind, range: &Range<usize>) -> PathBuf {
+    /// One file per track and chunk: a hash of the chunk's pieces, so the
+    /// same speech packed the same way finds its entry again.
+    fn path(&self, kind: TrackKind, map: &TimeMap) -> PathBuf {
+        let pieces: Vec<u8> = map
+            .pieces
+            .iter()
+            .flat_map(|p| [p.condensed, p.original, p.len])
+            .flat_map(|n| (n as u64).to_le_bytes())
+            .collect();
         self.dir.join(format!(
-            "{}-{}-{}.json",
+            "{}-{:016x}.json",
             kind.file_stem(),
-            range.start,
-            range.end
+            fnv1a64(&pieces)
         ))
     }
 
-    fn load(&self, kind: TrackKind, range: &Range<usize>) -> Option<Vec<Segment>> {
-        let data = fs::read(self.path(kind, range)).ok()?;
+    fn load(&self, kind: TrackKind, map: &TimeMap) -> Option<Vec<Segment>> {
+        let data = fs::read(self.path(kind, map)).ok()?;
         let cached: CachedChunk = serde_json::from_slice(&data).ok()?;
         (cached.fingerprint == self.fingerprint).then_some(cached.segments)
     }
 
-    fn store(
-        &self,
-        kind: TrackKind,
-        range: &Range<usize>,
-        segments: &[Segment],
-    ) -> anyhow::Result<()> {
+    fn store(&self, kind: TrackKind, map: &TimeMap, segments: &[Segment]) -> anyhow::Result<()> {
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("failed to create {}", self.dir.display()))?;
         fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
@@ -608,7 +657,7 @@ impl ChunkCache {
             fingerprint: self.fingerprint.clone(),
             segments: segments.to_vec(),
         };
-        write_private(&self.path(kind, range), &serde_json::to_vec(&cached)?)
+        write_private(&self.path(kind, map), &serde_json::to_vec(&cached)?)
     }
 
     /// The cache for chunks of the echo-cancelled mic. Its own fingerprint,
@@ -772,8 +821,10 @@ fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::meeting::echo::fixtures;
+    use crate::meeting::split::split_by_energies;
     use crate::meeting::TrackMeta;
     use crate::transcription::{RetryableHttpError, Transcript};
+    use audio_silence_gate::SILENCE_RMS_THRESHOLD;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -786,6 +837,8 @@ mod tests {
         texts: Vec<(i16, &'static str)>,
         chunk_secs: Option<u32>,
         calls: AtomicUsize,
+        /// Samples in each request that got through.
+        sent: std::sync::Mutex<Vec<usize>>,
         /// Calls with this index or later fail (a dead network).
         fail_from: Option<usize>,
         /// The first this many calls answer HTTP 429.
@@ -807,6 +860,7 @@ mod tests {
                 texts: texts.to_vec(),
                 chunk_secs,
                 calls: AtomicUsize::new(0),
+                sent: Default::default(),
                 fail_from,
                 rate_limited,
             })
@@ -843,6 +897,7 @@ mod tests {
                 bail!("network is down");
             }
             let samples = crate::transcription::decode_wav_samples(audio)?;
+            self.sent.lock().unwrap().push(samples.len());
             let frame = RATE / 10;
             let mut segments = Vec::new();
             let mut run: Option<(usize, i16)> = None;
@@ -879,14 +934,16 @@ mod tests {
         }
     }
 
-    /// `secs` of silence with `(start_s, len_s, amplitude)` square bursts.
+    /// `secs` of silence with `(start_s, len_s, amplitude)` bursts of a
+    /// 2 kHz square wave: in the speech band, where the echo canceller's
+    /// near-end detector listens, with RMS and peak both `amplitude`.
     fn track(secs: f64, bursts: &[(f64, f64, i16)]) -> Vec<i16> {
         let mut out = vec![0i16; (secs * RATE as f64) as usize];
         for &(start, len, amp) in bursts {
             let from = (start * RATE as f64) as usize;
             let to = ((start + len) * RATE as f64) as usize;
             for (i, s) in out[from..to].iter_mut().enumerate() {
-                *s = if i % 2 == 0 { amp } else { -amp };
+                *s = if i % 8 < 4 { amp } else { -amp };
             }
         }
         out
@@ -1024,9 +1081,10 @@ mod tests {
 
     #[tokio::test]
     async fn offsets_hold_across_chunks() {
+        // A 3 s cap holds one padded 1 s burst (1.6 s) but not two.
         let backend = FakeBackend::new(
             &[(3000, "first"), (4000, "second"), (5000, "third")],
-            Some(10),
+            Some(3),
         );
         let (tmp, _) = meeting(&[(
             TrackKind::Mic,
@@ -1038,9 +1096,10 @@ mod tests {
         )]);
         let meta = run(tmp.path(), backend.clone()).await;
 
-        assert!(
-            backend.calls.load(Ordering::Relaxed) >= 3,
-            "27 s at a 10 s cap is chunked"
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            3,
+            "one chunk per burst"
         );
         let starts: Vec<_> = meta
             .segments
@@ -1175,8 +1234,9 @@ mod tests {
         );
         let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(samples))]);
 
-        // The third chunk's request fails: the first two are cached.
-        let failing = FakeBackend::with_failures(&texts, Some(10), Some(2), 0);
+        // One chunk per burst at a 3 s cap. The third chunk's request fails:
+        // the first two are cached.
+        let failing = FakeBackend::with_failures(&texts, Some(3), Some(2), 0);
         let err = process_meeting(
             tmp.path(),
             &config(),
@@ -1194,7 +1254,7 @@ mod tests {
         );
 
         // The retry sends only the chunk that failed.
-        let working = FakeBackend::new(&texts, Some(10));
+        let working = FakeBackend::new(&texts, Some(3));
         let meta = run(tmp.path(), working.clone()).await;
         assert_eq!(working.calls.load(Ordering::Relaxed), 1);
         let texts: Vec<_> = meta.segments.iter().map(|s| s.text.as_str()).collect();
@@ -1249,8 +1309,14 @@ mod tests {
         process_meeting(dir, &config(), Some(backend)).await
     }
 
-    fn wav_samples(path: &Path) -> Vec<i16> {
-        crate::transcription::decode_wav_samples(&fs::read(path).unwrap()).unwrap()
+    /// A chunk of `(original start, len)` pieces, packed as
+    /// [`speech::pack`] packs them.
+    fn map(pieces: &[(usize, usize)]) -> TimeMap {
+        let regions: Vec<Range<usize>> = pieces
+            .iter()
+            .map(|&(start, len)| start..start + len)
+            .collect();
+        speech::pack(&regions, &[], None).remove(0)
     }
 
     /// A call over speakers: the mic and system tracks of
@@ -1260,9 +1326,38 @@ mod tests {
         (fixtures::quantize(&mic), fixtures::quantize(&system))
     }
 
-    /// With both tracks the mic request carries the echo-cancelled track,
-    /// exactly what [`cancel_echo`] writes, and `audio/mic.wav` is left as
-    /// recorded.
+    /// What one uncapped request carries for the track at `path`: its
+    /// speech, found by `near_end` when given, else by frame energy, packed
+    /// into one condensed chunk.
+    fn condensed(path: &Path, near_end: Option<&[bool]>) -> Vec<i16> {
+        let scan = scan_track(path).unwrap();
+        let active = near_end.map_or_else(|| speech::energy_mask(&scan.energies), <[bool]>::to_vec);
+        let regions = speech::regions(&active, scan.len);
+        let chunks = speech::pack(&regions, &scan.energies, None);
+        assert_eq!(chunks.len(), 1, "{} regions", regions.len());
+        read_condensed(path, &chunks[0]).unwrap()
+    }
+
+    /// Cancel the meeting's mic into `expected.wav` beside it, as
+    /// `process_meeting` should have, and return what that left to send.
+    fn expected_mic(dir: &Path, timeline_lag: i64) -> Vec<i16> {
+        let expected = dir.join("expected.wav");
+        let outcome = cancel_echo(
+            &store::audio_path(dir, TrackKind::Mic),
+            &store::audio_path(dir, TrackKind::System),
+            timeline_lag,
+            &expected,
+        )
+        .unwrap();
+        let EchoOutcome::Cancelled(done) = outcome else {
+            panic!("expected a cancellation, got {outcome:?}");
+        };
+        condensed(&expected, Some(&done.near_end))
+    }
+
+    /// With both tracks the mic request carries the user's speech from the
+    /// echo-cancelled track (what [`cancel_echo`] writes, condensed by its
+    /// near-end mask), and `audio/mic.wav` is left as recorded.
     #[tokio::test]
     async fn the_echo_cancelled_mic_is_sent_when_both_tracks_exist() {
         let (mic, system) = speaker_call();
@@ -1271,23 +1366,28 @@ mod tests {
             (TrackKind::System, 0, Some(system.clone())),
         ]);
         let mic_path = store::audio_path(tmp.path(), TrackKind::Mic);
+        let system_path = store::audio_path(tmp.path(), TrackKind::System);
         let recorded = fs::read(&mic_path).unwrap();
         let backend = Arc::new(RecordingBackend::default());
         run_recording(tmp.path(), &backend).await.unwrap();
 
-        let expected = tmp.path().join("expected.wav");
-        let system_path = store::audio_path(tmp.path(), TrackKind::System);
-        let outcome = cancel_echo(&mic_path, &system_path, 0, &expected).unwrap();
-        assert!(matches!(outcome, EchoOutcome::Cancelled(_)), "{outcome:?}");
         let sent = backend.sent.lock().unwrap();
         assert_eq!(sent.len(), 2);
         // `assert!`, not `assert_eq!`: a failure would print every sample.
         assert!(
-            sent[0] == wav_samples(&expected),
-            "mic is not the cancelled track"
+            sent[0] == expected_mic(tmp.path(), 0),
+            "mic is not the cancelled speech"
         );
-        assert!(sent[0] != mic, "the mic went out uncancelled");
-        assert!(sent[1] == system, "the system track is sent as recorded");
+        assert!(
+            sent[0] != condensed(&mic_path, None),
+            "the mic went out uncancelled"
+        );
+        // Only the user's 1.4 s (padded), not the 8.5 s of echo around it.
+        assert!(sent[0].len() < 3 * RATE, "{} samples", sent[0].len());
+        assert!(
+            sent[1] == condensed(&system_path, None),
+            "the system track is sent as recorded"
+        );
         assert_eq!(fs::read(&mic_path).unwrap(), recorded);
         assert!(
             !tmp.path().join(CACHE_DIR).exists(),
@@ -1296,15 +1396,17 @@ mod tests {
     }
 
     /// No system track (`system_device = "none"`), or a silent one: the mic
-    /// is sent as recorded.
+    /// is sent as recorded, condensed by frame energy.
     #[tokio::test]
     async fn the_raw_mic_is_sent_without_system_audio() {
         let (mic, _) = speaker_call();
         let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(mic.clone()))]);
+        let mic_path = store::audio_path(tmp.path(), TrackKind::Mic);
         let backend = Arc::new(RecordingBackend::default());
         run_recording(tmp.path(), &backend).await.unwrap();
+        let raw = condensed(&mic_path, None);
         assert!(
-            *backend.sent.lock().unwrap() == [mic.clone()],
+            *backend.sent.lock().unwrap() == [raw.clone()],
             "no system track"
         );
 
@@ -1315,9 +1417,67 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         run_recording(tmp.path(), &backend).await.unwrap();
         assert!(
-            *backend.sent.lock().unwrap() == [mic],
+            *backend.sent.lock().unwrap() == [raw],
             "silent system track"
         );
+    }
+
+    /// Two short utterances a minute apart in two quiet minutes: one request
+    /// of just them with a second of silence between, and the segments land
+    /// back where they were said.
+    #[tokio::test]
+    async fn only_the_speech_is_sent() {
+        let backend = FakeBackend::new(&[(3000, "first"), (4000, "second")], Some(600));
+        let samples = track(120.0, &[(30.0, 1.0, 3000), (90.0, 1.0, 4000)]);
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 250, Some(samples))]);
+        let meta = run(tmp.path(), backend.clone()).await;
+
+        // Each second of speech padded by 0.3 s a side, 1 s apart.
+        let region = (1.6 * RATE as f64) as usize;
+        assert_eq!(*backend.sent.lock().unwrap(), [2 * region + RATE]);
+        let lines: Vec<_> = meta
+            .segments
+            .iter()
+            .map(|s| (s.start_ms, s.end_ms, s.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [(30_250, 31_250, "first"), (90_250, 91_250, "second")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_track_sends_nothing() {
+        let backend = FakeBackend::new(&[], None);
+        let mut quiet = vec![0i16; 30 * RATE];
+        // Room noise well under the gate.
+        for (i, s) in quiet.iter_mut().enumerate() {
+            *s = [20, -20, 15, -15][i % 4];
+        }
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(quiet))]);
+        let meta = run(tmp.path(), backend.clone()).await;
+        assert_eq!(meta.status, MeetingState::Done);
+        assert!(meta.segments.is_empty());
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// The system track has no near-end detector: its speech is found by
+    /// frame energy and condensed the same way.
+    #[tokio::test]
+    async fn the_system_track_is_condensed_by_energy() {
+        let system = track(120.0, &[(10.0, 2.0, 6000), (100.0, 1.0, 6000)]);
+        let (tmp, _) = meeting(&[
+            (TrackKind::Mic, 0, Some(vec![0; 120 * RATE])),
+            (TrackKind::System, 0, Some(system)),
+        ]);
+        let backend = Arc::new(RecordingBackend::default());
+        run_recording(tmp.path(), &backend).await.unwrap();
+        let sent = backend.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "the silent mic sends nothing");
+        let (first, second) = ((2.6 * RATE as f64) as usize, (1.6 * RATE as f64) as usize);
+        assert_eq!(sent[0].len(), first + RATE + second);
+        let system_path = store::audio_path(tmp.path(), TrackKind::System);
+        assert!(sent[0] == condensed(&system_path, None));
     }
 
     /// A failed attempt keeps the cancelled mic in the cache, private, and
@@ -1335,18 +1495,56 @@ mod tests {
         });
         run_recording(tmp.path(), &failing).await.unwrap_err();
         let cached = tmp.path().join(CACHE_DIR).join(ECHO_CANCELLED_MIC);
-        let mode = fs::metadata(&cached).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        assert_eq!(fs::read_dir(tmp.path().join(CACHE_DIR)).unwrap().count(), 1);
+        let mask = tmp.path().join(CACHE_DIR).join(ECHO_CANCELLED_MASK);
+        for file in [&cached, &mask] {
+            let mode = fs::metadata(file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", file.display());
+        }
+        assert_eq!(fs::read_dir(tmp.path().join(CACHE_DIR)).unwrap().count(), 2);
+        let near_end = speech::decode_mask(&fs::read(&mask).unwrap(), mic.len()).unwrap();
 
         // A marker of the same length: sent only if the file is reused.
-        let marker = vec![1234i16; mic.len()];
-        write_wav(&cached, &marker);
+        write_wav(&cached, &vec![1234i16; mic.len()]);
         let working = Arc::new(RecordingBackend::default());
         run_recording(tmp.path(), &working).await.unwrap();
+        let sent = &working.sent.lock().unwrap()[0];
+        assert!(sent.contains(&1234), "cached track not reused");
+        assert!(sent.iter().all(|&s| s == 1234 || s == 0));
+        assert_eq!(sent.len(), condensed_len(&near_end, mic.len()));
+    }
+
+    /// Condensed length of a `len`-sample track sent by `active`.
+    fn condensed_len(active: &[bool], len: usize) -> usize {
+        speech::pack(&speech::regions(active, len), &[], None)
+            .iter()
+            .map(TimeMap::condensed_len)
+            .sum()
+    }
+
+    /// The cancelled track is reused only with its mask: without the mask
+    /// both are made again.
+    #[tokio::test]
+    async fn a_cached_track_without_its_mask_is_redone() {
+        let (mic, system) = speaker_call();
+        let (tmp, _) = meeting(&[
+            (TrackKind::Mic, 0, Some(mic.clone())),
+            (TrackKind::System, 0, Some(system)),
+        ]);
+        let failing = Arc::new(RecordingBackend {
+            fail_from: Some(0),
+            ..Default::default()
+        });
+        run_recording(tmp.path(), &failing).await.unwrap_err();
+        let cache = tmp.path().join(CACHE_DIR);
+        write_wav(&cache.join(ECHO_CANCELLED_MIC), &vec![1234i16; mic.len()]);
+        fs::remove_file(cache.join(ECHO_CANCELLED_MASK)).unwrap();
+
+        let working = Arc::new(RecordingBackend::default());
+        run_recording(tmp.path(), &working).await.unwrap();
+        let sent = &working.sent.lock().unwrap()[0];
         assert!(
-            working.sent.lock().unwrap()[0] == marker,
-            "cached track not reused"
+            *sent == expected_mic(tmp.path(), 0),
+            "stale cached track sent"
         );
     }
 
@@ -1371,23 +1569,26 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         run_recording(tmp.path(), &backend).await.unwrap();
 
-        let expected = tmp.path().join("expected.wav");
         let outcome = cancel_echo(
             &store::audio_path(tmp.path(), TrackKind::Mic),
             &store::audio_path(tmp.path(), TrackKind::System),
             6400,
-            &expected,
+            &tmp.path().join("check.wav"),
         )
         .unwrap();
-        let EchoOutcome::Cancelled(report) = outcome else {
+        let EchoOutcome::Cancelled(done) = outcome else {
             panic!("expected a cancellation, got {outcome:?}");
         };
-        assert!((report.lag - 7400).abs() <= 2, "{report:?}");
+        assert!((done.report.lag - 7400).abs() <= 2, "{:?}", done.report);
+        let mic_path = store::audio_path(tmp.path(), TrackKind::Mic);
         let sent = backend.sent.lock().unwrap();
-        assert!(sent[0] != mic, "the mic went out uncancelled");
         assert!(
-            sent[0] == wav_samples(&expected),
-            "mic is not the cancelled track"
+            sent[0] != condensed(&mic_path, None),
+            "the mic went out uncancelled"
+        );
+        assert!(
+            sent[0] == expected_mic(tmp.path(), 6400),
+            "mic is not the cancelled speech"
         );
     }
 
@@ -1405,7 +1606,8 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         let meta = run_recording(tmp.path(), &backend).await.unwrap();
         assert_eq!(meta.status, MeetingState::Done);
-        assert!(backend.sent.lock().unwrap()[0] == mic, "raw mic not sent");
+        let raw = condensed(&store::audio_path(tmp.path(), TrackKind::Mic), None);
+        assert!(backend.sent.lock().unwrap()[0] == raw, "raw mic not sent");
     }
 
     /// A rename that fails after a full cancellation (here the target is a
@@ -1460,17 +1662,11 @@ mod tests {
         write_wav(&cached, &vec![1234i16; mic.len() - 1]);
         let backend = Arc::new(RecordingBackend::default());
         run_recording(tmp.path(), &backend).await.unwrap();
-
-        let expected = tmp.path().join("expected.wav");
-        cancel_echo(
-            &store::audio_path(tmp.path(), TrackKind::Mic),
-            &store::audio_path(tmp.path(), TrackKind::System),
-            0,
-            &expected,
-        )
-        .unwrap();
         let sent = &backend.sent.lock().unwrap()[0];
-        assert!(*sent == wav_samples(&expected), "stale cached track sent");
+        assert!(
+            *sent == expected_mic(tmp.path(), 0),
+            "stale cached track sent"
+        );
     }
 
     #[test]
@@ -1481,16 +1677,16 @@ mod tests {
             fingerprint: "fp".into(),
         };
         let cancelled = raw.echo_cancelled();
-        let range = 0..16_000;
-        raw.store(TrackKind::Mic, &range, &[seg(0, 900, "raw")])
+        let chunk = map(&[(0, 16_000)]);
+        raw.store(TrackKind::Mic, &chunk, &[seg(0, 900, "raw")])
             .unwrap();
-        assert_eq!(cancelled.load(TrackKind::Mic, &range), None);
+        assert_eq!(cancelled.load(TrackKind::Mic, &chunk), None);
         cancelled
-            .store(TrackKind::Mic, &range, &[seg(0, 900, "cancelled")])
+            .store(TrackKind::Mic, &chunk, &[seg(0, 900, "cancelled")])
             .unwrap();
-        assert_eq!(raw.load(TrackKind::Mic, &range), None);
+        assert_eq!(raw.load(TrackKind::Mic, &chunk), None);
         assert_eq!(
-            cancelled.load(TrackKind::Mic, &range),
+            cancelled.load(TrackKind::Mic, &chunk),
             Some(vec![seg(0, 900, "cancelled")])
         );
     }
@@ -1503,25 +1699,163 @@ mod tests {
             fingerprint: format!("{backend}/{model}"),
         };
         let segments = vec![seg(0, 1000, "hi")];
+        let chunk = map(&[(0, 16_000), (48_000, 3_200)]);
         cache("groq", "m1")
-            .store(TrackKind::System, &(0..16_000), &segments)
+            .store(TrackKind::System, &chunk, &segments)
             .unwrap();
         assert_eq!(
-            cache("groq", "m1").load(TrackKind::System, &(0..16_000)),
+            cache("groq", "m1").load(TrackKind::System, &chunk),
             Some(segments)
         );
-        assert_eq!(
-            cache("openai", "m1").load(TrackKind::System, &(0..16_000)),
-            None
+        assert_eq!(cache("openai", "m1").load(TrackKind::System, &chunk), None);
+        assert_eq!(cache("groq", "m2").load(TrackKind::System, &chunk), None);
+        assert_eq!(cache("groq", "m1").load(TrackKind::Mic, &chunk), None);
+        // Other speech, or the same speech packed otherwise, is another chunk.
+        for other in [
+            map(&[(0, 16_000)]),
+            map(&[(0, 16_000), (48_000, 1_600)]),
+            map(&[(1_600, 16_000), (48_000, 3_200)]),
+        ] {
+            assert_eq!(cache("groq", "m1").load(TrackKind::System, &other), None);
+        }
+        let mut moved = chunk.clone();
+        moved.pieces[1].condensed += 1;
+        assert_eq!(cache("groq", "m1").load(TrackKind::System, &moved), None);
+    }
+
+    /// Real-data check of what gets sent, run by hand on copies of a
+    /// recorded meeting (never in the meeting folder itself):
+    ///
+    /// ```text
+    /// WHISRS_ECHO_MIC=mic.wav WHISRS_ECHO_SYSTEM=system.wav \
+    /// WHISRS_ECHO_OUT=cancelled.wav WHISRS_ECHO_LAG=<(system - mic offset_ms) * 16> \
+    /// WHISRS_SPEECH_LABELS=deepgram.json \
+    /// cargo test --release --lib speech_on_a_recorded_meeting -- --ignored --nocapture
+    /// ```
+    ///
+    /// The labels are a Deepgram response for the cancelled mic: the words
+    /// in `results.utterances[].words[]` are the user's. Prints the share of
+    /// STFT frames (256-sample hop, as the prototype counted them) inside
+    /// those words that are sent, and of all other frames, both for the
+    /// padded near-end mask alone and for the final regions, and how long
+    /// each track is once condensed.
+    #[test]
+    #[ignore = "needs a recorded meeting, see the doc comment"]
+    fn speech_on_a_recorded_meeting() {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+        let (mic, system, out) = (
+            PathBuf::from(var("WHISRS_ECHO_MIC")),
+            PathBuf::from(var("WHISRS_ECHO_SYSTEM")),
+            PathBuf::from(var("WHISRS_ECHO_OUT")),
         );
-        assert_eq!(
-            cache("groq", "m2").load(TrackKind::System, &(0..16_000)),
-            None
+        let lag: i64 = var("WHISRS_ECHO_LAG").parse().unwrap();
+        let labels: serde_json::Value =
+            serde_json::from_slice(&fs::read(var("WHISRS_SPEECH_LABELS")).unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        let EchoOutcome::Cancelled(done) = cancel_echo(&mic, &system, lag, &out).unwrap() else {
+            panic!("no echo cancelled");
+        };
+        println!("{done:?} in {:.2?}", started.elapsed());
+
+        let scan = scan_track(&out).unwrap();
+        let regions = speech::regions(&done.near_end, scan.len);
+        let mut words: Vec<(f64, f64)> = labels["results"]["utterances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|u| u["words"].as_array().unwrap().iter())
+            .map(|w| (w["start"].as_f64().unwrap(), w["end"].as_f64().unwrap()))
+            .collect();
+        words.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let hop = 256;
+        let frames = (scan.len - 512) / hop + 1;
+        let mut next_word = 0;
+        let mut labelled = vec![false; frames];
+        for (i, label) in labelled.iter_mut().enumerate() {
+            let t = (i * hop) as f64 / f64::from(SAMPLE_RATE);
+            while next_word < words.len() && words[next_word].1 < t {
+                next_word += 1;
+            }
+            *label = words[next_word..]
+                .iter()
+                .take_while(|w| w.0 <= t)
+                .any(|w| t <= w.1);
+        }
+        let padded = |at: usize| {
+            let f = at / speech::FRAME;
+            let lo = f.saturating_sub(3);
+            done.near_end[lo..(f + 4).min(done.near_end.len())]
+                .iter()
+                .any(|&a| a)
+        };
+        let in_regions = |at: usize| regions.iter().any(|r| r.contains(&at));
+        let share = |kept: &dyn Fn(usize) -> bool, want: bool| {
+            let picked: Vec<usize> = (0..frames).filter(|&i| labelled[i] == want).collect();
+            let n = picked.iter().filter(|&&i| kept(i * hop)).count();
+            100.0 * n as f64 / picked.len() as f64
+        };
+        println!(
+            "label frames {} of {frames}",
+            labelled.iter().filter(|&&l| l).count()
         );
-        assert_eq!(cache("groq", "m1").load(TrackKind::Mic, &(0..16_000)), None);
-        assert_eq!(
-            cache("groq", "m1").load(TrackKind::System, &(0..8_000)),
-            None
+        for (name, kept) in [
+            ("padded mask", &padded as &dyn Fn(usize) -> bool),
+            ("final regions", &in_regions),
+        ] {
+            println!(
+                "{name}: user's word frames kept {:.1}%, other frames kept {:.1}%",
+                share(kept, true),
+                share(kept, false)
+            );
+        }
+
+        // The user over the far side: word frames where the system track,
+        // shifted by the lag, is above the gate.
+        let system_scan = scan_track(&system).unwrap();
+        let far_active = |at: usize| {
+            let at = at as i64 - done.report.lag;
+            at >= 0
+                && system_scan
+                    .energies
+                    .get(at as usize / speech::FRAME)
+                    .is_some_and(|&e| e >= SILENCE_RMS_THRESHOLD)
+        };
+        let over: Vec<usize> = (0..frames)
+            .filter(|&i| labelled[i] && far_active(i * hop))
+            .collect();
+        let kept = over.iter().filter(|&&i| in_regions(i * hop)).count();
+        println!(
+            "user's word frames over far-end audio: {}, kept {:.1}%",
+            over.len(),
+            100.0 * kept as f64 / over.len().max(1) as f64
+        );
+
+        let secs = |samples: usize| samples as f64 / f64::from(SAMPLE_RATE);
+        let report = |name: &str, len: usize, regions: &[Range<usize>], energies: &[f64]| {
+            let speech_len: usize = regions.iter().map(|r| r.len()).sum();
+            let one: usize = speech::pack(regions, energies, None)
+                .iter()
+                .map(TimeMap::condensed_len)
+                .sum();
+            let groq = speech::pack(regions, energies, Some(600));
+            println!(
+                "{name}: {:.1} s track, {} region(s), {:.1} s of speech, condensed {:.1} s \
+                 ({} chunk(s) at a 600 s cap)",
+                secs(len),
+                regions.len(),
+                secs(speech_len),
+                secs(one),
+                groq.len()
+            );
+        };
+        report("mic", scan.len, &regions, &scan.energies);
+        let system_regions =
+            speech::regions(&speech::energy_mask(&system_scan.energies), system_scan.len);
+        report(
+            "system",
+            system_scan.len,
+            &system_regions,
+            &system_scan.energies,
         );
     }
 
@@ -1586,7 +1920,7 @@ mod tests {
         let samples = track(17.0, &[(2.0, 1.0, 3000), (12.0, 1.0, 4000)]);
         let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(samples))]);
         // The second chunk fails: the first is cached under English.
-        let failing = FakeBackend::with_failures(&texts, Some(10), Some(1), 0);
+        let failing = FakeBackend::with_failures(&texts, Some(3), Some(1), 0);
         process_meeting(
             tmp.path(),
             &config(),
@@ -1598,7 +1932,7 @@ mod tests {
 
         let mut german = config();
         german.general.language = "de".into();
-        let working = FakeBackend::new(&texts, Some(10));
+        let working = FakeBackend::new(&texts, Some(3));
         process_meeting(
             tmp.path(),
             &german,
@@ -1722,6 +2056,9 @@ mod tests {
 
         let scan = scan_track(&path).unwrap();
         assert_eq!(scan.len, samples.len());
+        // Every frame, the partial last one included.
+        assert_eq!(scan.energies.len(), speech::frame_count(samples.len()));
+        assert_eq!(scan.energies.last(), Some(&rms_energy(&[9i16; 123])));
         for cap in [10, 25, 60] {
             let expected =
                 crate::meeting::split::split_at_silence(&samples, RATE, cap, SILENCE_RMS_THRESHOLD);

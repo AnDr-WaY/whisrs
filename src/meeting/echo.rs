@@ -22,6 +22,8 @@
 //!    frames, which is the echo path's power gain.
 //! 4. [`suppress`]: a gain per bin and frame, inverse STFT and overlap-add,
 //!    written out as the mic is read, so the output has the mic's length.
+//!    The same pass marks where the user speaks (the near-end mask), so
+//!    only those stretches need transcribing.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -38,6 +40,7 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use tracing::debug;
 
 use super::process::open_track;
+use super::speech;
 
 const RATE: usize = super::SAMPLE_RATE as usize;
 
@@ -91,6 +94,19 @@ const POWER_FLOOR: f32 = 1e-12;
 /// Same, for the GCC-PHAT whitening.
 const PHAT_FLOOR: f32 = 1e-9;
 
+/// The speech band (300 to 3400 Hz) in STFT bins, where the near-end
+/// detector compares the mic with the predicted echo.
+const SPEECH_BINS: std::ops::Range<usize> = 300 * FRAME / RATE..3400 * FRAME / RATE;
+
+/// How far the mic must be above the predicted echo (the prediction itself,
+/// without the over-subtraction) in the speech band for a frame to count as
+/// the user speaking.
+const NEAR_END_MARGIN_DB: f64 = 10.0;
+
+/// How loud the cancelled output must be in the speech band for the same,
+/// in dBFS (mean power per sample), so room noise does not count.
+const NEAR_END_FLOOR_DB: f64 = -60.0;
+
 /// A system frame quieter than this mean square is not far-end speech
 /// whatever its rank, so a meeting where the far side rarely talks does not
 /// learn the echo path from its noise floor (and the user's voice over it).
@@ -100,9 +116,32 @@ const ACTIVE_POWER: f64 = SILENCE_RMS_THRESHOLD * SILENCE_RMS_THRESHOLD;
 #[derive(Debug, Clone, PartialEq)]
 pub enum EchoOutcome {
     /// The echo-cancelled mic was written.
-    Cancelled(EchoReport),
+    Cancelled(Cancelled),
     /// Nothing to cancel, and nothing was written.
     Skipped(SkipReason),
+}
+
+/// A finished cancellation.
+#[derive(Clone, PartialEq)]
+pub struct Cancelled {
+    pub report: EchoReport,
+    /// Per [`speech::FRAME`] of the mic (the last one possibly partial):
+    /// whether the user is speaking in it rather than the speakers echoing.
+    pub near_end: Vec<bool>,
+}
+
+impl fmt::Debug for Cancelled {
+    // The mask has a flag per 100 ms; a count reads better in a log.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let active = self.near_end.iter().filter(|&&a| a).count();
+        f.debug_struct("Cancelled")
+            .field("report", &self.report)
+            .field(
+                "near_end",
+                &format_args!("{active} of {} frames", self.near_end.len()),
+            )
+            .finish()
+    }
 }
 
 /// Why [`cancel_echo`] left the mic alone.
@@ -174,17 +213,20 @@ pub fn cancel_echo(
     let Some(path) = echo_path(&pair, threshold, &mut stft)? else {
         return Ok(EchoOutcome::Skipped(SkipReason::SilentSystem));
     };
-    suppress(&pair, &path, &mut stft, out)?;
+    let near_end = suppress(&pair, &path, &mut stft, out)?;
 
     let mut lag_values: Vec<f64> = pair.lags.points.iter().map(|p| p.1).collect();
     lag_values.sort_by(f64::total_cmp);
     let mut path_db: Vec<f32> = path.iter().map(|&p| db(p)).collect();
     path_db.sort_by(f32::total_cmp);
-    Ok(EchoOutcome::Cancelled(EchoReport {
-        lag: lag_values[lag_values.len() / 2].round() as i64,
-        lag_drift: (lag_values[lag_values.len() - 1] - lag_values[0]).round() as i64,
-        aligned_blocks: lag_values.len(),
-        echo_path_db: path_db[BINS / 2],
+    Ok(EchoOutcome::Cancelled(Cancelled {
+        report: EchoReport {
+            lag: lag_values[lag_values.len() / 2].round() as i64,
+            lag_drift: (lag_values[lag_values.len() - 1] - lag_values[0]).round() as i64,
+            aligned_blocks: lag_values.len(),
+            echo_path_db: path_db[BINS / 2],
+        },
+        near_end,
     }))
 }
 
@@ -445,8 +487,16 @@ fn echo_path(pair: &Pair<'_>, threshold: f32, stft: &mut Stft) -> anyhow::Result
 
 /// Pass 4: turn each mic bin down by the predicted echo, `G = 1 -
 /// OVERSUBTRACTION * echo / mic` clamped to `0..=1`, and write the result
-/// to `out` as the frames complete.
-fn suppress(pair: &Pair<'_>, path: &[f32], stft: &mut Stft, out: &Path) -> anyhow::Result<()> {
+/// to `out` as the frames complete. Returns the near-end mask: a
+/// [`speech::FRAME`] is the user speaking when any STFT frame overlapping
+/// it has the mic [`NEAR_END_MARGIN_DB`] over the predicted echo in the
+/// speech band and the output there at [`NEAR_END_FLOOR_DB`] or louder.
+fn suppress(
+    pair: &Pair<'_>,
+    path: &[f32],
+    stft: &mut Stft,
+    out: &Path,
+) -> anyhow::Result<Vec<bool>> {
     let file = create_private(out)?;
     let mut writer = hound::WavWriter::new(BufWriter::new(file.try_clone()?), track_spec())
         .with_context(|| format!("failed to start WAV {}", out.display()))?;
@@ -455,6 +505,9 @@ fn suppress(pair: &Pair<'_>, path: &[f32], stft: &mut Stft, out: &Path) -> anyho
     let norm: Vec<f32> = (0..HOP)
         .map(|j| 1.0 / (stft.window[j].powi(2) + stft.window[j + HOP].powi(2)))
         .collect();
+    // In-band spectral power to mean power per sample (Parseval, one-sided).
+    let per_sample = FRAME as f64 * stft.window.iter().map(|w| f64::from(w * w)).sum::<f64>() / 2.0;
+    let mut near_end = vec![false; speech::frame_count(pair.mic_len)];
 
     let mut frames = pair.frames()?;
     let mut smear = Smear::new();
@@ -470,9 +523,27 @@ fn suppress(pair: &Pair<'_>, path: &[f32], stft: &mut Stft, out: &Path) -> anyho
         power_of(&spectrum, &mut far_power);
         let smeared = smear.push(&far_power);
         stft.forward(&mic, &mut spectrum)?;
-        for ((y, &x), &h) in spectrum.iter_mut().zip(smeared).zip(path) {
-            let gain = 1.0 - OVERSUBTRACTION * h * x / (y.norm_sqr() + POWER_FLOOR);
-            *y *= gain.clamp(0.0, 1.0);
+        let (mut mic_band, mut echo_band, mut out_band) = (0f64, 0f64, 0f64);
+        for (bin, ((y, &x), &h)) in spectrum.iter_mut().zip(smeared).zip(path).enumerate() {
+            let power = y.norm_sqr();
+            let echo = h * x;
+            let gain = (1.0 - OVERSUBTRACTION * echo / (power + POWER_FLOOR)).clamp(0.0, 1.0);
+            if SPEECH_BINS.contains(&bin) {
+                mic_band += f64::from(power);
+                echo_band += f64::from(echo);
+                out_band += f64::from(power * gain * gain);
+            }
+            *y *= gain;
+        }
+        let margin = 10.0 * ((mic_band + 1e-12) / (echo_band + 1e-12)).log10();
+        let level = 10.0 * (out_band / per_sample + 1e-12).log10();
+        if margin >= NEAR_END_MARGIN_DB && level >= NEAR_END_FLOOR_DB {
+            // Frame `index` covers mic samples `(index - 1) * HOP` to `+ FRAME`.
+            let start = (index * HOP).saturating_sub(HOP);
+            let end = ((index * HOP + HOP).min(pair.mic_len)).max(1) - 1;
+            let last = near_end.len() - 1;
+            near_end[(start / speech::FRAME).min(last)..=(end / speech::FRAME).min(last)]
+                .fill(true);
         }
         stft.inverse(&mut spectrum, &mut synth)?;
         for (a, s) in acc.iter_mut().zip(&synth) {
@@ -501,7 +572,7 @@ fn suppress(pair: &Pair<'_>, path: &[f32], stft: &mut Stft, out: &Path) -> anyho
         .finalize()
         .with_context(|| format!("failed to finish {}", out.display()))?;
     file.sync_all()?;
-    Ok(())
+    Ok(near_end)
 }
 
 /// Mic frames on the STFT grid, each with the system frame its echo came
@@ -928,16 +999,23 @@ mod tests {
 
     fn report(outcome: &EchoOutcome) -> &EchoReport {
         match outcome {
-            EchoOutcome::Cancelled(report) => report,
+            EchoOutcome::Cancelled(done) => &done.report,
             other => panic!("expected a cancellation, got {other:?}"),
         }
     }
 
-    /// The far side talks in five spans; the user talks alone in two and
-    /// over the far side in two more. The mic hears the speakers 1000
-    /// samples late though the track offsets say 900.
-    #[test]
-    fn removes_the_echo_and_keeps_the_user() {
+    /// Spans of [`double_talk_call`], in seconds, clear of the edges.
+    const ECHO_ONLY: [(f64, f64); 3] = [(2.0, 8.0), (28.0, 36.0), (55.5, 58.5)];
+    const USER_ONLY: [(f64, f64); 2] = [(9.7, 13.3), (38.1, 42.9)];
+    const DOUBLE_TALK: [(f64, f64); 2] = [(16.5, 19.5), (46.5, 49.5)];
+    /// Neither side talks: only the two noise floors.
+    const QUIET: (f64, f64) = (23.0, 26.5);
+
+    /// A minute of call: the far side talks in five spans; the user talks
+    /// alone in two (at 0.01 RMS, about the echo's level) and over the far
+    /// side in two more (at `over_far`). The mic hears the speakers 1000
+    /// samples late. Returns `(mic, system, near end)`.
+    fn double_talk_call(over_far: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let len = at(60.0);
         let far_spans = [
             (1.0, 9.0),
@@ -946,34 +1024,119 @@ mod tests {
             (44.0, 52.0),
             (55.0, 59.0),
         ];
-        let near_spans = [(9.6, 13.4), (16.0, 20.0), (38.0, 43.0), (46.0, 50.0)];
         let mut system = speech(len, &far_spans, 0.1, 1);
-        let near = speech(len, &near_spans, 0.01, 2);
+        let near = mix(
+            &speech(len, &[(9.6, 13.4), (38.0, 43.0)], 0.01, 2),
+            &speech(len, &[(16.0, 20.0), (46.0, 50.0)], over_far, 6),
+        );
         let mut mic = mix(&echo(&system, 1000, 3), &near);
         add_noise(&mut mic, 3e-4, 4);
         add_noise(&mut system, 1e-4, 5);
-        let mic = read_back(&mic);
+        (read_back(&mic), system, read_back(&near))
+    }
 
+    /// The track offsets say 900 samples where the echo is 1000 late.
+    #[test]
+    fn removes_the_echo_and_keeps_the_user() {
+        let (mic, system, near) = double_talk_call(0.01);
         let (outcome, out) = run(&mic, &system, 900);
         let report = report(&outcome);
         assert!((report.lag - 1000).abs() <= 2, "{report:?}");
         let out = out.unwrap();
         assert_eq!(out.len(), mic.len());
 
-        for span in [(2.0, 8.0), (28.0, 36.0), (55.5, 58.5)] {
+        for span in ECHO_ONLY {
             let change = change_db(&mic, &out, span);
             assert!(change <= -15.0, "echo only {span:?}: {change:.1} dB");
         }
-        for span in [(9.7, 13.3), (38.1, 42.9)] {
+        for span in USER_ONLY {
             let change = change_db(&mic, &out, span);
             assert!(change.abs() < 1.0, "user only {span:?}: {change:.1} dB");
         }
         // Over the far side the user loses the bins the echo covers, but is
         // not wiped out with it.
-        for span in [(16.5, 19.5), (46.5, 49.5)] {
-            let kept = change_db(&read_back(&near), &out, span);
+        for span in DOUBLE_TALK {
+            let kept = change_db(&near, &out, span);
             assert!(kept > -10.0, "double talk {span:?}: {kept:.1} dB");
         }
+    }
+
+    /// The near-end mask and the regions sent from it: the user alone, or
+    /// speaking up over the far side, and never the echo or the noise floor.
+    /// (Over the far side at the echo's own level the user is not told
+    /// apart from it: the detector wants the mic 10 dB over the predicted
+    /// echo.)
+    #[test]
+    fn the_near_end_mask_finds_the_user_not_the_echo() {
+        let (mic, system, _) = double_talk_call(0.02);
+        let (outcome, _) = run(&mic, &system, 900);
+        let EchoOutcome::Cancelled(done) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(done.near_end.len(), speech::frame_count(mic.len()));
+        let regions = speech::regions(&done.near_end, mic.len());
+        // (share of frames active, share of the span sent)
+        let measure = |span: (f64, f64)| {
+            let frames = &done.near_end[at(span.0) / speech::FRAME..at(span.1) / speech::FRAME];
+            let active = frames.iter().filter(|&&a| a).count() as f64 / frames.len() as f64;
+            let samples = at(span.0)..at(span.1);
+            let sent: usize = regions
+                .iter()
+                .map(|r| {
+                    r.end
+                        .min(samples.end)
+                        .saturating_sub(r.start.max(samples.start))
+                })
+                .sum();
+            (active, sent as f64 / samples.len() as f64)
+        };
+        for span in ECHO_ONLY.into_iter().chain([QUIET]) {
+            let (active, sent) = measure(span);
+            assert!(
+                active < 0.02 && sent == 0.0,
+                "{span:?}: {active:.2} {sent:.2}"
+            );
+        }
+        for span in USER_ONLY {
+            let (active, sent) = measure(span);
+            assert!(
+                active > 0.95 && sent == 1.0,
+                "{span:?}: {active:.2} {sent:.2}"
+            );
+        }
+        for span in DOUBLE_TALK {
+            let (active, sent) = measure(span);
+            assert!(
+                active > 0.6 && sent == 1.0,
+                "{span:?}: {active:.2} {sent:.2}"
+            );
+        }
+    }
+
+    /// An echo 20 dB louder than usual leaves a residual above the level
+    /// floor, and is still not taken for the user: the margin over the
+    /// predicted echo decides.
+    #[test]
+    fn a_loud_echo_is_not_the_user() {
+        let len = at(30.0);
+        let mut system = speech(len, &[(1.0, 13.0), (16.0, 29.0)], 0.1, 21);
+        let mut mic: Vec<f32> = echo(&system, 1000, 22).iter().map(|s| s * 10.0).collect();
+        add_noise(&mut mic, 3e-4, 23);
+        add_noise(&mut system, 1e-4, 24);
+        let (outcome, out) = run(&mic, &system, 0);
+        let EchoOutcome::Cancelled(done) = outcome else {
+            panic!("{outcome:?}");
+        };
+        let out = out.unwrap();
+        let level = 10.0
+            * (out[at(2.0)..at(12.0)]
+                .iter()
+                .map(|&v| f64::from(v).powi(2))
+                .sum::<f64>()
+                / at(10.0) as f64)
+                .log10();
+        assert!(level > NEAR_END_FLOOR_DB, "residual {level:.1} dB");
+        assert!(done.near_end.iter().all(|&a| !a), "echo taken for the user");
     }
 
     /// The samples as the WAV round trip leaves them.
