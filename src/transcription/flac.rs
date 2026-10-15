@@ -2,9 +2,10 @@
 //!
 //! Meeting chunks reach the backends as 16 kHz mono i16 WAV. FLAC is
 //! lossless, so a cloud service decodes the exact samples the WAV holds (same
-//! transcript, same billed duration) from less than half the bytes. Only the
-//! native-timestamp `transcribe_segments` of Deepgram, Groq and OpenAI send
-//! it: dictation, the phrase fallback, asr-sidecar and local-whisper keep WAV.
+//! transcript, same billed duration) from, for speech, usually less than half
+//! the bytes. Only the native-timestamp `transcribe_segments` of Deepgram,
+//! Groq and OpenAI send it: dictation, the phrase fallback, asr-sidecar and
+//! local-whisper keep WAV.
 
 use std::borrow::Cow;
 

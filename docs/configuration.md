@@ -573,7 +573,7 @@ needs a backend that can transcribe a recorded file: groq, openai, deepgram,
 asr-sidecar or local-whisper.
 `backend` defaults to `[general] backend`. With `deepgram-streaming` the meeting
 goes to Deepgram's REST API. Groq, Deepgram and OpenAI's `whisper-1` receive
-the audio as FLAC, which is lossless and less than half the size of WAV. The
+the audio as FLAC, which is lossless and, for speech, usually less than half the size of WAV. The
 realtime backends (`openai-realtime`, `openai-compatible-realtime`) cannot
 transcribe a recording: setting one as
 `[meeting] backend` is a config error. Inheriting one from `[general]` gives a

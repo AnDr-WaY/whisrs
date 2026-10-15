@@ -1396,7 +1396,7 @@ mod tests {
             .collect();
         let wav = crate::audio::wav::encode_wav(&samples).unwrap();
 
-        // The streaming backend hands meetings to REST, so this covers both.
+        // The streaming backend hands meetings to this REST path in one line.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = local_backend(&listener);
         let server = tokio::spawn(serve_once(
