@@ -270,11 +270,15 @@ fn cancel_into_cache(
     let mut tmp_name = out.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
     let tmp = out.with_file_name(tmp_name);
-    let outcome = cancel_echo(mic, system, timeline_lag, &tmp);
-    if matches!(outcome, Ok(EchoOutcome::Cancelled(_))) {
-        fs::rename(&tmp, out)
-            .with_context(|| format!("failed to rename {} into place", tmp.display()))?;
-    } else if let Err(e) = fs::remove_file(&tmp) {
+    let outcome = cancel_echo(mic, system, timeline_lag, &tmp).and_then(|outcome| {
+        if let EchoOutcome::Cancelled(_) = outcome {
+            fs::rename(&tmp, out)
+                .with_context(|| format!("failed to rename {} into place", tmp.display()))?;
+        }
+        Ok(outcome)
+    });
+    // Gone after a rename; otherwise never leave a mic-sized file behind.
+    if let Err(e) = fs::remove_file(&tmp) {
         if e.kind() != std::io::ErrorKind::NotFound {
             warn!("failed to delete {}: {e}", tmp.display());
         }
@@ -1217,11 +1221,12 @@ mod tests {
         }
     }
 
-    async fn run_recording(dir: &Path, backend: &Arc<RecordingBackend>) -> anyhow::Result<()> {
+    async fn run_recording(
+        dir: &Path,
+        backend: &Arc<RecordingBackend>,
+    ) -> anyhow::Result<MeetingMeta> {
         let backend = backend.clone() as Arc<dyn TranscriptionBackend>;
-        process_meeting(dir, &config(), Some(backend))
-            .await
-            .map(drop)
+        process_meeting(dir, &config(), Some(backend)).await
     }
 
     fn wav_samples(path: &Path) -> Vec<i16> {
@@ -1256,9 +1261,13 @@ mod tests {
         assert!(matches!(outcome, EchoOutcome::Cancelled(_)), "{outcome:?}");
         let sent = backend.sent.lock().unwrap();
         assert_eq!(sent.len(), 2);
-        assert_eq!(sent[0], wav_samples(&expected));
-        assert_ne!(sent[0], mic);
-        assert_eq!(sent[1], system, "the system track is sent as recorded");
+        // `assert!`, not `assert_eq!`: a failure would print every sample.
+        assert!(
+            sent[0] == wav_samples(&expected),
+            "mic is not the cancelled track"
+        );
+        assert!(sent[0] != mic, "the mic went out uncancelled");
+        assert!(sent[1] == system, "the system track is sent as recorded");
         assert_eq!(fs::read(&mic_path).unwrap(), recorded);
         assert!(
             !tmp.path().join(CACHE_DIR).exists(),
@@ -1274,7 +1283,10 @@ mod tests {
         let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(mic.clone()))]);
         let backend = Arc::new(RecordingBackend::default());
         run_recording(tmp.path(), &backend).await.unwrap();
-        assert_eq!(*backend.sent.lock().unwrap(), std::slice::from_ref(&mic));
+        assert!(
+            *backend.sent.lock().unwrap() == [mic.clone()],
+            "no system track"
+        );
 
         let (tmp, _) = meeting(&[
             (TrackKind::Mic, 0, Some(mic.clone())),
@@ -1282,7 +1294,10 @@ mod tests {
         ]);
         let backend = Arc::new(RecordingBackend::default());
         run_recording(tmp.path(), &backend).await.unwrap();
-        assert_eq!(*backend.sent.lock().unwrap(), [mic]);
+        assert!(
+            *backend.sent.lock().unwrap() == [mic],
+            "silent system track"
+        );
     }
 
     /// A failed attempt keeps the cancelled mic in the cache, private, and
@@ -1309,7 +1324,133 @@ mod tests {
         write_wav(&cached, &marker);
         let working = Arc::new(RecordingBackend::default());
         run_recording(tmp.path(), &working).await.unwrap();
-        assert_eq!(working.sent.lock().unwrap()[0], marker);
+        assert!(
+            working.sent.lock().unwrap()[0] == marker,
+            "cached track not reused"
+        );
+    }
+
+    /// The system track started 400 ms after the mic, so system sample `v`
+    /// was captured with mic sample `v + 6400`, and the mic hears it 1000
+    /// samples after that. With the offsets read the wrong way round, the
+    /// echo would fall outside the lag search and the mic would go out
+    /// uncancelled.
+    #[tokio::test]
+    async fn track_offsets_place_the_echo_search() {
+        let len = fixtures::at(12.0);
+        let mut system = fixtures::speech(len, &[(0.5, 5.0), (7.0, 11.0)], 0.1, 1);
+        let near = fixtures::speech(len, &[(5.6, 6.8)], 0.01, 2);
+        let mut mic = fixtures::mix(&fixtures::echo(&system, 6400 + 1000, 3), &near);
+        fixtures::add_noise(&mut mic, 3e-4, 4);
+        fixtures::add_noise(&mut system, 1e-4, 5);
+        let (mic, system) = (fixtures::quantize(&mic), fixtures::quantize(&system));
+        let (tmp, _) = meeting(&[
+            (TrackKind::Mic, 0, Some(mic.clone())),
+            (TrackKind::System, 400, Some(system)),
+        ]);
+        let backend = Arc::new(RecordingBackend::default());
+        run_recording(tmp.path(), &backend).await.unwrap();
+
+        let expected = tmp.path().join("expected.wav");
+        let outcome = cancel_echo(
+            &store::audio_path(tmp.path(), TrackKind::Mic),
+            &store::audio_path(tmp.path(), TrackKind::System),
+            6400,
+            &expected,
+        )
+        .unwrap();
+        let EchoOutcome::Cancelled(report) = outcome else {
+            panic!("expected a cancellation, got {outcome:?}");
+        };
+        assert!((report.lag - 7400).abs() <= 2, "{report:?}");
+        let sent = backend.sent.lock().unwrap();
+        assert!(sent[0] != mic, "the mic went out uncancelled");
+        assert!(
+            sent[0] == wav_samples(&expected),
+            "mic is not the cancelled track"
+        );
+    }
+
+    /// The echo step never fails a meeting: with `.cache` a plain file it
+    /// cannot write the cancelled track (nor cache chunks), and the meeting
+    /// still finishes from the mic as recorded.
+    #[tokio::test]
+    async fn a_failed_echo_step_falls_back_to_the_raw_mic() {
+        let (mic, system) = speaker_call();
+        let (tmp, _) = meeting(&[
+            (TrackKind::Mic, 0, Some(mic.clone())),
+            (TrackKind::System, 0, Some(system)),
+        ]);
+        fs::write(tmp.path().join(CACHE_DIR), "not a directory").unwrap();
+        let backend = Arc::new(RecordingBackend::default());
+        let meta = run_recording(tmp.path(), &backend).await.unwrap();
+        assert_eq!(meta.status, MeetingState::Done);
+        assert!(backend.sent.lock().unwrap()[0] == mic, "raw mic not sent");
+    }
+
+    /// A rename that fails after a full cancellation (here the target is a
+    /// directory) leaves no mic-sized temporary in the cache.
+    #[tokio::test]
+    async fn a_failed_rename_leaves_no_temporary() {
+        let (mic, system) = speaker_call();
+        let (tmp, _) = meeting(&[
+            (TrackKind::Mic, 0, Some(mic)),
+            (TrackKind::System, 0, Some(system)),
+        ]);
+        let cached = tmp.path().join(CACHE_DIR).join(ECHO_CANCELLED_MIC);
+        fs::create_dir_all(cached.join("occupied")).unwrap();
+        // Fail the mic request so the cache is kept for inspection.
+        let failing = Arc::new(RecordingBackend {
+            fail_from: Some(0),
+            ..Default::default()
+        });
+        run_recording(tmp.path(), &failing).await.unwrap_err();
+        let leftover = tmp
+            .path()
+            .join(CACHE_DIR)
+            .join("mic-echo-cancelled.wav.tmp");
+        assert!(!leftover.exists(), "temporary left behind");
+    }
+
+    /// A system track listed in `meeting.json` but missing on disk is not an
+    /// echo failure: the step is skipped before it touches the cache.
+    #[tokio::test]
+    async fn a_missing_system_file_skips_the_echo_step() {
+        let (mic, _) = speaker_call();
+        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(mic)), (TrackKind::System, 0, None)]);
+        // Fail the mic request, so nothing else creates the cache dir.
+        let failing = Arc::new(RecordingBackend {
+            fail_from: Some(0),
+            ..Default::default()
+        });
+        run_recording(tmp.path(), &failing).await.unwrap_err();
+        assert!(!tmp.path().join(CACHE_DIR).exists());
+    }
+
+    /// A cached cancelled track whose length is not the mic's (another
+    /// recording, or a stray file) is cancelled again rather than sent.
+    #[tokio::test]
+    async fn a_cached_track_of_the_wrong_length_is_redone() {
+        let (mic, system) = speaker_call();
+        let (tmp, _) = meeting(&[
+            (TrackKind::Mic, 0, Some(mic.clone())),
+            (TrackKind::System, 0, Some(system)),
+        ]);
+        let cached = tmp.path().join(CACHE_DIR).join(ECHO_CANCELLED_MIC);
+        write_wav(&cached, &vec![1234i16; mic.len() - 1]);
+        let backend = Arc::new(RecordingBackend::default());
+        run_recording(tmp.path(), &backend).await.unwrap();
+
+        let expected = tmp.path().join("expected.wav");
+        cancel_echo(
+            &store::audio_path(tmp.path(), TrackKind::Mic),
+            &store::audio_path(tmp.path(), TrackKind::System),
+            0,
+            &expected,
+        )
+        .unwrap();
+        let sent = &backend.sent.lock().unwrap()[0];
+        assert!(*sent == wav_samples(&expected), "stale cached track sent");
     }
 
     #[test]

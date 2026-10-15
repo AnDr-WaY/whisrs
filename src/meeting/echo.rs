@@ -66,7 +66,8 @@ const LAG_BLOCK: usize = 10 * RATE;
 /// Search window around the lag the track offsets imply: the mic may hear
 /// the speakers up to `MAX_DELAY` after the system track has them (output
 /// latency, Bluetooth speakers), or up to `MAX_LEAD` before (the offsets are
-/// only as exact as the capture start times).
+/// only as exact as the capture start times). Once lags are measured, the
+/// window follows them instead, so drift never walks the echo out of it.
 const MAX_LEAD: usize = RATE / 4;
 const MAX_DELAY: usize = RATE / 2;
 
@@ -78,6 +79,10 @@ const MIN_PEAK_Z: f64 = 12.0;
 
 /// Median smoothing window over the measured lags, in blocks.
 const LAG_MEDIAN: usize = 5;
+
+/// Confident blocks needed before the search window follows the measured
+/// lag: their median, so one stray peak cannot drag the window away.
+const LAG_LOCK: usize = LAG_MEDIAN / 2 + 1;
 
 /// Keeps a silent bin from dividing by zero; far below any audible power of
 /// samples scaled to -1..1.
@@ -230,7 +235,9 @@ impl LagTrack {
 
 /// Pass 1: the lag in every block where the system track is active and the
 /// mic clearly holds its echo. Low-confidence peaks are dropped rather than
-/// trusted, and the median smoothing outvotes a stray confident one.
+/// trusted, and the median smoothing outvotes a stray confident one. Each
+/// block is searched around the median of the last [`LAG_MEDIAN`] confident
+/// lags once there are [`LAG_LOCK`] of them, else around `timeline_lag`.
 fn estimate_lags(
     mic: &Path,
     system: &Path,
@@ -244,20 +251,34 @@ fn estimate_lags(
     let mut system_block = vec![0f32; LAG_BLOCK];
     let mut active = false;
     let mut found = Vec::new();
+    let mut recent = VecDeque::with_capacity(LAG_MEDIAN);
     for block in 0..mic_len.div_ceil(LAG_BLOCK) {
         let start = block * LAG_BLOCK;
+        let search = if recent.len() >= LAG_LOCK {
+            let mut lags: Vec<i64> = recent.iter().copied().collect();
+            lags.sort_unstable();
+            lags[(lags.len() - 1) / 2]
+        } else {
+            timeline_lag
+        };
         mic_stream.read(start as i64, &mut mic_block)?;
-        system_stream.read(start as i64 - timeline_lag, &mut system_block)?;
+        // Moves by at most the window per block, far less than the block, so
+        // the read never steps backwards.
+        system_stream.read(start as i64 - search, &mut system_block)?;
         if mean_square(&system_block) < ACTIVE_POWER {
             continue;
         }
         active = true;
         let (offset, z) = gcc.peak(&mic_block, &system_block)?;
-        let lag = timeline_lag + offset;
+        let lag = search + offset;
         debug!("echo lag block {block}: {lag} samples, peak z {z:.1}");
         if z >= MIN_PEAK_Z {
             let centre = start + LAG_BLOCK.min(mic_len - start) / 2;
             found.push((centre as f64, lag as f64));
+            if recent.len() == LAG_MEDIAN {
+                recent.pop_front();
+            }
+            recent.push_back(lag);
         }
     }
     if !active {
@@ -966,6 +987,10 @@ mod tests {
     /// A USB mic and laptop speakers run on separate clocks: the system
     /// track is resampled by 100 ppm, so the echo slides 288 samples over
     /// three minutes. The lag is followed and the end is still cancelled.
+    /// One lag for the whole call would also clear this bar at 100 ppm, and
+    /// a fixture cannot drift much faster (from about 300 ppm a block's peak
+    /// smears below [`MIN_PEAK_Z`]), so `frames_follow_a_sloped_lag_track`
+    /// pins the per-frame lag instead.
     #[test]
     fn follows_clock_drift() {
         let len = at(180.0);
@@ -975,18 +1000,7 @@ mod tests {
         let far = speech(len, &spans, 0.1, 6);
         let mut mic = echo(&far, 800, 7);
         add_noise(&mut mic, 3e-4, 8);
-        // System sample `v` is the far end at `v * (1 + 1e-4)` on the mic's clock.
-        let system: Vec<f32> = (0..len)
-            .map(|v| {
-                let x = v as f64 * 1.0001;
-                let (i, frac) = (x as usize, (x.fract()) as f32);
-                match (far.get(i), far.get(i + 1)) {
-                    (Some(&a), Some(&b)) => a + (b - a) * frac,
-                    (Some(&a), None) => a,
-                    _ => 0.0,
-                }
-            })
-            .collect();
+        let system = resampled(&far, 1e-4);
         let mic = read_back(&mic);
 
         let (outcome, out) = run(&mic, &system, 0);
@@ -1000,6 +1014,91 @@ mod tests {
         let last = spans[spans.len() - 1];
         let change = change_db(&mic, &out, (last.0 + 0.5, last.1 - 0.5));
         assert!(change <= -12.0, "end of the call: {change:.1} dB");
+    }
+
+    /// `far` as a system track whose clock runs `drift` fast: system sample
+    /// `v` is the far end at `v * (1 + drift)` on the mic's clock.
+    fn resampled(far: &[f32], drift: f64) -> Vec<f32> {
+        (0..far.len())
+            .map(|v| {
+                let x = v as f64 * (1.0 + drift);
+                let (i, frac) = (x as usize, x.fract() as f32);
+                match (far.get(i), far.get(i + 1)) {
+                    (Some(&a), Some(&b)) => a + (b - a) * frac,
+                    (Some(&a), None) => a,
+                    _ => 0.0,
+                }
+            })
+            .collect()
+    }
+
+    /// The offsets put the echo 3900 samples before where it is, near the
+    /// edge of the first search window, and the lag shrinks by 100 ppm, so
+    /// the echo leaves that window after about a minute. The search follows
+    /// the measured lag and finds it to the end of the call.
+    #[test]
+    fn the_lag_search_follows_drift_out_of_the_first_window() {
+        let len = at(180.0);
+        let spans: Vec<(f64, f64)> = (0..22)
+            .map(|i| (1.0 + 8.0 * i as f64, 7.0 + 8.0 * i as f64))
+            .collect();
+        let far = speech(len, &spans, 0.1, 17);
+        let mut mic = echo(&far, 1000, 18);
+        add_noise(&mut mic, 3e-4, 19);
+        let drift = -1e-4;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mic_path, system_path) = (tmp.path().join("mic.wav"), tmp.path().join("system.wav"));
+        write(&mic_path, &mic);
+        write(&system_path, &resampled(&far, drift));
+
+        let lags = estimate_lags(&mic_path, &system_path, 1000 + 3900, len)
+            .unwrap()
+            .unwrap();
+        // Mic sample `u` holds the far end of system sample `u - lag`.
+        let truth = |u: f64| u - (u - 1000.0) / (1.0 + drift);
+        let last = lags.points.last().unwrap().0;
+        assert!(last > at(170.0) as f64, "measured only up to sample {last}");
+        for &(pos, lag) in &lags.points {
+            let want = truth(pos);
+            assert!((lag - want).abs() <= 40.0, "at {pos}: {lag} vs {want:.0}");
+        }
+    }
+
+    /// Each system frame starts where the lag track puts the echo at that
+    /// frame, not at one lag for the whole call.
+    #[test]
+    fn frames_follow_a_sloped_lag_track() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mic, system) = (tmp.path().join("mic.wav"), tmp.path().join("system.wav"));
+        let len = 48_000;
+        write(&mic, &vec![0.0; len]);
+        // Every system sample encodes its own index.
+        let code = |i: i64| (i % 20_000) as f32 / 32768.0;
+        write(&system, &(0..60_000).map(code).collect::<Vec<f32>>());
+        // 500 samples at the start, 5300 at the end: 0.1 per sample.
+        let pair = Pair {
+            mic: &mic,
+            system: &system,
+            mic_len: len,
+            lags: LagTrack {
+                points: vec![(0.0, 500.0), (len as f64, 5300.0)],
+            },
+        };
+        let mut frames = pair.frames().unwrap();
+        let (mut mic_frame, mut system_frame) = ([0f32; FRAME], [0f32; FRAME]);
+        let mut checked = 0;
+        while frames.read_next(&mut mic_frame, &mut system_frame).unwrap() {
+            let start = (frames.next as i64 - 2) * HOP as i64;
+            let centre = (start + FRAME as i64 / 2) as f64;
+            let lag = (500.0 + 0.1 * centre.clamp(0.0, len as f64)).round() as i64;
+            let from = start - lag;
+            if from >= 0 {
+                assert_eq!(system_frame[0], code(from), "frame at {start}");
+                assert_eq!(system_frame[FRAME - 1], code(from + FRAME as i64 - 1));
+                checked += 1;
+            }
+        }
+        assert!(checked > 150, "{checked} frames checked");
     }
 
     /// The far side rarely talks while the user talks almost all the time,
@@ -1101,7 +1200,10 @@ mod tests {
         let (outcome, out) = run(&mic, &system, 0);
         report(&outcome);
         let (mic, out) = (quantize(&mic), quantize(&out.unwrap()));
-        assert_eq!(mic[at(5.8)..at(6.8)], out[at(5.8)..at(6.8)]);
+        assert!(
+            mic[at(5.8)..at(6.8)] == out[at(5.8)..at(6.8)],
+            "user audio changed"
+        );
     }
 
     #[test]
