@@ -240,7 +240,8 @@ impl TranscriptionBackend for OpenAIRestBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcription::test_server::serve_once;
+    use crate::transcription::retry::{retry_transient, RATE_LIMIT_BUDGET};
+    use crate::transcription::test_server::{serve_once, serve_responses};
 
     #[tokio::test]
     async fn transcribe_rejects_empty_audio() {
@@ -382,5 +383,32 @@ mod tests {
         let (headers, data) = request.file_part();
         assert!(headers.contains("filename=\"audio.wav\""), "{headers}");
         assert!(data.starts_with(b"RIFF"));
+    }
+    /// A Cloudflare origin timeout (524) on a meeting chunk is retried like
+    /// a rate limit, with short stand-ins for the server-error waits.
+    #[tokio::test]
+    async fn a_524_is_retried_until_the_chunk_goes_through() {
+        let config = config_for("whisper-1");
+        let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![
+                (524, "error code: 524"),
+                (
+                    200,
+                    r#"{"text": "hi", "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}"#,
+                ),
+            ],
+        ));
+        let quick = [std::time::Duration::from_millis(1); 3];
+        let t = retry_transient(RATE_LIMIT_BUDGET, &quick, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap();
+        assert_eq!(t.segments[0].text, "hi");
+        assert_eq!(server.await.unwrap().len(), 2);
     }
 }

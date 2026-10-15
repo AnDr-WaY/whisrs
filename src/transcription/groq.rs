@@ -391,7 +391,10 @@ pub fn parse_response(body: &str) -> anyhow::Result<GroqTranscriptionResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcription::test_server::serve_once;
+    use crate::transcription::retry::{retry_transient, RateLimitExhausted, RATE_LIMIT_BUDGET};
+    use crate::transcription::test_server::{serve_once, serve_responses};
+    use crate::transcription::RetryableHttpError;
+    use std::time::Duration;
 
     #[test]
     fn groq_sends_the_prompt() {
@@ -570,5 +573,95 @@ mod tests {
         assert!(headers.contains("filename=\"audio.wav\""), "{headers}");
         assert!(headers.contains("Content-Type: audio/wav"), "{headers}");
         assert!(data.starts_with(&wav));
+    }
+
+    /// Short stand-ins for the server-error waits, so these tests talk to a
+    /// real socket without sleeping 50 s.
+    const QUICK: [Duration; 3] = [Duration::from_millis(1); 3];
+    const CLOUDFLARE_524: &str = "error code: 524";
+    const SEGMENTS: &str =
+        r#"{"text": "hi", "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}"#;
+
+    fn meeting_request() -> (Vec<u8>, TranscriptionConfig) {
+        let config = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+        };
+        (encode_wav(&[300i16; 16_000]).unwrap(), config)
+    }
+
+    /// A Cloudflare origin timeout (524) on a meeting chunk is retried, and
+    /// the chunk goes through on the next try.
+    #[tokio::test]
+    async fn a_524_is_retried_until_the_chunk_goes_through() {
+        let (wav, config) = meeting_request();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![(524, CLOUDFLARE_524), (200, SEGMENTS)],
+        ));
+        let t = retry_transient(RATE_LIMIT_BUDGET, &QUICK, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap();
+        assert_eq!(t.segments[0].text, "hi");
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    /// A 524 on every try ends after the bounded retries in the error the
+    /// server gave, as a final error the meeting reports.
+    #[tokio::test]
+    async fn a_lasting_524_gives_up_after_the_bounded_retries() {
+        let (wav, config) = meeting_request();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_responses(listener, vec![(524, CLOUDFLARE_524); 4]));
+        let err = retry_transient(RATE_LIMIT_BUDGET, &QUICK, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap_err();
+        // Bounded, so a client that stops early fails here instead of hanging.
+        let served = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the server waited for four requests")
+            .unwrap();
+        assert_eq!(served.len(), 4, "one try and three retries");
+        let exhausted = err.downcast_ref::<RateLimitExhausted>().unwrap();
+        assert_eq!(exhausted.status, 524);
+        assert!(
+            err.to_string()
+                .ends_with("Groq API error (524): error code: 524"),
+            "{err}"
+        );
+        assert!(err.downcast_ref::<RetryableHttpError>().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_400_is_not_retried() {
+        let (wav, config) = meeting_request();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![(
+                400,
+                r#"{"error": {"message": "could not decode the audio"}}"#,
+            )],
+        ));
+        let err = retry_transient(RATE_LIMIT_BUDGET, &QUICK, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(server.await.unwrap().len(), 1);
+        assert_eq!(
+            err.to_string(),
+            "Groq API error (400): could not decode the audio"
+        );
     }
 }

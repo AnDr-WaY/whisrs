@@ -43,6 +43,25 @@ impl Request {
 /// `body`, and hand back the request so a test can assert on what was
 /// actually put on the wire.
 pub(crate) async fn serve_once(listener: TcpListener, body: &'static str) -> Request {
+    serve_one(&listener, 200, body).await
+}
+
+/// Answer one connection per `(status, body)`, in order, and hand back the
+/// requests: a server that fails before it succeeds, or keeps failing.
+pub(crate) async fn serve_responses(
+    listener: TcpListener,
+    responses: Vec<(u16, &'static str)>,
+) -> Vec<Request> {
+    let mut requests = Vec::new();
+    for (status, body) in responses {
+        requests.push(serve_one(&listener, status, body).await);
+    }
+    requests
+}
+
+/// Read one request and answer it with `status` and `body`, closing the
+/// connection so the client opens a new one for its next request.
+async fn serve_one(listener: &TcpListener, status: u16, body: &str) -> Request {
     let (mut stream, _) = listener.accept().await.unwrap();
 
     let mut buf = Vec::new();
@@ -73,8 +92,10 @@ pub(crate) async fn serve_once(listener: TcpListener, body: &'static str) -> Req
         buf.extend_from_slice(&chunk[..n]);
     }
 
+    let reason = if status == 200 { "OK" } else { "Error" };
     let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await.unwrap();

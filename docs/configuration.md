@@ -641,7 +641,9 @@ failed instead of being resumed again, so dictation keeps working; run
 
 Cloud backends that answer "rate limited" (HTTP 429) or "overloaded" (503) are
 retried with a backoff, honoring the server's `Retry-After`, for up to five
-minutes per chunk. Each finished chunk is saved in the meeting's `.cache/`
+minutes per chunk. A server error (500, 502, 504, or Cloudflare's 520 to 524,
+such as a 524 timeout on a long upload) is retried three times, 5, 15 and 30
+seconds apart. Each finished chunk is saved in the meeting's `.cache/`
 folder, so a retry after a failure only sends what was not transcribed yet.
 The cache is deleted once the transcript is written.
 

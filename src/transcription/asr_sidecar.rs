@@ -280,7 +280,8 @@ impl TranscriptionBackend for AsrSidecarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcription::test_server::serve_once;
+    use crate::transcription::retry::{retry_transient, RATE_LIMIT_BUDGET};
+    use crate::transcription::test_server::{serve_once, serve_responses};
     use tokio::net::TcpListener;
 
     fn test_config() -> TranscriptionConfig {
@@ -541,5 +542,33 @@ mod tests {
         assert_eq!(t.segments.len(), 1);
         assert_eq!(t.segments[0].start_ms, 1000);
         assert!(!backend.no_segments.load(Ordering::Relaxed));
+    }
+    /// A Cloudflare origin timeout (524) on a meeting chunk is retried like
+    /// a rate limit, with short stand-ins for the server-error waits.
+    #[tokio::test]
+    async fn a_524_is_retried_until_the_chunk_goes_through() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![
+                (524, "error code: 524"),
+                (
+                    200,
+                    r#"{"text": "ok", "segments": [{"start": 1.0, "end": 2.0, "text": "ok"}]}"#,
+                ),
+            ],
+        ));
+        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
+        let quick = [std::time::Duration::from_millis(1); 3];
+        let config = test_config();
+        let t = retry_transient(RATE_LIMIT_BUDGET, &quick, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap();
+        assert_eq!(t.segments[0].text, "ok");
+        assert_eq!(server.await.unwrap().len(), 2);
     }
 }

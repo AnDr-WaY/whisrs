@@ -1,7 +1,9 @@
-//! Waiting out rate limits (HTTP 429/503) for long jobs such as meetings.
+//! Waiting out rate limits (HTTP 429/503) and riding out server errors
+//! (500, 502, 504, Cloudflare's 520 to 524) for long jobs such as meetings.
+//! Only meeting requests go through here; dictation does not retry.
 //!
 //! One retry layer per request: [`retry_rate_limited`] retries an operation
-//! that fails with a [`RetryableHttpError`], and when its budget runs out it
+//! that fails with a [`RetryableHttpError`], and when its retries run out it
 //! returns a [`RateLimitExhausted`], which is not retryable. So a caller that
 //! wraps an operation already retried inside (a phrase backend retries each
 //! phrase in [`super::segments_by_phrase`]) gives up at once instead of
@@ -22,8 +24,19 @@ pub const RATE_LIMIT_BUDGET: Duration = Duration::from_secs(300);
 pub const BACKOFF_BASE: Duration = Duration::from_secs(2);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
-/// A request that was still rate limited when its budget ran out. Not a
-/// [`RetryableHttpError`], so an outer retry layer does not retry it again.
+/// The wait before each retry of a server error (500, 502, 504, 520 to 524)
+/// that names no `Retry-After`. Only these few: a server that keeps failing
+/// is not a rate limit about to lift, and all three stay well inside
+/// [`RATE_LIMIT_BUDGET`].
+pub const SERVER_ERROR_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+/// A request that was still failing (rate limited, overloaded, or a server
+/// error) when its retries ran out. Not a [`RetryableHttpError`], so an
+/// outer retry layer does not retry it again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateLimitExhausted {
     pub status: u16,
@@ -58,13 +71,34 @@ pub fn backoff_delay(
     (waited.saturating_add(delay) <= budget).then_some(delay)
 }
 
+/// How long to wait before retry number `retries` (from 0) of a server
+/// error, or `None` to give up: the `schedule` entry, or the server's
+/// `Retry-After` when it sent one, while the schedule lasts and the total
+/// stays within `budget`.
+pub fn server_error_delay(
+    schedule: &[Duration],
+    retries: usize,
+    retry_after: Option<Duration>,
+    waited: Duration,
+    budget: Duration,
+) -> Option<Duration> {
+    let planned = *schedule.get(retries)?;
+    let delay = retry_after.map_or(planned, |d| d.max(Duration::from_millis(500)));
+    (waited.saturating_add(delay) <= budget).then_some(delay)
+}
+
 /// Why a retry gave up, in words.
 fn give_up_message(retryable: &RetryableHttpError, waited: Duration, budget: Duration) -> String {
     let status = retryable.status;
+    let kind = if retryable.is_rate_limit() {
+        "rate limited"
+    } else {
+        "server error"
+    };
     match retryable.retry_after {
         Some(asked) if waited.saturating_add(asked) > budget => {
             let mut message = format!(
-                "rate limited (HTTP {status}); the server asked to wait {} s, more than the \
+                "{kind} (HTTP {status}); the server asked to wait {} s, more than the \
                  {} s budget",
                 asked.as_secs_f64().ceil() as u64,
                 budget.as_secs()
@@ -82,16 +116,33 @@ fn give_up_message(retryable: &RetryableHttpError, waited: Duration, budget: Dur
     }
 }
 
-/// Run `op`, waiting out rate limits within `budget`.
+/// Run `op`, waiting out rate limits within `budget` and retrying a server
+/// error up to [`SERVER_ERROR_BACKOFF`] times.
 ///
 /// Any error that is not a [`RetryableHttpError`] is returned as is. When
-/// the budget runs out the result is a [`RateLimitExhausted`].
-pub async fn retry_rate_limited<T, F, Fut>(budget: Duration, mut op: F) -> anyhow::Result<T>
+/// the retries run out the result is a [`RateLimitExhausted`] ending in the
+/// last error's message.
+pub async fn retry_rate_limited<T, F, Fut>(budget: Duration, op: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    retry_transient(budget, &SERVER_ERROR_BACKOFF, op).await
+}
+
+/// [`retry_rate_limited`] with the server-error waits given, so a test
+/// against a real socket need not sleep through them.
+pub(crate) async fn retry_transient<T, F, Fut>(
+    budget: Duration,
+    server_backoff: &[Duration],
+    mut op: F,
+) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
     let mut attempt = 0u32;
+    let mut server_retries = 0usize;
     let mut waited = Duration::ZERO;
     loop {
         let err = match op().await {
@@ -105,7 +156,18 @@ where
         else {
             return Err(err);
         };
-        match backoff_delay(attempt, retryable.retry_after, waited, budget) {
+        let delay = if retryable.is_rate_limit() {
+            backoff_delay(attempt, retryable.retry_after, waited, budget)
+        } else {
+            server_error_delay(
+                server_backoff,
+                server_retries,
+                retryable.retry_after,
+                waited,
+                budget,
+            )
+        };
+        match delay {
             Some(delay) => {
                 info!(
                     "transcription got HTTP {}; retrying in {:.1} s",
@@ -114,7 +176,11 @@ where
                 );
                 tokio::time::sleep(delay).await;
                 waited += delay;
-                attempt += 1;
+                if retryable.is_rate_limit() {
+                    attempt += 1;
+                } else {
+                    server_retries += 1;
+                }
             }
             None => {
                 return Err(RateLimitExhausted {
@@ -216,6 +282,81 @@ mod tests {
                 && text.ends_with(" s of retries: slow down"),
             "{text}"
         );
+    }
+
+    fn server_error(status: u16) -> anyhow::Error {
+        RetryableHttpError {
+            status,
+            retry_after: None,
+            message: format!("Groq API error ({status}): error code: {status}"),
+        }
+        .into()
+    }
+
+    /// A 524 origin timeout that clears on the second try costs one 5 s wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_passing_server_error_is_retried() {
+        let calls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let value = retry_rate_limited(RATE_LIMIT_BUDGET, || {
+            let call = calls.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if call == 0 {
+                    Err(server_error(524))
+                } else {
+                    Ok("transcript")
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, "transcript");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    /// A server that keeps failing is retried three times, 5, 15 and 30 s
+    /// apart, then given up on with its own message, as a final error.
+    #[tokio::test(start_paused = true)]
+    async fn a_lasting_server_error_gives_up_after_a_few_tries() {
+        for status in [500, 502, 504, 520, 524] {
+            let calls = AtomicUsize::new(0);
+            let started = tokio::time::Instant::now();
+            let err = retry_rate_limited(RATE_LIMIT_BUDGET, || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async move { Err::<(), _>(server_error(status)) }
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls.load(Ordering::Relaxed), 4, "{status}");
+            assert_eq!(started.elapsed(), Duration::from_secs(50), "{status}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "the backend still answered HTTP {status} after 50 s of retries: \
+                     Groq API error ({status}): error code: {status}"
+                )
+            );
+            assert!(err.downcast_ref::<RetryableHttpError>().is_none());
+            assert!(err.downcast_ref::<RateLimitExhausted>().is_some());
+        }
+    }
+
+    #[test]
+    fn server_error_waits_follow_the_schedule_and_the_budget() {
+        let budget = RATE_LIMIT_BUDGET;
+        let at = |retries, retry_after, waited| {
+            server_error_delay(&SERVER_ERROR_BACKOFF, retries, retry_after, waited, budget)
+        };
+        assert_eq!(at(0, None, Duration::ZERO), Some(Duration::from_secs(5)));
+        assert_eq!(at(2, None, Duration::ZERO), Some(Duration::from_secs(30)));
+        assert_eq!(at(3, None, Duration::ZERO), None, "the schedule ran out");
+        // The server's own wait wins while the schedule lasts.
+        assert_eq!(
+            at(1, Some(Duration::from_secs(40)), Duration::ZERO),
+            Some(Duration::from_secs(40))
+        );
+        assert_eq!(at(0, None, Duration::from_secs(297)), None, "budget");
     }
 
     #[tokio::test(start_paused = true)]

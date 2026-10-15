@@ -110,10 +110,12 @@ pub fn meeting_phrase_silence_ms(configured: u64) -> u64 {
     configured.min(MEETING_PHRASE_SILENCE_MAX_MS)
 }
 
-/// A transient HTTP failure worth retrying later: 429 (rate limited) or 503
-/// (overloaded). Cloud backends return it inside their `anyhow::Error` so a
-/// long job such as a meeting can back off and resume, while dictation just
-/// shows the message as before.
+/// A transient HTTP failure worth retrying later: 429 (rate limited), 503
+/// (overloaded), or a server or gateway error (500, 502, 504, and
+/// Cloudflare's 520 to 524, such as a 524 origin timeout on a long upload).
+/// Cloud backends return it inside their `anyhow::Error` so a long job such
+/// as a meeting can back off and resume ([`retry::retry_rate_limited`]),
+/// while dictation, which does not retry, shows the same message as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryableHttpError {
     pub status: u16,
@@ -130,13 +132,23 @@ impl std::fmt::Display for RetryableHttpError {
 
 impl std::error::Error for RetryableHttpError {}
 
-/// Whether an HTTP status is a transient failure ([`RetryableHttpError`]).
-pub fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 429 | 503)
+impl RetryableHttpError {
+    /// Rate limited or overloaded (429, 503): waited out within the budget.
+    /// The other retryable statuses are server errors, retried a few times
+    /// only ([`retry::SERVER_ERROR_BACKOFF`]).
+    pub fn is_rate_limit(&self) -> bool {
+        matches!(self.status, 429 | 503)
+    }
 }
 
-/// An error for a failed request: a [`RetryableHttpError`] for 429/503, a
-/// plain error otherwise. `message` is what the user sees either way.
+/// Whether an HTTP status is a transient failure ([`RetryableHttpError`]).
+pub fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504 | 520..=524)
+}
+
+/// An error for a failed request: a [`RetryableHttpError`] for a transient
+/// status ([`is_retryable_status`]), a plain error otherwise. `message` is
+/// what the user sees either way.
 pub(crate) fn http_error(
     status: u16,
     retry_after: Option<std::time::Duration>,
@@ -435,17 +447,27 @@ mod tests {
     }
 
     #[test]
-    fn only_429_and_503_are_retryable() {
+    fn transient_statuses_are_retryable() {
         let err = http_error(429, None, "rate limited".into());
         assert!(err.downcast_ref::<RetryableHttpError>().is_some());
         assert_eq!(err.to_string(), "rate limited");
-        assert!(http_error(503, None, "x".into())
-            .downcast_ref::<RetryableHttpError>()
-            .is_some());
-        for status in [400, 401, 500] {
-            assert!(http_error(status, None, "x".into())
-                .downcast_ref::<RetryableHttpError>()
-                .is_none());
+        for status in [429, 500, 502, 503, 504, 520, 521, 522, 523, 524] {
+            let err = http_error(status, None, "x".into());
+            let retryable = err.downcast_ref::<RetryableHttpError>();
+            assert!(retryable.is_some(), "{status}");
+            assert_eq!(
+                retryable.unwrap().is_rate_limit(),
+                matches!(status, 429 | 503),
+                "{status}"
+            );
+        }
+        for status in [400, 401, 403, 404, 413, 422, 501, 505, 525, 526] {
+            assert!(
+                http_error(status, None, "x".into())
+                    .downcast_ref::<RetryableHttpError>()
+                    .is_none(),
+                "{status}"
+            );
         }
     }
     use super::*;

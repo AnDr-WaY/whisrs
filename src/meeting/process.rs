@@ -590,7 +590,8 @@ async fn transcribe_track(
 }
 
 /// Transcribe one chunk, waiting out rate limits within
-/// [`RATE_LIMIT_BUDGET`]. Phrase backends retry each phrase inside
+/// [`RATE_LIMIT_BUDGET`] and retrying a server error a few times
+/// ([`retry_rate_limited`]). Phrase backends retry each phrase inside
 /// `transcribe_segments` and give up with a [`RateLimitExhausted`], which
 /// this layer does not retry again, so the two waits never multiply.
 async fn transcribe_with_retry(
