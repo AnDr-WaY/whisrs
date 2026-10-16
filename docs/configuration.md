@@ -565,11 +565,14 @@ using the system audio as the reference. Echoed lines that still get through
 are dropped, but headphones give a cleaner transcript and avoid the occasional
 miss.
 
-**Dictation keeps working.** A meeting records in the background, so
-`whisrs toggle`, command mode and read-aloud work as usual while it runs. The
-tray icon turns into a red outlined bubble with a dot while a meeting records,
-and an amber outlined bubble with three dots while it is transcribed (as long
-as you are not dictating at that moment).
+**Dictation is off while a meeting records.** The microphone is shared with
+the call, so the other people would hear a dictation and the transcript would
+record it as your speech. Until the meeting stops, `whisrs toggle`, command
+mode and `[[llm_commands]]` are refused with a notification saying why. A
+dictation already running when the meeting started finishes normally, and
+read-aloud keeps working. The tray icon turns into a red outlined bubble with
+a dot while a meeting records, and an amber outlined bubble with three dots
+while it is transcribed (as long as you are not dictating at that moment).
 
 **Backends.** A meeting is transcribed from its recording after it ends, so it
 needs a backend that can transcribe a recorded file: groq, openai, deepgram,

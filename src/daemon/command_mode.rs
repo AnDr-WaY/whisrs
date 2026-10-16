@@ -16,6 +16,7 @@ use crate::injection::{
     clear_line_and_inject, inject_text, is_terminal_class, notify_copied_for_held_modifier,
     prepare_llm_injection, Injection, KeystrokeSettings, LlmInjection,
 };
+use crate::meeting::{refuse_while_recording, DictationStart};
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     format_api_error, format_no_microphone_error, save_history_entry, transcribe_batch_audio,
@@ -166,7 +167,11 @@ pub(crate) async fn handle_command_mode(
             }
         }
         State::Idle => {
-            // First press: copy selection and start recording.
+            // First press: copy selection and start recording. A recording
+            // meeting refuses it before the selection is copied.
+            if let Some(refused) = refuse_while_recording(&context, DictationStart::CommandMode) {
+                return refused;
+            }
             command_mode_start(daemon_state, context).await
         }
         State::Transcribing => Response::Error {
@@ -586,7 +591,16 @@ pub(crate) async fn handle_llm_command(
                 .find(|e| e.name == name)
                 .cloned();
             match entry {
-                Some(entry) => llm_command_start(daemon_state, context, entry).await,
+                // After the lookup, so a misspelled name still gets the
+                // config error rather than the meeting's.
+                Some(entry) => {
+                    if let Some(refused) =
+                        refuse_while_recording(&context, DictationStart::LlmCommand(&name))
+                    {
+                        return refused;
+                    }
+                    llm_command_start(daemon_state, context, entry).await
+                }
                 None => Response::Error {
                     message: format!("no llm_commands entry named '{name}' — check config.toml"),
                 },

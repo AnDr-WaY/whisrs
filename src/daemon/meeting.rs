@@ -2,10 +2,11 @@
 //! crash recovery and graceful shutdown.
 //!
 //! A meeting lives entirely outside the dictation state machine and its
-//! lock: dictation keeps working while a meeting records, and a long
-//! transcription runs on its own task so IPC never waits for it. Status goes
-//! out on a separate watch channel that only the tray reads, so a meeting
-//! never animates the overlay or fires recording hooks.
+//! lock, and a long transcription runs on its own task so IPC never waits
+//! for it. While a meeting records, dictation and voice commands refuse to
+//! start ([`refuse_while_recording`]); one already recording finishes as
+//! usual. Status goes out on a separate watch channel that only the tray
+//! reads, so a meeting never animates the overlay or fires recording hooks.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -81,6 +82,48 @@ const NOT_TRANSCRIBED: &str = "meeting stopped but not transcribed";
 /// hotkey and tray dispatcher does not toast it a second time.
 pub(crate) fn error_already_notified(message: &str) -> bool {
     message.starts_with(NOT_TRANSCRIBED)
+}
+
+/// A start that opens the mic to type what the user says, which a recording
+/// meeting refuses.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DictationStart<'a> {
+    /// `toggle`: the CLI, its hotkey, or a tray left-click.
+    Dictation,
+    /// `command`.
+    CommandMode,
+    /// A named `[[llm_commands]]` entry.
+    LlmCommand(&'a str),
+}
+
+/// Refuse `start` while a meeting records, returning the error to send back.
+///
+/// The mic is shared with the call: the others would hear the dictation, and
+/// the meeting transcript would record it as the user's speech. Only starts
+/// are refused: a session already recording when the meeting started keeps
+/// its own capture and stops, cancels and types as usual.
+///
+/// Notified like any other failure (`notify_error`), since a hotkey or tray
+/// press shows nobody the response and no overlay appears for a start that
+/// did not happen.
+pub(crate) fn refuse_while_recording(
+    context: &DaemonContext,
+    start: DictationStart<'_>,
+) -> Option<Response> {
+    if !context.meeting.is_recording() {
+        return None;
+    }
+    let (what, subject) = match start {
+        DictationStart::Dictation => ("dictation".to_string(), "Dictation".to_string()),
+        DictationStart::CommandMode => ("command mode".to_string(), "Command mode".to_string()),
+        DictationStart::LlmCommand(name) => (format!("llm-command '{name}'"), format!("'{name}'")),
+    };
+    info!("{what} not started: a meeting is recording");
+    let message = format!("A meeting is recording. {subject} is off until you stop it.");
+    if context.notify_error() {
+        send_notification("whisrs", &message);
+    }
+    Some(error_response(message))
 }
 
 /// A meeting that is recording, processing or queued, as shown in status.
@@ -281,6 +324,18 @@ impl MeetingRuntime {
         self.view.lock().unwrap_or_else(|e| e.into_inner()).status()
     }
 
+    /// Whether a meeting is recording. Reads the view, never the session
+    /// lock, so it answers at once while a start or stop holds that lock for
+    /// seconds opening or closing devices. A start counts once its devices
+    /// are open, a stop until its tracks are finalized.
+    pub(crate) fn is_recording(&self) -> bool {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recording
+            .is_some()
+    }
+
     /// Change the view and broadcast the new status. `send_replace` updates
     /// the value even with no receiver (tray disabled), so `status` stays
     /// truthful.
@@ -291,6 +346,18 @@ impl MeetingRuntime {
             view.status()
         };
         self.status_tx.send_replace(status);
+    }
+
+    /// Take meeting `id` off the view as recording, unless another meeting
+    /// is shown by now: a stop finalizes its tracks (up to 15 s) after
+    /// releasing the session lock, so a meeting may start meanwhile, and an
+    /// unconditional clear would show it, and refuse dictation, as idle.
+    fn clear_recording(&self, id: &str) {
+        self.update(|v| {
+            if v.recording.as_ref().is_some_and(|r| r.id == id) {
+                v.recording = None;
+            }
+        });
     }
 
     /// Queue a meeting for processing, refusing one that is already queued
@@ -603,8 +670,12 @@ async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()
         timer: Some(timer),
         stopping,
     });
-    drop(slot);
+    // Shown before the session lock is released, so a stop that takes this
+    // meeting right after cannot have its clear overwritten by this. When
+    // both are held, the session lock is taken first; the view lock is never
+    // held across an await.
     context.meeting.update(|v| v.recording = Some(active));
+    drop(slot);
 
     notify(context, "Meeting recording started");
     if let Some(e) = system_error {
@@ -808,7 +879,7 @@ async fn stop(
         meta.status = MeetingState::Failed;
         meta.error = Some(message.clone());
         let written = store::write_meta(&dir, &meta);
-        context.meeting.update(|v| v.recording = None);
+        context.meeting.clear_recording(&meta.id);
         written?;
         error!("meeting {}: {message}", meta.id);
         // Notified here for every caller (CLI, hotkey, tray, time limit);
@@ -822,7 +893,7 @@ async fn stop(
     }
     let written = store::write_meta(&dir, &meta);
     let active = ActiveMeeting::from_meta(&dir, &meta);
-    context.meeting.update(|v| v.recording = None);
+    context.meeting.clear_recording(&meta.id);
     written?;
     info!("meeting {} stopped ({reason:?})", meta.id);
 
@@ -853,7 +924,7 @@ async fn cancel(context: &Arc<DaemonContext>) -> Result<()> {
     }
     drop(finish_tracks(session.tracks, &session.stopping, STOP_TIMEOUT, STOP_GRACE).await);
     remove_meeting_dir(&session.dir).await;
-    context.meeting.update(|v| v.recording = None);
+    context.meeting.clear_recording(&session.meta.id);
     info!("meeting {} cancelled and deleted", session.meta.id);
     notify(context, "Meeting recording cancelled and deleted");
     Ok(())
@@ -1271,7 +1342,7 @@ pub(crate) async fn shutdown(context: &DaemonContext) {
         ),
         Err(e) => error!("failed to save meeting {} at shutdown: {e:#}", meta.id),
     }
-    context.meeting.update(|v| v.recording = None);
+    context.meeting.clear_recording(&meta.id);
 }
 
 /// Abort the processing worker, so an interrupted transcription is resumed
@@ -1373,8 +1444,12 @@ async fn abandon_start(runtime: &MeetingRuntime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command_mode::{handle_command_mode, handle_llm_command};
+    use crate::context::{CommandModeContext, DaemonState, LlmCommandContext};
+    use crate::dictation::{handle_cancel, handle_toggle};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use whisrs::meeting::Segment;
+    use whisrs::state::Action;
     use whisrs::transcription::{Transcript, TranscriptionBackend, TranscriptionConfig};
     use whisrs::State;
 
@@ -1562,8 +1637,17 @@ mod tests {
         root: &Path,
         backend: Arc<dyn TranscriptionBackend>,
     ) -> (Arc<DaemonContext>, mpsc::UnboundedReceiver<QueuedMeeting>) {
+        test_context_with(root, backend, "")
+    }
+
+    /// [`test_context`] with `extra` appended to its config.
+    fn test_context_with(
+        root: &Path,
+        backend: Arc<dyn TranscriptionBackend>,
+        extra: &str,
+    ) -> (Arc<DaemonContext>, mpsc::UnboundedReceiver<QueuedMeeting>) {
         let config: Config = toml::from_str(&format!(
-            "[general]\nbackend = \"groq\"\n[meeting]\nuser_name = \"Tester\"\ndir = \"{}\"\n",
+            "[general]\nbackend = \"groq\"\n[meeting]\nuser_name = \"Tester\"\ndir = \"{}\"\n{extra}",
             root.display()
         ))
         .unwrap();
@@ -2136,5 +2220,396 @@ mod tests {
         }
         assert!(with_audio.exists());
         assert!(context.meeting.starting.lock().unwrap().is_none());
+    }
+
+    /// One `[[llm_commands]]` entry, for the dictation refusal tests.
+    const GERMAN: &str = "[[llm_commands]]\nname = \"german\"\n\
+                          hotkey = \"Super+Shift+G\"\ninstruction = \"Translate to German.\"\n";
+
+    fn idle_dictation() -> Arc<tokio::sync::Mutex<DaemonState>> {
+        Arc::new(tokio::sync::Mutex::new(DaemonState::new()))
+    }
+
+    fn assert_refused(response: &Response, subject: &str) {
+        let Response::Error { message } = response else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert_eq!(
+            message,
+            &format!("A meeting is recording. {subject} is off until you stop it.")
+        );
+    }
+
+    /// A toggle from idle while a meeting records is refused before it
+    /// opens the mic or moves the state machine. It carries a bad `-l`, the
+    /// next check after the refusal, so a broken refusal fails here on the
+    /// language error instead of opening the host's mic.
+    #[tokio::test]
+    async fn dictation_is_refused_while_a_meeting_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context(tmp.path(), working_backend());
+        context
+            .meeting
+            .update(|v| v.recording = Some(active("rec")));
+        let ds = idle_dictation();
+
+        let response = handle_toggle(
+            Arc::clone(&ds),
+            Arc::clone(&context),
+            Some("english".into()),
+        )
+        .await;
+        assert_refused(&response, "Dictation");
+        let ds = ds.lock().await;
+        assert_eq!(ds.state_machine.state(), State::Idle);
+        assert!(ds.audio_capture.is_none(), "no capture is opened");
+        assert!(ds.recording_started_at.is_none());
+        assert!(ds.session_language.is_none());
+    }
+
+    /// The refusal for every mode: an error naming the mode while a meeting
+    /// records, nothing while it is idle or being transcribed. Command mode
+    /// and llm-command are tested here and by source order below, not
+    /// through their handlers: with no seam before the selection and the
+    /// mic, a broken refusal would copy the host's selection (sending Ctrl+C
+    /// when it is empty) and open its mic.
+    #[test]
+    fn the_refusal_names_each_mode_and_fires_only_while_recording() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context(tmp.path(), working_backend());
+        let modes = [
+            (DictationStart::Dictation, "Dictation"),
+            (DictationStart::CommandMode, "Command mode"),
+            (DictationStart::LlmCommand("german"), "'german'"),
+        ];
+
+        for (start, _) in modes {
+            assert!(
+                refuse_while_recording(&context, start).is_none(),
+                "{start:?}"
+            );
+        }
+        context
+            .meeting
+            .update(|v| v.recording = Some(active("rec")));
+        for (start, subject) in modes {
+            let response = refuse_while_recording(&context, start)
+                .unwrap_or_else(|| panic!("{start:?} was not refused"));
+            assert_refused(&response, subject);
+        }
+        context.meeting.update(|v| {
+            v.recording = None;
+            v.processing = Some(active("rec"));
+        });
+        for (start, _) in modes {
+            assert!(
+                refuse_while_recording(&context, start).is_none(),
+                "{start:?}"
+            );
+        }
+    }
+
+    /// The llm-command refusal comes after the entry lookup, so a misspelled
+    /// name keeps its config error during a meeting. An unknown name never
+    /// reaches a device, so the handler is safe to call here.
+    #[tokio::test]
+    async fn an_unknown_llm_command_keeps_its_config_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context_with(tmp.path(), working_backend(), GERMAN);
+        context
+            .meeting
+            .update(|v| v.recording = Some(active("rec")));
+        let ds = idle_dictation();
+
+        let response =
+            handle_llm_command(Arc::clone(&ds), Arc::clone(&context), "nope".into()).await;
+        assert!(
+            matches!(&response, Response::Error { message } if message.contains("no llm_commands entry")),
+            "{response:?}"
+        );
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+    }
+
+    /// Calls a refused start must not reach: the mic, the start cue, the
+    /// selection (whose capture may send Ctrl+C), the focused window, and
+    /// the two start fns that make those calls.
+    const DEVICE_CALLS: &[&str] = &[
+        "AudioCaptureHandle::",
+        "feedback::play_start(",
+        "capture_selection(",
+        "acquire_selected_text(",
+        "get_focused_window(",
+        "command_mode_start(",
+        "llm_command_start(",
+    ];
+
+    /// `source` before its test module, without comment lines, so neither
+    /// prose nor the strings in a test can match.
+    fn production_code(source: &str) -> String {
+        source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production half")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The top-level fn starting at `signature`, up to its closing brace.
+    fn fn_body<'a>(code: &'a str, signature: &str) -> &'a str {
+        let start = code
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let rest = &code[start..];
+        &rest[..rest.find("\n}").expect("the fn ends")]
+    }
+
+    /// Each start handler calls `refuse_while_recording` before anything in
+    /// [`DEVICE_CALLS`]. This pins command mode and llm-command, whose
+    /// handlers no test may run with a broken refusal; toggle is pinned too.
+    /// The two start fns are private and called once each, from their
+    /// handler, so nothing reaches them around the refusal.
+    #[test]
+    fn every_start_is_refused_before_it_touches_a_device() {
+        let dictation = production_code(include_str!("dictation.rs"));
+        let command_mode = production_code(include_str!("command_mode.rs"));
+        let cases = [
+            (&dictation, "fn handle_toggle(", "DictationStart::Dictation"),
+            (
+                &command_mode,
+                "fn handle_command_mode(",
+                "DictationStart::CommandMode",
+            ),
+            (
+                &command_mode,
+                "fn handle_llm_command(",
+                "DictationStart::LlmCommand(",
+            ),
+        ];
+        for (code, signature, mode) in cases {
+            let body = fn_body(code, signature);
+            let refusal = body
+                .find(&format!("refuse_while_recording(&context, {mode}"))
+                .unwrap_or_else(|| panic!("{signature} does not refuse {mode}"));
+            for call in DEVICE_CALLS {
+                assert!(
+                    !body[..refusal].contains(call),
+                    "{signature} reaches {call} before the meeting refusal"
+                );
+            }
+            assert!(
+                DEVICE_CALLS
+                    .iter()
+                    .any(|call| body[refusal..].contains(call)),
+                "{signature}: the start path after the refusal was not found"
+            );
+        }
+        for start_fn in ["command_mode_start(", "llm_command_start("] {
+            assert_eq!(
+                command_mode.matches(start_fn).count(),
+                2,
+                "{start_fn} must be defined once and called once, by its handler"
+            );
+            assert!(command_mode.contains(&format!("async fn {start_fn}")));
+        }
+    }
+
+    /// Only starts are refused. A dictation recording when the meeting
+    /// started stops and goes on to transcription: with no device in the
+    /// test it has no capture, so the batch path fails to collect audio and
+    /// returns to idle. Command-mode and llm-command sessions still stop on
+    /// their second press and cancel.
+    #[tokio::test]
+    async fn a_session_started_before_the_meeting_still_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context_with(tmp.path(), working_backend(), GERMAN);
+        let ds = idle_dictation();
+        ds.lock()
+            .await
+            .state_machine
+            .transition(Action::Toggle)
+            .unwrap();
+        context
+            .meeting
+            .update(|v| v.recording = Some(active("rec")));
+
+        let response = handle_toggle(Arc::clone(&ds), Arc::clone(&context), None).await;
+        assert!(
+            matches!(response, Response::Ok { state: State::Idle }),
+            "{response:?}"
+        );
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+
+        {
+            let mut ds = ds.lock().await;
+            ds.state_machine.transition(Action::Toggle).unwrap();
+            ds.command_mode = Some(CommandModeContext {
+                selected_text: "selected".into(),
+                llm_config: Default::default(),
+            });
+        }
+        let response = handle_command_mode(Arc::clone(&ds), Arc::clone(&context)).await;
+        assert!(
+            matches!(
+                response,
+                Response::Ok {
+                    state: State::Recording
+                }
+            ),
+            "{response:?}"
+        );
+        let response = handle_cancel(Arc::clone(&ds), Arc::clone(&context)).await;
+        assert!(
+            matches!(response, Response::Ok { state: State::Idle }),
+            "{response:?}"
+        );
+
+        {
+            let mut ds = ds.lock().await;
+            ds.state_machine.transition(Action::Toggle).unwrap();
+            ds.llm_command = Some(LlmCommandContext {
+                name: "german".into(),
+                instruction: "Translate to German.".into(),
+                llm_config: Default::default(),
+            });
+        }
+        let response =
+            handle_llm_command(Arc::clone(&ds), Arc::clone(&context), "german".into()).await;
+        assert!(
+            matches!(
+                response,
+                Response::Ok {
+                    state: State::Recording
+                }
+            ),
+            "{response:?}"
+        );
+        let response = handle_cancel(Arc::clone(&ds), Arc::clone(&context)).await;
+        assert!(
+            matches!(response, Response::Ok { state: State::Idle }),
+            "{response:?}"
+        );
+        assert!(context.meeting.is_recording(), "the meeting is untouched");
+    }
+
+    /// Only a recording meeting refuses: one being transcribed or queued
+    /// does not. The start carries a bad `-l`, so it fails at the language
+    /// check right after the refusal, before any device opens; that error,
+    /// not the meeting's, shows the start got past the refusal.
+    #[tokio::test]
+    async fn a_meeting_being_transcribed_does_not_block_dictation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context(tmp.path(), working_backend());
+        let ds = idle_dictation();
+
+        context
+            .meeting
+            .update(|v| v.processing = Some(active("proc")));
+        assert_start_reaches_the_language_check(&ds, &context).await;
+
+        context.meeting.update(|v| {
+            v.processing = None;
+            v.queued = vec![active("next")];
+        });
+        assert_start_reaches_the_language_check(&ds, &context).await;
+    }
+
+    async fn assert_start_reaches_the_language_check(
+        ds: &Arc<tokio::sync::Mutex<DaemonState>>,
+        context: &Arc<DaemonContext>,
+    ) {
+        assert_eq!(context.meeting.status().phase, MeetingPhase::Processing);
+        let response =
+            handle_toggle(Arc::clone(ds), Arc::clone(context), Some("english".into())).await;
+        let Response::Error { message } = &response else {
+            panic!("expected the language error, got {response:?}");
+        };
+        assert!(
+            message.starts_with("invalid language 'english'"),
+            "{message}"
+        );
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+    }
+
+    /// A recording session with its folder and meta on disk and a mic track
+    /// fed by the returned sender instead of a device: its writer finishes
+    /// only once the sender is dropped, like a slow device at a stop.
+    fn fed_session(
+        root: &Path,
+        title: &str,
+    ) -> (
+        MeetingSession,
+        mpsc::UnboundedSender<whisrs::audio::AudioChunk>,
+    ) {
+        let (id, dir) = store::create(root, Local::now(), Some(title)).unwrap();
+        let mut meta = MeetingMeta::new(id, Some(title.into()), Local::now());
+        meta.tracks = vec![track_meta(TrackKind::Mic, "default".into())];
+        store::write_meta(&dir, &meta).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = spawn_track_writer(rx, store::audio_path(&dir, TrackKind::Mic), FLUSH_EVERY);
+        let session = MeetingSession {
+            dir,
+            meta,
+            started: Instant::now(),
+            tracks: vec![TrackCapture::new(TrackKind::Mic, None, writer)],
+            timer: None,
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+        (session, tx)
+    }
+
+    /// Install `session` the way `start` does once its devices are open.
+    async fn show_recording(context: &DaemonContext, session: MeetingSession) {
+        let mut slot = context.meeting.session.lock().await;
+        let active = ActiveMeeting::from_meta(&session.dir, &session.meta);
+        *slot = Some(session);
+        context.meeting.update(|v| v.recording = Some(active));
+    }
+
+    /// A stop finalizes its tracks after releasing the session lock, so the
+    /// next meeting can start meanwhile. The first stop's late clear must
+    /// leave that meeting shown as recording, and dictation refused.
+    #[tokio::test]
+    async fn a_slow_stop_does_not_hide_the_next_meeting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = test_context(tmp.path(), working_backend());
+        let (first, first_tx) = fed_session(tmp.path(), "first");
+        let first_id = first.meta.id.clone();
+        show_recording(&context, first).await;
+
+        let stopping = tokio::spawn({
+            let context = Arc::clone(&context);
+            async move { stop(&context, None, EndReason::Stopped).await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let taken = context.meeting.session.lock().await.is_none();
+            if taken {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the stop never took the session");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The next meeting starts while the first one's track is finalizing.
+        let (next, next_tx) = fed_session(tmp.path(), "next");
+        let next_id = next.meta.id.clone();
+        show_recording(&context, next).await;
+        drop(first_tx);
+        stopping.await.unwrap().unwrap();
+
+        assert_eq!(queue.try_recv().unwrap().meeting.id, first_id);
+        assert!(context.meeting.is_recording(), "the next meeting is hidden");
+        assert_eq!(
+            context.meeting.status().id.as_deref(),
+            Some(next_id.as_str())
+        );
+        assert!(refuse_while_recording(&context, DictationStart::Dictation).is_some());
+
+        // Its own stop still clears it.
+        drop(next_tx);
+        stop(&context, None, EndReason::Stopped).await.unwrap();
+        assert!(!context.meeting.is_recording());
     }
 }

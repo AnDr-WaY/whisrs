@@ -201,9 +201,9 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn title(&self) -> String {
-        // A meeting only takes over the title while dictation is idle:
-        // dictating during a meeting is normal and its state matters more
-        // in the moment.
+        // A meeting only takes over the title while dictation is idle: a
+        // dictation started before the meeting, or while it is transcribed,
+        // matters more in the moment.
         match (self.state.current, self.state.meeting.phase) {
             (State::Idle, MeetingPhase::Recording) => "whisrs: meeting recording".to_string(),
             (State::Idle, MeetingPhase::Processing) => "whisrs: processing meeting".to_string(),
@@ -218,9 +218,9 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        // A meeting only takes over the icon while dictation is idle:
-        // dictating during a meeting is normal and its state matters more in
-        // the moment.
+        // A meeting only takes over the icon while dictation is idle: a
+        // dictation started before the meeting, or while it is transcribed,
+        // matters more in the moment.
         let set = match (self.state.current, self.state.meeting.phase) {
             (State::Idle, MeetingPhase::Recording) => IconSet::MeetingRecording,
             (State::Idle, MeetingPhase::Processing) => IconSet::MeetingProcessing,
