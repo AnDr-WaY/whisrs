@@ -109,6 +109,12 @@ enum MeetingCmd {
     },
     /// Stop recording and queue the meeting for transcription
     Stop,
+    /// Start a meeting, or stop the one recording (bind this to a hotkey)
+    Toggle {
+        /// Meeting title when this starts a meeting
+        #[arg(short, long)]
+        title: Option<String>,
+    },
     /// Stop recording and delete the meeting
     Cancel,
     /// Show whether a meeting is recording or processing
@@ -396,6 +402,7 @@ async fn cmd_meeting(cmd: MeetingCmd) -> anyhow::Result<()> {
     let (action, title, id) = match cmd {
         MeetingCmd::Start { title } => (MeetingAction::Start, title, None),
         MeetingCmd::Stop => (MeetingAction::Stop, None, None),
+        MeetingCmd::Toggle { title } => (MeetingAction::Toggle, title, None),
         MeetingCmd::Cancel => (MeetingAction::Cancel, None, None),
         MeetingCmd::Status => (MeetingAction::Status, None, None),
         MeetingCmd::Copy { id } => (MeetingAction::Copy, None, Some(id)),
@@ -686,6 +693,18 @@ mod tests {
                 MeetingCmd::Start { title } => assert_eq!(title.as_deref(), Some("Weekly sync")),
                 _ => panic!("expected start"),
             }
+        }
+    }
+
+    #[test]
+    fn meeting_toggle_parses_title() {
+        assert!(matches!(
+            parse_meeting(&["toggle"]),
+            MeetingCmd::Toggle { title: None }
+        ));
+        match parse_meeting(&["toggle", "-t", "Weekly sync"]) {
+            MeetingCmd::Toggle { title } => assert_eq!(title.as_deref(), Some("Weekly sync")),
+            _ => panic!("expected toggle"),
         }
     }
 

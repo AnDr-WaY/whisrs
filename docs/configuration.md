@@ -550,8 +550,8 @@ PulseAudio/PipeWire sources are checked first, then ALSA names. A name that matc
 `whisrs meeting start [--title ...]` (or the `[hotkeys] meeting` binding, or
 "Start meeting" in the tray menu) records a meeting; `whisrs meeting stop` ends
 it and queues the transcript. `whisrs meeting cancel` stops and deletes it. The
-`meeting` hotkey toggles: it starts a meeting when none is recording and stops
-the one that is.
+`meeting` hotkey and `whisrs meeting toggle` (for a compositor binding) start a
+meeting when none is recording and stop the one that is.
 
 **Two tracks.** Your microphone and the system audio (what your speakers or
 headphones play) are recorded as separate files and transcribed separately.

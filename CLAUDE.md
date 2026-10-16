@@ -38,7 +38,7 @@ whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
 whisrs config    # interactive config editor
-whisrs meeting start [-t TITLE] | stop | cancel | status   # record a meeting (mic + system audio)
+whisrs meeting start [-t TITLE] | stop | toggle | cancel | status   # record a meeting (mic + system audio)
 whisrs meeting list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id>
 
 # Dev loop: rebuild this checkout and restart the daemon

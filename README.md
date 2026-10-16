@@ -237,7 +237,7 @@ whisrs command   # Command mode: select text + speak instruction → LLM rewrite
 whisrs llm-command <name>      # Toggle a named [[llm_commands]] entry (see config.toml)
 whisrs llm-command-set <name>  # Reprogram a named LLM command from the current selection
 whisrs speak     # Read the selected text aloud (alias: whisrs read; press again to stop)
-whisrs meeting start -t "Standup"   # Record a meeting (mic + system audio); stop | cancel | status
+whisrs meeting start -t "Standup"   # Record a meeting (mic + system audio); stop | toggle | cancel | status
 whisrs meeting show last            # Print the latest meeting transcript (list | path | copy | retry)
 whisrs log       # Show recent transcription history
 whisrs log -n 5  # Show last 5 entries
