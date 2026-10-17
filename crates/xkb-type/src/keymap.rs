@@ -309,6 +309,11 @@ impl XkbKeymap {
     pub fn lookup(&self, ch: char) -> Option<&KeyMapping> {
         self.map.get(&ch)
     }
+    /// Every character the keymap can type, with how to type it.
+    #[cfg(feature = "xtest")]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (char, &KeyMapping)> {
+        self.map.iter().map(|(ch, m)| (*ch, m))
+    }
     pub fn level3_keycode(&self) -> u16 {
         self.level3_keycode
     }

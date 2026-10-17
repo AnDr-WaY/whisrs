@@ -1031,8 +1031,12 @@ fn new_uinput_keyboard(
 ///
 /// `Auto` prefers the layout-independent Wayland virtual keyboard when a
 /// Wayland session is detected, falling back to uinput when the compositor
-/// lacks `zwp_virtual_keyboard_v1`. `prewarm` only affects the uinput path
-/// (the Wayland backend ships its own keymap, so no settle delay is needed).
+/// lacks `zwp_virtual_keyboard_v1`. Without Wayland but with `DISPLAY` set it
+/// uses XTEST, so a fast burst cannot overflow the kernel's evdev queue on
+/// the way to the X server, falling back to uinput when XTEST is unavailable,
+/// the server is Xwayland, or its XTEST keyboard has a different layout.
+/// `prewarm` only affects the uinput path (the Wayland backend ships its own
+/// keymap and XTEST creates no device, so no settle delay is needed).
 fn new_keyboard(
     key_delay: std::time::Duration,
     prewarm: bool,
@@ -1043,6 +1047,11 @@ fn new_keyboard(
         InjectorBackend::WaylandVk => {
             let kb = xkb_type::wayland_vk::WaylandVkKeyboard::new(key_delay)?;
             info!("using wayland virtual-keyboard injection backend");
+            Ok(Box::new(kb))
+        }
+        InjectorBackend::Xtest => {
+            let kb = xkb_type::Keyboard::new_xtest(key_delay)?;
+            info!("using X11 XTEST injection backend");
             Ok(Box::new(kb))
         }
         InjectorBackend::Auto => {
@@ -1056,6 +1065,16 @@ fn new_keyboard(
                         warn!(
                             "wayland virtual-keyboard unavailable, falling back to uinput: {e:#}"
                         );
+                    }
+                }
+            } else if std::env::var_os("DISPLAY").is_some() {
+                match xkb_type::Keyboard::new_xtest(key_delay) {
+                    Ok(kb) => {
+                        info!("using X11 XTEST injection backend");
+                        return Ok(Box::new(kb));
+                    }
+                    Err(e) => {
+                        warn!("X11 XTEST unavailable, falling back to uinput: {e:#}");
                     }
                 }
             }

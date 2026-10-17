@@ -100,10 +100,17 @@ position = "bottom-center"
 device = "default"         # input device; see "Choosing the microphone" below
 
 [input]
-# Inter-key delay for the virtual keyboard (uinput). Raise this if a TUI
+# Inter-key delay for the virtual keyboard. Raise this if a TUI
 # drops characters while whisrs is typing — e.g. Node/Ink-based apps like
-# Claude Code in raw mode. Default: 2.
+# Claude Code in raw mode. The uinput backend treats 0 as 1 (with no delay
+# the kernel's input queue overflows and the end of the text is lost); XTEST
+# honours 0. Default: 2.
 key_delay_ms = 2
+# Keyboard-injection backend: auto | uinput | wayland-vk | xtest.
+# auto uses the Wayland virtual keyboard on Wayland and XTEST on X11 (skipped
+# on Xwayland or when the X server's XTEST keyboard has a different layout),
+# falling back to uinput. Default: auto.
+backend = "auto"
 # How long to wait, in milliseconds, for physically held modifier keys (Super,
 # Alt, Ctrl, Shift) to be released before whisrs sends a keystroke with a
 # batch backend (groq, openai, deepgram, local-whisper, asr-sidecar) or in
