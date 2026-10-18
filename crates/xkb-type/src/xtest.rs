@@ -15,10 +15,10 @@ use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{ConnectionExt as _, Window, KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
 use x11rb::protocol::xtest::{self, ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
-use xkbcommon::xkb::keysyms::KEY_ISO_Level3_Shift;
+use xkbcommon::xkb::keysyms::{KEY_Control_L, KEY_ISO_Level3_Shift, KEY_Shift_L};
 
 use crate::keymap::Group1Keysyms;
-use crate::{KeyTap, XkbKeymap};
+use crate::{Key, KeyMapping, KeyTap, XkbKeymap};
 
 /// Offset from an evdev keycode to the X11 keycode of the server's evdev
 /// keymap.
@@ -53,32 +53,93 @@ fn group1_keysyms(first_keycode: u8, maps: &[xkb::KeySymMap]) -> Group1Keysyms {
     Group1Keysyms(levels)
 }
 
-/// Characters `keymap` would type differently on the `server` keyboard:
-/// a key it presses for them (a dead key and the key after it included)
-/// gives a different keysym at that level than in `keymap`'s group 1, or
-/// the character needs AltGr and `keymap`'s level 3 key is not
-/// `ISO_Level3_Shift` there.
+/// The modifiers [`Keyboard`](crate::Keyboard) presses by keycode, with the
+/// keysym each must give: Shift for shifted characters and the terminal
+/// paste (Ctrl+Shift+V), Ctrl for the paste batch's Ctrl+V and
+/// `send_combo` shortcuts.
+const MODIFIERS: [(Key, u32, &str); 2] = [
+    (Key::KEY_LEFTSHIFT, KEY_Shift_L, "Shift_L"),
+    (Key::KEY_LEFTCTRL, KEY_Control_L, "Control_L"),
+];
+
+/// What [`layout_mismatches`] found typing differently on the server.
+#[derive(Debug, Default)]
+struct Mismatches {
+    /// Modifier keys the sink presses, by the keysym they should give.
+    modifiers: Vec<&'static str>,
+    /// Characters with a key that gives another keysym.
+    chars: Vec<char>,
+}
+
+impl Mismatches {
+    fn is_empty(&self) -> bool {
+        self.modifiers.is_empty() && self.chars.is_empty()
+    }
+
+    /// Up to 12 of them, modifiers first: `[Control_L, 'y', 'z']`.
+    fn sample(&self) -> String {
+        let mut chars = self.chars.clone();
+        chars.sort_unstable();
+        let items: Vec<String> = self
+            .modifiers
+            .iter()
+            .map(|name| name.to_string())
+            .chain(chars.iter().map(|ch| format!("{ch:?}")))
+            .take(12)
+            .collect();
+        format!("[{}]", items.join(", "))
+    }
+}
+
+/// Every key `mapping` presses: the main one and the one after a dead key.
+fn taps(mapping: &KeyMapping) -> impl Iterator<Item = &KeyTap> {
+    std::iter::once(&mapping.main).chain(&mapping.follow)
+}
+
+/// What `keymap` would type differently on the `server` keyboard:
+/// a modifier the sink presses is not that modifier there (`ctrl:swapcaps`
+/// makes Ctrl+V a Caps Lock), or a key pressed for a character (a dead key
+/// and the key after it included) gives a different keysym at that level
+/// than in `keymap`'s group 1.
+///
+/// Control characters other than `\t`, `\n` and `\r` are not compared:
+/// whisrs strips them from dictated text, and options like
+/// `caps:swapescape` move Escape without changing what it types.
 ///
 /// Group 1 against group 1 keeps a second layout group (`us,ru`) from
 /// failing a `us` XTEST keyboard: its characters are pressed with group 1
 /// keys, so both keyboards give the same group 1 keysym for them.
-fn layout_mismatches(server: &Group1Keysyms, keymap: &XkbKeymap) -> Vec<char> {
-    let level3 = KeyTap {
-        keycode: keymap.level3_keycode(),
+fn layout_mismatches(server: &Group1Keysyms, keymap: &XkbKeymap) -> Mismatches {
+    let base = |keycode| KeyTap {
+        keycode,
         shift: false,
         altgr: false,
     };
-    let level3_ok = same_symbol(server.keysym(&level3), KEY_ISO_Level3_Shift);
-    keymap
+    let typed = || {
+        keymap
+            .iter()
+            .filter(|(ch, _)| !ch.is_control() || matches!(ch, '\t' | '\n' | '\r'))
+    };
+    let mut modifiers: Vec<&'static str> = MODIFIERS
         .iter()
+        .filter(|(key, keysym, _)| !same_symbol(server.keysym(&base(key.code())), *keysym))
+        .map(|(_, _, name)| *name)
+        .collect();
+    if typed().any(|(_, m)| taps(m).any(|tap| tap.altgr))
+        && !same_symbol(
+            server.keysym(&base(keymap.level3_keycode())),
+            KEY_ISO_Level3_Shift,
+        )
+    {
+        modifiers.push("ISO_Level3_Shift");
+    }
+    let chars = typed()
         .filter(|(_, m)| {
-            std::iter::once(&m.main).chain(&m.follow).any(|tap| {
-                (tap.altgr && !level3_ok)
-                    || !same_symbol(server.keysym(tap), keymap.group1().keysym(tap))
-            })
+            taps(m).any(|tap| !same_symbol(server.keysym(tap), keymap.group1().keysym(tap)))
         })
         .map(|(ch, _)| ch)
-        .collect()
+        .collect();
+    Mismatches { modifiers, chars }
 }
 
 /// Drop from `keymap` every character with a key (the one after a dead key
@@ -92,7 +153,7 @@ fn drop_unsendable(keymap: &mut XkbKeymap, min: u8, max: u8) {
             .and_then(|x11| u8::try_from(x11).ok())
             .is_some_and(|x11| (min..=max).contains(&x11))
     };
-    keymap.retain(|m| std::iter::once(&m.main).chain(&m.follow).all(sendable));
+    keymap.retain(|m| taps(m).all(sendable));
 }
 
 /// Whether keysyms `a` and `b` type the same: equal, or the same character
@@ -197,15 +258,12 @@ impl XtestSink {
             reply.first_key_sym,
             reply.map.syms_rtrn.as_deref().unwrap_or_default(),
         );
-        let mismatched = layout_mismatches(&server, keymap);
-        if !mismatched.is_empty() {
-            let mut sample: Vec<char> =
-                mismatched.into_iter().filter(|c| !c.is_control()).collect();
-            sample.sort_unstable();
-            sample.truncate(12);
+        let mismatches = layout_mismatches(&server, keymap);
+        if !mismatches.is_empty() {
             anyhow::bail!(
                 "the X server's XTEST keyboard uses a different layout than the detected one \
-                 (keys for {sample:?} differ); run setxkbmap with your layout to fix it"
+                 (keys for {} differ); run setxkbmap with your layout to fix it",
+                mismatches.sample()
             );
         }
         Ok(())
@@ -317,10 +375,14 @@ mod tests {
         .unwrap()
     }
 
-    /// The group 1 keysyms of an XTEST keyboard with this layout, compiled
-    /// by xkbcommon so no X server is needed, without the keys past the X
-    /// keycode range that a server cannot have.
     fn server(layout: &str, variant: &str) -> Group1Keysyms {
+        server_with_options(layout, variant, "")
+    }
+
+    /// The group 1 keysyms of an XTEST keyboard with this layout and XKB
+    /// options, compiled by xkbcommon so no X server is needed, without the
+    /// keys past the X keycode range that a server cannot have.
+    fn server_with_options(layout: &str, variant: &str, options: &str) -> Group1Keysyms {
         let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
         let keymap = xkbcommon::xkb::Keymap::new_from_names(
             &context,
@@ -328,7 +390,7 @@ mod tests {
             "",
             layout,
             variant,
-            None,
+            Some(options.to_string()),
             xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
         )
         .unwrap();
@@ -339,39 +401,43 @@ mod tests {
         keysyms
     }
 
-    fn mismatches(detected_layout: (&str, &str), server_layout: (&str, &str)) -> Vec<char> {
+    /// What a `detected` keymap, filtered as `connect` does, would type
+    /// differently on `server`.
+    fn mismatches_on(detected_layout: (&str, &str), server: &Group1Keysyms) -> Mismatches {
         let mut keymap = detected(detected_layout.0, detected_layout.1);
         drop_unsendable(&mut keymap, 8, 255);
-        let mut chars = layout_mismatches(&server(server_layout.0, server_layout.1), &keymap);
-        chars.sort_unstable();
-        chars
+        layout_mismatches(server, &keymap)
+    }
+
+    fn mismatches(detected_layout: (&str, &str), server_layout: (&str, &str)) -> Mismatches {
+        mismatches_on(detected_layout, &server(server_layout.0, server_layout.1))
     }
 
     #[test]
     fn de_on_us_xtest_keyboard_fails() {
-        let chars = mismatches(("de", ""), ("us", ""));
-        assert!(chars.contains(&'y') && chars.contains(&'z'), "{chars:?}");
+        let m = mismatches(("de", ""), ("us", ""));
+        assert!(m.chars.contains(&'y') && m.chars.contains(&'z'), "{m:?}");
     }
 
     #[test]
     fn altgr_level_differences_fail() {
         // `é` is AltGr+e on us(altgr-intl); plain `us` has no third level.
-        let chars = mismatches(("us", "altgr-intl"), ("us", ""));
-        assert!(chars.contains(&'é'), "{chars:?}");
+        let m = mismatches(("us", "altgr-intl"), ("us", ""));
+        assert!(m.chars.contains(&'é'), "{m:?}");
     }
 
     #[test]
     fn dead_key_layout_on_us_xtest_keyboard_fails() {
         // us(intl) turns `'` into dead_acute and moves `'` to AltGr.
-        let chars = mismatches(("us", "intl"), ("us", ""));
-        assert!(chars.contains(&'\''), "{chars:?}");
+        let m = mismatches(("us", "intl"), ("us", ""));
+        assert!(m.chars.contains(&'\''), "{m:?}");
     }
 
     #[test]
     fn matching_layouts_pass() {
         for (layout, variant) in [("us", ""), ("us", "altgr-intl"), ("us", "intl"), ("de", "")] {
-            let chars = mismatches((layout, variant), (layout, variant));
-            assert!(chars.is_empty(), "{layout}({variant}): {chars:?}");
+            let m = mismatches((layout, variant), (layout, variant));
+            assert!(m.is_empty(), "{layout}({variant}): {m:?}");
         }
     }
 
@@ -380,19 +446,43 @@ mod tests {
         // `ф` comes from group 2 and is typed with group 1's `a` key, the
         // same on a `us` XTEST keyboard as on a `us,ru` one.
         assert!(detected("us,ru", "").lookup('ф').is_some());
-        assert_eq!(mismatches(("us,ru", ""), ("us", "")), []);
-        assert_eq!(mismatches(("us,ru", ""), ("us,ru", "")), []);
+        let m = mismatches(("us,ru", ""), ("us", ""));
+        assert!(m.is_empty(), "{m:?}");
+        let m = mismatches(("us,ru", ""), ("us,ru", ""));
+        assert!(m.is_empty(), "{m:?}");
     }
 
     #[test]
     fn altgr_characters_fail_without_level3_shift() {
-        let mut keymap = detected("us", "altgr-intl");
-        drop_unsendable(&mut keymap, 8, 255);
+        let keymap = detected("us", "altgr-intl");
         let mut server = server("us", "altgr-intl");
         server.0.get_mut(&keymap.level3_keycode()).unwrap()[0] = xkbcommon::xkb::keysyms::KEY_Alt_R;
-        let chars = layout_mismatches(&server, &keymap);
-        assert!(chars.contains(&'é'), "{chars:?}");
-        assert!(!chars.contains(&'e'), "{chars:?}");
+        let m = mismatches_on(("us", "altgr-intl"), &server);
+        assert_eq!(m.modifiers, ["ISO_Level3_Shift"], "{m:?}");
+        assert_eq!(m.sample(), "[ISO_Level3_Shift]");
+    }
+
+    #[test]
+    fn moved_escape_passes() {
+        // caps:swapescape puts Caps_Lock on Escape's key; Escape is never
+        // typed from dictated text.
+        let server = server_with_options("us", "", "caps:swapescape");
+        let esc = KeyTap {
+            keycode: Key::KEY_ESC.code(),
+            shift: false,
+            altgr: false,
+        };
+        assert_eq!(server.keysym(&esc), xkbcommon::xkb::keysyms::KEY_Caps_Lock);
+        let m = mismatches_on(("us", ""), &server);
+        assert!(m.is_empty(), "{m:?}");
+    }
+
+    #[test]
+    fn moved_ctrl_fails() {
+        // ctrl:swapcaps makes the paste's Ctrl+V a Caps Lock and a `V`.
+        let m = mismatches_on(("us", ""), &server_with_options("us", "", "ctrl:swapcaps"));
+        assert_eq!(m.modifiers, ["Control_L"], "{m:?}");
+        assert_eq!(m.sample(), "[Control_L]");
     }
 
     #[test]
@@ -414,12 +504,17 @@ mod tests {
         assert_eq!(acute_u.follow.unwrap().keycode + EVDEV_TO_X11_KEYCODE, 30);
         drop_unsendable(&mut keymap, 8, 25);
         assert!(keymap.lookup('q').is_some());
+        assert!(keymap.lookup('w').is_some(), "`w` (25) is the last keycode");
         assert!(keymap.lookup('ú').is_none());
         assert!(keymap.lookup('u').is_none());
         // And keycodes below the server's minimum.
         let mut keymap = detected("us", "");
         drop_unsendable(&mut keymap, 25, 255);
         assert!(keymap.lookup('q').is_none());
+        assert!(
+            keymap.lookup('w').is_some(),
+            "`w` (25) is the first keycode"
+        );
         assert!(keymap.lookup('a').is_some());
     }
 
