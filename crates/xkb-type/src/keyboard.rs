@@ -231,8 +231,8 @@ impl Keyboard {
     #[cfg(feature = "xtest")]
     pub fn new_xtest(key_delay: Duration) -> anyhow::Result<Self> {
         let layout = KeyboardLayout::detect();
-        let keymap = XkbKeymap::from_layout(&layout)?;
-        let sink = Sink::Xtest(Box::new(crate::xtest::XtestSink::connect(&keymap)?));
+        let mut keymap = XkbKeymap::from_layout(&layout)?;
+        let sink = Sink::Xtest(Box::new(crate::xtest::XtestSink::connect(&mut keymap)?));
         debug!("XTEST keyboard connected");
         Ok(Self {
             sink,

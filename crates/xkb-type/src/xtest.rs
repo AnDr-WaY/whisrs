@@ -62,8 +62,6 @@ fn group1_keysyms(first_keycode: u8, maps: &[xkb::KeySymMap]) -> Group1Keysyms {
 /// Group 1 against group 1 keeps a second layout group (`us,ru`) from
 /// failing a `us` XTEST keyboard: its characters are pressed with group 1
 /// keys, so both keyboards give the same group 1 keysym for them.
-/// Characters on a key `server` lacks are skipped: past the X keycode
-/// range (`€` on `KEY_EURO`), no X keyboard has it, whatever its layout.
 fn layout_mismatches(server: &Group1Keysyms, keymap: &XkbKeymap) -> Vec<char> {
     let level3 = KeyTap {
         keycode: keymap.level3_keycode(),
@@ -74,15 +72,27 @@ fn layout_mismatches(server: &Group1Keysyms, keymap: &XkbKeymap) -> Vec<char> {
     keymap
         .iter()
         .filter(|(_, m)| {
-            let taps = || std::iter::once(&m.main).chain(&m.follow);
-            taps().all(|tap| server.0.contains_key(&tap.keycode))
-                && taps().any(|tap| {
-                    (tap.altgr && !level3_ok)
-                        || !same_symbol(server.keysym(tap), keymap.group1().keysym(tap))
-                })
+            std::iter::once(&m.main).chain(&m.follow).any(|tap| {
+                (tap.altgr && !level3_ok)
+                    || !same_symbol(server.keysym(tap), keymap.group1().keysym(tap))
+            })
         })
         .map(|(ch, _)| ch)
         .collect()
+}
+
+/// Drop from `keymap` every character with a key (the one after a dead key
+/// included) outside the X keycodes `min..=max`, such as `€` on `KEY_EURO`
+/// (X keycode 443): XTEST cannot press it, so `Keyboard::type_text` pastes
+/// it like a character the layout lacks instead of failing mid-text.
+fn drop_unsendable(keymap: &mut XkbKeymap, min: u8, max: u8) {
+    let sendable = |tap: &KeyTap| {
+        tap.keycode
+            .checked_add(EVDEV_TO_X11_KEYCODE)
+            .and_then(|x11| u8::try_from(x11).ok())
+            .is_some_and(|x11| (min..=max).contains(&x11))
+    };
+    keymap.retain(|m| std::iter::once(&m.main).chain(&m.follow).all(sendable));
 }
 
 /// Whether keysyms `a` and `b` type the same: equal, or the same character
@@ -103,8 +113,10 @@ pub(crate) struct XtestSink {
 impl XtestSink {
     /// Connect to `$DISPLAY`, check that it is a real X server with XTEST
     /// whose XTEST keyboard reads keycodes the way `keymap` expects, and
-    /// release any key a previous connection left down.
-    pub(crate) fn connect(keymap: &XkbKeymap) -> anyhow::Result<Self> {
+    /// release any key a previous connection left down. Characters on keys
+    /// the server has no keycode for are dropped from `keymap`, so they are
+    /// pasted.
+    pub(crate) fn connect(keymap: &mut XkbKeymap) -> anyhow::Result<Self> {
         let (conn, screen) = x11rb::connect(None).context("failed to connect to the X server")?;
         if conn
             .extension_information(xtest::X11_EXTENSION_NAME)
@@ -122,7 +134,9 @@ impl XtestSink {
         {
             anyhow::bail!("the X server is Xwayland; XTEST keys would only reach X11 clients");
         }
-        let root = conn.setup().roots[screen].root;
+        let setup = conn.setup();
+        drop_unsendable(keymap, setup.min_keycode, setup.max_keycode);
+        let root = setup.roots[screen].root;
         let mut sink = Self {
             conn,
             root,
@@ -326,7 +340,8 @@ mod tests {
     }
 
     fn mismatches(detected_layout: (&str, &str), server_layout: (&str, &str)) -> Vec<char> {
-        let keymap = detected(detected_layout.0, detected_layout.1);
+        let mut keymap = detected(detected_layout.0, detected_layout.1);
+        drop_unsendable(&mut keymap, 8, 255);
         let mut chars = layout_mismatches(&server(server_layout.0, server_layout.1), &keymap);
         chars.sort_unstable();
         chars
@@ -371,12 +386,41 @@ mod tests {
 
     #[test]
     fn altgr_characters_fail_without_level3_shift() {
-        let keymap = detected("us", "altgr-intl");
+        let mut keymap = detected("us", "altgr-intl");
+        drop_unsendable(&mut keymap, 8, 255);
         let mut server = server("us", "altgr-intl");
         server.0.get_mut(&keymap.level3_keycode()).unwrap()[0] = xkbcommon::xkb::keysyms::KEY_Alt_R;
         let chars = layout_mismatches(&server, &keymap);
         assert!(chars.contains(&'é'), "{chars:?}");
         assert!(!chars.contains(&'e'), "{chars:?}");
+    }
+
+    #[test]
+    fn keys_past_the_x_keycode_range_are_pasted() {
+        let mut keymap = detected("us", "");
+        assert!(keymap.lookup('€').is_some(), "`€` is on KEY_EURO");
+        drop_unsendable(&mut keymap, 8, 255);
+        assert!(keymap.lookup('€').is_none());
+        assert!(keymap.lookup('a').is_some());
+    }
+
+    #[test]
+    fn keys_outside_the_server_keycodes_are_pasted() {
+        // A server whose keycodes stop at 25 has `q` (24) but not `u` (30),
+        // so `ú` goes although its dead acute (21) fits.
+        let mut keymap = detected("de", "");
+        let acute_u = *keymap.lookup('ú').unwrap();
+        assert_eq!(acute_u.main.keycode + EVDEV_TO_X11_KEYCODE, 21);
+        assert_eq!(acute_u.follow.unwrap().keycode + EVDEV_TO_X11_KEYCODE, 30);
+        drop_unsendable(&mut keymap, 8, 25);
+        assert!(keymap.lookup('q').is_some());
+        assert!(keymap.lookup('ú').is_none());
+        assert!(keymap.lookup('u').is_none());
+        // And keycodes below the server's minimum.
+        let mut keymap = detected("us", "");
+        drop_unsendable(&mut keymap, 25, 255);
+        assert!(keymap.lookup('q').is_none());
+        assert!(keymap.lookup('a').is_some());
     }
 
     #[test]

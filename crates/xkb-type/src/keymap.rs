@@ -328,6 +328,12 @@ impl XkbKeymap {
     pub(crate) fn group1(&self) -> &Group1Keysyms {
         &self.group1
     }
+    /// Keep only the characters whose mapping `keep` accepts; the rest are
+    /// typed like characters the layout lacks (pasted).
+    #[cfg(feature = "xtest")]
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&KeyMapping) -> bool) {
+        self.map.retain(|_, m| keep(m));
+    }
     pub fn level3_keycode(&self) -> u16 {
         self.level3_keycode
     }
