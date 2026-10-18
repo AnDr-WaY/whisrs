@@ -8,16 +8,17 @@
 //! end of the text never arrives. XTEST has no such queue, so the per-key
 //! delay is only pacing and can be zero.
 
-use std::collections::{HashMap, HashSet};
-
 use anyhow::Context;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
+use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{ConnectionExt as _, Window, KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
 use x11rb::protocol::xtest::{self, ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
+use xkbcommon::xkb::keysyms::KEY_ISO_Level3_Shift;
 
-use crate::XkbKeymap;
+use crate::keymap::Group1Keysyms;
+use crate::{KeyTap, XkbKeymap};
 
 /// Offset from an evdev keycode to the X11 keycode of the server's evdev
 /// keymap.
@@ -25,6 +26,71 @@ const EVDEV_TO_X11_KEYCODE: u16 = 8;
 
 /// Name of the slave keyboard the X server attaches XTEST key events to.
 const XTEST_KEYBOARD_NAME: &[u8] = b"Virtual core XTEST keyboard";
+
+/// The group 1 keysyms of each key in `maps`, the XKB symbol maps of the
+/// X keycodes from `first_keycode`.
+///
+/// The core-protocol mapping cannot stand in for this: it lists levels 3
+/// and up of every group after the first two levels of both, so with a
+/// two-level group 1 (`us,ru`) its fifth column is group 2 level 3.
+fn group1_keysyms(first_keycode: u8, maps: &[xkb::KeySymMap]) -> Group1Keysyms {
+    let levels = maps
+        .iter()
+        .zip(u16::from(first_keycode)..)
+        .filter_map(|(map, x11_keycode)| {
+            // `syms` holds `width` keysyms per group, group 1 first.
+            let width = usize::from(map.width);
+            let levels = [0, 1, 2, 3].map(|level| {
+                if level < width {
+                    map.syms.get(level).copied().unwrap_or(0)
+                } else {
+                    0
+                }
+            });
+            Some((x11_keycode.checked_sub(EVDEV_TO_X11_KEYCODE)?, levels))
+        })
+        .collect();
+    Group1Keysyms(levels)
+}
+
+/// Characters `keymap` would type differently on the `server` keyboard:
+/// a key it presses for them (a dead key and the key after it included)
+/// gives a different keysym at that level than in `keymap`'s group 1, or
+/// the character needs AltGr and `keymap`'s level 3 key is not
+/// `ISO_Level3_Shift` there.
+///
+/// Group 1 against group 1 keeps a second layout group (`us,ru`) from
+/// failing a `us` XTEST keyboard: its characters are pressed with group 1
+/// keys, so both keyboards give the same group 1 keysym for them.
+/// Characters on a key `server` lacks are skipped: past the X keycode
+/// range (`€` on `KEY_EURO`), no X keyboard has it, whatever its layout.
+fn layout_mismatches(server: &Group1Keysyms, keymap: &XkbKeymap) -> Vec<char> {
+    let level3 = KeyTap {
+        keycode: keymap.level3_keycode(),
+        shift: false,
+        altgr: false,
+    };
+    let level3_ok = same_symbol(server.keysym(&level3), KEY_ISO_Level3_Shift);
+    keymap
+        .iter()
+        .filter(|(_, m)| {
+            let taps = || std::iter::once(&m.main).chain(&m.follow);
+            taps().all(|tap| server.0.contains_key(&tap.keycode))
+                && taps().any(|tap| {
+                    (tap.altgr && !level3_ok)
+                        || !same_symbol(server.keysym(tap), keymap.group1().keysym(tap))
+                })
+        })
+        .map(|(ch, _)| ch)
+        .collect()
+}
+
+/// Whether keysyms `a` and `b` type the same: equal, or the same character
+/// (`Cyrillic_ef` and `U0444`).
+fn same_symbol(a: u32, b: u32) -> bool {
+    let ch = xkbcommon::xkb::keysym_to_utf32(a.into());
+    a == b || (ch != 0 && ch == xkbcommon::xkb::keysym_to_utf32(b.into()))
+}
 
 /// An X server connection that sends fake key events via XTEST.
 pub(crate) struct XtestSink {
@@ -67,8 +133,8 @@ impl XtestSink {
         Ok(sink)
     }
 
-    /// Fail unless every unmodified key `keymap` would press for a character
-    /// the XTEST keyboard has as a base character gives that character.
+    /// Fail unless every key `keymap` would press, at the level it would
+    /// press it, gives the same keysym on the XTEST keyboard.
     ///
     /// The XTEST keyboard has its own keymap. Layouts set only through an
     /// xorg.conf `InputClass` (e.g. `localectl set-x11-keymap`) apply to
@@ -76,40 +142,48 @@ impl XtestSink {
     /// detected layout is `de`: typing through it would swap `y` and `z`.
     fn check_keymap(&self, keymap: &XkbKeymap) -> anyhow::Result<()> {
         let device = self.xtest_keyboard_id()?;
-        let setup = self.conn.setup();
-        let (min, max) = (setup.min_keycode, setup.max_keycode);
+        if !self
+            .conn
+            .xkb_use_extension(1, 0)
+            .context("failed to query the XKB extension")?
+            .reply()
+            .context("failed to query the XKB extension")?
+            .supported
+        {
+            anyhow::bail!("the X server does not support the XKB extension");
+        }
+        // The symbols of every key (`full`); the ranges below are only read
+        // for `partial` parts, of which there are none.
         let reply = self
             .conn
-            .xinput_get_device_key_mapping(device, min, max - min + 1)
+            .xkb_get_map(
+                device.into(),
+                xkb::MapPart::KEY_SYMS,
+                xkb::MapPart::default(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                xkb::VMod::default(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
             .context("failed to request the XTEST keyboard mapping")?
             .reply()
             .context("failed to read the XTEST keyboard mapping")?;
-        // Base character (group 1, level 1) of each key, by evdev keycode.
-        let per_key = usize::from(reply.keysyms_per_keycode);
-        let server: HashMap<u16, char> = (min..=max)
-            .filter_map(|x11| {
-                let index = usize::from(x11 - min) * per_key;
-                let keysym = *reply.keysyms.get(index)?;
-                let ch = char::from_u32(xkbcommon::xkb::keysym_to_utf32(keysym.into()))?;
-                Some((u16::from(x11).checked_sub(EVDEV_TO_X11_KEYCODE)?, ch))
-            })
-            .collect();
-        let server_chars: HashSet<char> = server.values().copied().collect();
-
-        // Only characters the XTEST keyboard has as a base character are
-        // compared: a second layout group in the detected layout (`us,ru`)
-        // adds characters it never types without a group switch anyway.
-        let mismatched: Vec<char> = keymap
-            .iter()
-            .filter(|(ch, m)| {
-                !m.main.shift
-                    && !m.main.altgr
-                    && m.follow.is_none()
-                    && server_chars.contains(ch)
-                    && server.get(&m.main.keycode) != Some(ch)
-            })
-            .map(|(ch, _)| ch)
-            .collect();
+        let server = group1_keysyms(
+            reply.first_key_sym,
+            reply.map.syms_rtrn.as_deref().unwrap_or_default(),
+        );
+        let mismatched = layout_mismatches(&server, keymap);
         if !mismatched.is_empty() {
             let mut sample: Vec<char> =
                 mismatched.into_iter().filter(|c| !c.is_control()).collect();
@@ -213,5 +287,109 @@ impl Drop for XtestSink {
             }
         }
         let _ = self.conn.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::KeyboardLayout;
+
+    fn detected(layout: &str, variant: &str) -> XkbKeymap {
+        XkbKeymap::from_layout(&KeyboardLayout {
+            layout: layout.to_string(),
+            variant: variant.to_string(),
+        })
+        .unwrap()
+    }
+
+    /// The group 1 keysyms of an XTEST keyboard with this layout, compiled
+    /// by xkbcommon so no X server is needed, without the keys past the X
+    /// keycode range that a server cannot have.
+    fn server(layout: &str, variant: &str) -> Group1Keysyms {
+        let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkbcommon::xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            layout,
+            variant,
+            None,
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        let mut keysyms = Group1Keysyms::from_keymap(&keymap);
+        keysyms
+            .0
+            .retain(|&keycode, _| keycode + EVDEV_TO_X11_KEYCODE <= u16::from(u8::MAX));
+        keysyms
+    }
+
+    fn mismatches(detected_layout: (&str, &str), server_layout: (&str, &str)) -> Vec<char> {
+        let keymap = detected(detected_layout.0, detected_layout.1);
+        let mut chars = layout_mismatches(&server(server_layout.0, server_layout.1), &keymap);
+        chars.sort_unstable();
+        chars
+    }
+
+    #[test]
+    fn de_on_us_xtest_keyboard_fails() {
+        let chars = mismatches(("de", ""), ("us", ""));
+        assert!(chars.contains(&'y') && chars.contains(&'z'), "{chars:?}");
+    }
+
+    #[test]
+    fn altgr_level_differences_fail() {
+        // `é` is AltGr+e on us(altgr-intl); plain `us` has no third level.
+        let chars = mismatches(("us", "altgr-intl"), ("us", ""));
+        assert!(chars.contains(&'é'), "{chars:?}");
+    }
+
+    #[test]
+    fn dead_key_layout_on_us_xtest_keyboard_fails() {
+        // us(intl) turns `'` into dead_acute and moves `'` to AltGr.
+        let chars = mismatches(("us", "intl"), ("us", ""));
+        assert!(chars.contains(&'\''), "{chars:?}");
+    }
+
+    #[test]
+    fn matching_layouts_pass() {
+        for (layout, variant) in [("us", ""), ("us", "altgr-intl"), ("us", "intl"), ("de", "")] {
+            let chars = mismatches((layout, variant), (layout, variant));
+            assert!(chars.is_empty(), "{layout}({variant}): {chars:?}");
+        }
+    }
+
+    #[test]
+    fn second_group_passes_on_its_first_group() {
+        // `ф` comes from group 2 and is typed with group 1's `a` key, the
+        // same on a `us` XTEST keyboard as on a `us,ru` one.
+        assert!(detected("us,ru", "").lookup('ф').is_some());
+        assert_eq!(mismatches(("us,ru", ""), ("us", "")), []);
+        assert_eq!(mismatches(("us,ru", ""), ("us,ru", "")), []);
+    }
+
+    #[test]
+    fn altgr_characters_fail_without_level3_shift() {
+        let keymap = detected("us", "altgr-intl");
+        let mut server = server("us", "altgr-intl");
+        server.0.get_mut(&keymap.level3_keycode()).unwrap()[0] = xkbcommon::xkb::keysyms::KEY_Alt_R;
+        let chars = layout_mismatches(&server, &keymap);
+        assert!(chars.contains(&'é'), "{chars:?}");
+        assert!(!chars.contains(&'e'), "{chars:?}");
+    }
+
+    #[test]
+    fn group1_keysyms_skips_later_groups() {
+        // X keycode 17 (`8`) on `us,ru`: two groups of width 4, group 1
+        // with only two levels. Group 2 level 3 is `₽`.
+        let maps = [xkb::KeySymMap {
+            kt_index: [0; 4],
+            group_info: 2,
+            width: 4,
+            syms: vec![0x38, 0x2a, 0, 0, 0x38, 0x2a, 0x10020bd, 0],
+        }];
+        let server = group1_keysyms(17, &maps);
+        assert_eq!(server.0.get(&9), Some(&[0x38, 0x2a, 0, 0]));
     }
 }

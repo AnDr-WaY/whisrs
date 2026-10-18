@@ -27,7 +27,7 @@ log = { version = "0.4", optional = true }
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols-misc = { version = "0.3", features = ["client"], optional = true }
 rustix = { version = "0.38", features = ["fs"], optional = true }
-x11rb = { version = "0.13", features = ["xinput", "xtest"], optional = true }
+x11rb = { version = "0.13", features = ["xinput", "xkb", "xtest"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3", optional = true }

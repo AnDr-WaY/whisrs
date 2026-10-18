@@ -272,6 +272,9 @@ fn parse_localectl_status(output: &str) -> Option<KeyboardLayout> {
 pub struct XkbKeymap {
     map: HashMap<char, KeyMapping>,
     level3_keycode: u16,
+    /// What each tap in `map` produces on a keyboard with this layout.
+    #[cfg(feature = "xtest")]
+    group1: Group1Keysyms,
 }
 
 impl XkbKeymap {
@@ -303,6 +306,8 @@ impl XkbKeymap {
         Ok(Self {
             map,
             level3_keycode,
+            #[cfg(feature = "xtest")]
+            group1: Group1Keysyms::from_keymap(&keymap),
         })
     }
 
@@ -313,6 +318,15 @@ impl XkbKeymap {
     #[cfg(feature = "xtest")]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (char, &KeyMapping)> {
         self.map.iter().map(|(ch, m)| (*ch, m))
+    }
+    /// The group 1 keysyms of this layout's keys.
+    ///
+    /// A character [`build_reverse_map`] found in a later group (`ф` on
+    /// `us,ru`) is typed with a tap that means another keysym in group 1
+    /// (`a`): that keysym is what typing it gives while group 1 is active.
+    #[cfg(feature = "xtest")]
+    pub(crate) fn group1(&self) -> &Group1Keysyms {
+        &self.group1
     }
     pub fn level3_keycode(&self) -> u16 {
         self.level3_keycode
@@ -404,6 +418,40 @@ fn find_level3_keycode(keymap: &xkbcommon::xkb::Keymap) -> Option<u16> {
     }
 
     None
+}
+
+/// The group 1 keysym at each of the four levels [`build_reverse_map`]
+/// uses (Shift, AltGr), of each key by evdev keycode: what a [`KeyTap`]
+/// produces while group 1 is active. A level a key lacks is `NoSymbol` (0).
+#[cfg(feature = "xtest")]
+pub(crate) struct Group1Keysyms(pub(crate) HashMap<u16, [u32; 4]>);
+
+#[cfg(feature = "xtest")]
+impl Group1Keysyms {
+    /// Read the first keysym of each level from a compiled keymap.
+    pub(crate) fn from_keymap(keymap: &xkbcommon::xkb::Keymap) -> Self {
+        let levels = (keymap.min_keycode().raw()..=keymap.max_keycode().raw())
+            .filter_map(|raw_keycode| {
+                let keycode = xkbcommon::xkb::Keycode::new(raw_keycode);
+                let evdev_keycode = u16::try_from(raw_keycode.checked_sub(8)?).ok()?;
+                let levels = [0, 1, 2, 3].map(|level| {
+                    keymap
+                        .key_get_syms_by_level(keycode, 0, level)
+                        .first()
+                        .map_or(0, |sym| sym.raw())
+                });
+                Some((evdev_keycode, levels))
+            })
+            .collect();
+        Self(levels)
+    }
+
+    /// The keysym `tap` produces, `NoSymbol` (0) if none.
+    pub(crate) fn keysym(&self, tap: &KeyTap) -> u32 {
+        // Level 1 (Shift), 2 (AltGr) and 3 (both), as in `build_reverse_map`.
+        let level = usize::from(tap.shift) | usize::from(tap.altgr) << 1;
+        self.0.get(&tap.keycode).map_or(0, |levels| levels[level])
+    }
 }
 
 #[allow(non_upper_case_globals)]

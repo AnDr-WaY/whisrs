@@ -103,13 +103,18 @@ device = "default"         # input device; see "Choosing the microphone" below
 # Inter-key delay for the virtual keyboard. Raise this if a TUI
 # drops characters while whisrs is typing — e.g. Node/Ink-based apps like
 # Claude Code in raw mode. The uinput backend treats 0 as 1 (with no delay
-# the kernel's input queue overflows and the end of the text is lost); XTEST
-# honours 0. Default: 2.
+# the kernel's input queue overflows and the end of the text is lost); the
+# xtest backend honours 0. Default: 2.
 key_delay_ms = 2
 # Keyboard-injection backend: auto | uinput | wayland-vk | xtest.
-# auto uses the Wayland virtual keyboard on Wayland and XTEST on X11 (skipped
-# on Xwayland or when the X server's XTEST keyboard has a different layout),
-# falling back to uinput. Default: auto.
+# auto uses the Wayland virtual keyboard when the compositor supports it,
+# otherwise uinput. Default: auto.
+# On X11, set "xtest" to type through the X server's XTEST extension instead
+# of uinput: no /dev/uinput access needed, and key_delay_ms = 0 drops no
+# keys. auto never picks it. It refuses to start on Xwayland, and when the X
+# server's XTEST keyboard has a different layout than the one whisrs detected
+# (a layout set only in xorg.conf, e.g. by `localectl set-x11-keymap`, does
+# not reach that keyboard); run setxkbmap with your layout to fix that.
 backend = "auto"
 # How long to wait, in milliseconds, for physically held modifier keys (Super,
 # Alt, Ctrl, Shift) to be released before whisrs sends a keystroke with a

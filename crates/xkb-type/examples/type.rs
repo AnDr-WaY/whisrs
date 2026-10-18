@@ -19,12 +19,13 @@
 //! type [--backend auto|uinput|wayland-vk|xtest] [--delay-ms N] <text...>
 //! ```
 //!
-//! `xtest` (X11 only) needs `--features xtest`.
+//! `xtest` (X11 only) needs `--features xtest`. It refuses to start when the
+//! X server's XTEST keyboard has a different layout than the detected one.
 //!
 //! `auto` mirrors the daemon: it uses the Wayland virtual keyboard when
 //! `WAYLAND_DISPLAY` is set and the compositor supports
-//! `zwp_virtual_keyboard_v1`, XTEST when only `DISPLAY` is set (with
-//! `--features xtest`), otherwise it falls back to uinput.
+//! `zwp_virtual_keyboard_v1`, otherwise it falls back to uinput. It never
+//! picks `xtest`, which is opt-in.
 
 use std::time::Duration;
 
@@ -111,15 +112,6 @@ fn build_backend(
                     Err(e) => {
                         eprintln!("wayland-vk unavailable, falling back to uinput: {e:#}");
                     }
-                }
-            }
-            #[cfg(feature = "xtest")]
-            if std::env::var_os("WAYLAND_DISPLAY").is_none()
-                && std::env::var_os("DISPLAY").is_some()
-            {
-                match xkb_type::Keyboard::new_xtest(key_delay) {
-                    Ok(kb) => return Ok((Box::new(kb), "xtest (auto)")),
-                    Err(e) => eprintln!("xtest unavailable, falling back to uinput: {e:#}"),
                 }
             }
             Ok((
