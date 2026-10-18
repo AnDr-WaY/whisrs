@@ -377,6 +377,13 @@ pub struct AudioConfig {
 /// active layout cannot be produced. The Wayland virtual-keyboard backend
 /// (`zwp_virtual_keyboard_v1`) ships its own keymap and types
 /// layout-independently, fixing that class of bugs (see issue #44).
+///
+/// On X11, uinput keys pass through the kernel's evdev queue to the X
+/// server, and a fast burst overflows it: the server drops the rest of the
+/// text. The opt-in XTEST backend sends keys straight to the X server
+/// instead, so nothing is dropped even at `key_delay_ms = 0`. `auto` never
+/// picks it. It refuses to start on Xwayland and when the X server's XTEST
+/// keyboard has a different layout than the detected one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum InjectorBackend {
@@ -388,14 +395,22 @@ pub enum InjectorBackend {
     Uinput,
     /// Force `zwp_virtual_keyboard_v1` (errors at startup if unsupported).
     WaylandVk,
+    /// Force the X11 XTEST extension (errors at startup without an X server,
+    /// on Xwayland, or when the XTEST keyboard types differently than the
+    /// detected layout, e.g. an XKB option moved Ctrl or Shift).
+    Xtest,
 }
 
-/// Keyboard injection (uinput) tuning.
+/// Keyboard injection tuning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputConfig {
     /// Delay between individual key events, in milliseconds. Raise this if
     /// characters are dropped by TUIs that read stdin in raw mode (e.g.
-    /// Node/Ink-based apps like Claude Code).
+    /// Node/Ink-based apps like Claude Code). The uinput backend treats 0 as
+    /// 1: with no delay a burst overflows the kernel's input queue and the
+    /// end of the text is lost. The XTEST backend (`backend = "xtest"`)
+    /// honours 0, though an input method (ibus, fcitx) may still need a
+    /// delay.
     #[serde(default = "default_key_delay_ms")]
     pub key_delay_ms: u64,
     /// How long to wait, in milliseconds, for physically held modifier keys
@@ -426,6 +441,8 @@ pub struct InputConfig {
     /// to uinput. Set this to `wayland-vk` to fix garbled bilingual /
     /// code-switching dictation on Wayland (issue #44), where the uinput
     /// backend can only emit characters present in the active XKB layout.
+    /// On X11, `xtest` types through the X server instead of uinput, so
+    /// `key_delay_ms = 0` drops no keys.
     #[serde(default)]
     pub backend: InjectorBackend,
     /// Inject text by clipboard paste (Ctrl+V) instead of typing keystrokes.
@@ -3310,6 +3327,7 @@ mod tests {
             (InjectorBackend::Auto, "auto"),
             (InjectorBackend::Uinput, "uinput"),
             (InjectorBackend::WaylandVk, "wayland-vk"),
+            (InjectorBackend::Xtest, "xtest"),
         ] {
             #[derive(Serialize, Deserialize)]
             struct Wrap {

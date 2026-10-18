@@ -1,7 +1,9 @@
-//! Virtual keyboard typing via evdev/uinput with XKB layout-aware key mapping.
+//! Virtual keyboard typing via evdev/uinput or X11 XTEST with XKB layout-aware
+//! key mapping.
 //!
 //! This crate provides:
-//! - [`Keyboard`] — a virtual uinput device that injects keystrokes.
+//! - [`Keyboard`] — a virtual uinput device that injects keystrokes (or,
+//!   with the `xtest` feature, an X11 XTEST connection).
 //! - [`XkbKeymap`] — reverse char→keycode lookup from the active XKB layout.
 //! - [`ClipboardBackend`] — trait + auto-detected clipboard implementations.
 //!
@@ -34,6 +36,8 @@ pub mod keyboard;
 pub mod keymap;
 #[cfg(feature = "wayland-vk")]
 pub mod wayland_vk;
+#[cfg(feature = "xtest")]
+mod xtest;
 
 // ---------------------------------------------------------------------------
 // Core types

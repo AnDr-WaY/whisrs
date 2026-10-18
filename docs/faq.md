@@ -1,7 +1,7 @@
 # FAQ
 
 **Does whisrs work on Wayland?**
-Yes. whisrs has native support for Wayland compositors including Hyprland, Sway, GNOME, and KDE. It uses compositor-specific protocols for window tracking and uinput for keyboard injection, so it does not depend on X11 tools like xdotool.
+Yes. whisrs has native support for Wayland compositors including Hyprland, Sway, GNOME, and KDE. It uses compositor-specific protocols for window tracking and the Wayland virtual keyboard (or uinput) for keyboard injection, so it does not depend on X11 tools like xdotool.
 
 **Can whisrs work offline?**
 Yes. The local whisper.cpp backend runs transcription entirely on your machine. No API key, no internet connection, and no audio data leaves your device. Run `whisrs setup` and select the local backend to get started.
@@ -10,7 +10,7 @@ Yes. The local whisper.cpp backend runs transcription entirely on your machine. 
 Six backends: Groq (cloud, free tier), Deepgram Nova REST and Streaming (cloud, 60+ languages, $200 free credit on signup), OpenAI REST (cloud), OpenAI Realtime (cloud, true streaming over WebSocket), and local whisper.cpp (offline, CPU/GPU). More local backends (Vosk, Parakeet) are planned.
 
 **How does whisrs type text into applications?**
-whisrs creates a virtual keyboard using Linux's uinput subsystem and performs XKB reverse lookups to find the correct keycode and modifier combination for each character. This means it respects your keyboard layout and works in any application, including terminals, editors, and browsers.
+whisrs sends keystrokes through the Wayland virtual-keyboard protocol or a virtual keyboard created with Linux's uinput subsystem (on X11 you can opt into the XTEST extension instead with `[input] backend = "xtest"`), and performs XKB reverse lookups to find the correct keycode and modifier combination for each character. This means it respects your keyboard layout and works in any application, including terminals, editors, and browsers.
 
 **Can whisrs read text back to me?**
 Yes. Select some text, then run `whisrs speak` (alias `read`, or bind `[hotkeys] speak`) and whisrs reads the selection aloud. Press the speak hotkey again or run `whisrs cancel` to stop playback. Supported backends are Groq, OpenAI, Deepgram, and a local OpenAI-compatible `tts-sidecar` (Kokoro, Supertonic, etc.). It is off by default; enable it with `[tts] enabled = true`.

@@ -447,17 +447,20 @@ pub(crate) fn select_backend(existing: Option<&Config>) -> Result<String> {
 /// compositor supports `zwp_virtual_keyboard_v1` and otherwise falls back to
 /// uinput. The Wayland backend types layout-independently, which fixes
 /// garbled bilingual / code-switching dictation on Wayland (issue #44).
+/// `xtest` is the opt-in X11 alternative to uinput.
 pub(crate) fn select_injector_backend(existing: Option<&Config>) -> Result<InjectorBackend> {
     const BACKENDS: &[InjectorBackend] = &[
         InjectorBackend::Auto,
         InjectorBackend::Uinput,
         InjectorBackend::WaylandVk,
+        InjectorBackend::Xtest,
     ];
     let default_idx = existing
         .map(|cfg| match cfg.input.backend {
             InjectorBackend::Auto => 0,
             InjectorBackend::Uinput => 1,
             InjectorBackend::WaylandVk => 2,
+            InjectorBackend::Xtest => 3,
         })
         .unwrap_or(0);
 
@@ -468,6 +471,7 @@ pub(crate) fn select_injector_backend(existing: Option<&Config>) -> Result<Injec
             "Auto        (recommended — Wayland virtual keyboard, falls back to uinput)",
             "uinput      (evdev/uinput; layout-dependent on Wayland)",
             "wayland-vk  (force zwp_virtual_keyboard_v1 — fixes bilingual typing on Wayland)",
+            "xtest       (force X11 XTEST — no dropped keys at any key delay)",
         ])
         .default(default_idx)
         .interact()
