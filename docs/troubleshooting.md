@@ -12,6 +12,17 @@ sudo usermod -aG input $USER
 
 Log out and back in for the group change to take effect.
 
+If you are already in the `input` group and still get permission denied, the
+`uinput` module is probably not loaded (`ls /sys/class/misc/uinput` fails). The
+kernel only autoloads it when `/dev/uinput` is opened, and the node is
+`root:root 0600` until then, so a non-root open never gets that far. The rule's
+`static_node=uinput` option fixes the node's permissions at boot. To fix it
+without rebooting:
+
+```bash
+sudo modprobe uinput
+```
+
 The rule also grants the `input` group an ACL on `/dev/uinput`, which matters when
 another rule (e.g. brltty) sets one; ACLs override plain group permissions. That
 line is written against the FHS path `/usr/bin/setfacl` and is skipped when the

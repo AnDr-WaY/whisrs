@@ -14,6 +14,7 @@ use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
 use whisrs::audio::feedback;
 use whisrs::history::{self, HistoryEntry};
 use whisrs::llm;
+use whisrs::replacements::Replacer;
 use whisrs::state::Action;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::WindowTracker;
@@ -65,6 +66,8 @@ pub(crate) struct StreamingPipelineParams {
     pub(crate) silence_timeout_ms: u64,
     pub(crate) filler_enabled: bool,
     pub(crate) filler_words: Vec<String>,
+    /// `[replacements]`, applied to each batch after filler removal.
+    pub(crate) replacements: std::collections::BTreeMap<String, String>,
     pub(crate) audio_feedback: bool,
     pub(crate) audio_feedback_volume: f32,
     pub(crate) backend_name: String,
@@ -79,6 +82,8 @@ pub(crate) struct StreamingPipelineParams {
     /// `[input] terminal_classes`, for folding line breaks in deltas typed
     /// into a terminal ([`fold_line_breaks_at_terminal`]).
     pub(crate) terminal_classes: Vec<String>,
+    /// `[general] history`: save the transcript for `whisrs log`.
+    pub(crate) history: bool,
 }
 
 /// The streaming pipeline: reads audio in real-time, sends to API, types text.
@@ -99,6 +104,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         silence_timeout_ms,
         filler_enabled,
         filler_words,
+        replacements,
         audio_feedback,
         audio_feedback_volume,
         backend_name,
@@ -106,6 +112,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         clipboard_fallback,
         clipboard_only,
         terminal_classes,
+        history,
     } = params;
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
@@ -124,6 +131,8 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     } else {
         None
     };
+    let replacer =
+        Replacer::new(&replacements).context("invalid [replacements] key in configuration")?;
 
     // Spawn the transcription backend.
     let config_clone = config.clone();
@@ -160,8 +169,12 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         // `fold_line_breaks_at_terminal`).
         let at_terminal = Arc::new(std::sync::OnceLock::<bool>::new());
         let terminal_classes = Arc::new(terminal_classes);
-        let full_text =
-            run_typing_batcher(text_rx, typing_cancel, filler_filter, move |text_to_type| {
+        let full_text = run_typing_batcher(
+            text_rx,
+            typing_cancel,
+            filler_filter,
+            replacer,
+            move |text_to_type| {
                 let wid = wid.clone();
                 let tracker = Arc::clone(&window_tracker);
                 let focused = Arc::clone(&focused);
@@ -214,7 +227,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                         .await
                         {
                             Ok(Ok((StreamingDelivery::Typed, text))) => {
-                                info!("typed: {text:?}");
+                                debug!("typed: {text:?}");
                             }
                             Ok(Ok((StreamingDelivery::Cancelled, text))) => {
                                 info!(
@@ -229,8 +242,9 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                     }
                     text_to_type
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         write_streaming_clipboard(
             &full_text,
@@ -397,7 +411,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     // Save to history if we got any text.
     if !full_text.is_empty() {
         let duration_secs = pipeline_start.elapsed().as_secs_f64();
-        save_history_entry(&full_text, &backend_name, &language, duration_secs);
+        save_history_entry(history, &full_text, &backend_name, &language, duration_secs);
     }
 
     // If auto-stop happened, we need to transition to Idle.
@@ -454,6 +468,7 @@ pub(crate) async fn run_typing_batcher<F, Fut>(
     mut text_rx: tokio::sync::mpsc::Receiver<String>,
     cancel: Arc<AtomicBool>,
     filler_filter: Option<FillerFilter>,
+    replacer: Option<Replacer>,
     mut sink: F,
 ) -> String
 where
@@ -486,6 +501,15 @@ where
         // Apply filler word removal if enabled.
         if let Some(filter) = filler_filter.as_ref() {
             batch = filter.apply(&batch);
+            if batch.is_empty() {
+                continue;
+            }
+        }
+
+        // Apply `[replacements]`. Per batch, so a phrase split across two
+        // batches is not matched.
+        if let Some(replacer) = replacer.as_ref() {
+            batch = replacer.apply(&batch);
             if batch.is_empty() {
                 continue;
             }
@@ -640,6 +664,8 @@ pub(crate) struct BatchOptions<'a> {
     pub(crate) check_prompt_echo: bool,
     /// Apply the configured filler-word filter. Dictation only for now.
     pub(crate) apply_filler: bool,
+    /// Apply `[replacements]`. Dictation only, like `apply_filler`.
+    pub(crate) apply_replacements: bool,
     /// Which flow is asking; picks the notification/log wording.
     pub(crate) origin: BatchOrigin<'a>,
 }
@@ -653,6 +679,7 @@ impl<'a> BatchOptions<'a> {
             save_recovery: true,
             check_prompt_echo: true,
             apply_filler: true,
+            apply_replacements: true,
             origin: BatchOrigin::Dictation,
         }
     }
@@ -666,6 +693,7 @@ impl<'a> BatchOptions<'a> {
             save_recovery: false,
             check_prompt_echo: false,
             apply_filler: false,
+            apply_replacements: false,
             origin: BatchOrigin::CommandMode,
         }
     }
@@ -681,6 +709,7 @@ impl<'a> BatchOptions<'a> {
             save_recovery: false,
             check_prompt_echo: true,
             apply_filler: false,
+            apply_replacements: false,
             origin: BatchOrigin::LlmCommand { name },
         }
     }
@@ -846,6 +875,17 @@ pub(crate) async fn transcribe_batch_audio(
             );
         }
         cleaned
+    } else {
+        text
+    };
+
+    let text = if opts.apply_replacements {
+        match Replacer::new(&context.config.replacements)
+            .context("invalid [replacements] key in configuration")?
+        {
+            Some(replacer) => replacer.apply(&text),
+            None => text,
+        }
     } else {
         text
     };
@@ -1249,8 +1289,18 @@ fn transcription_prompt(prompt: Option<&str>, vocabulary: &[String]) -> Option<S
     }
 }
 
-/// Save a transcription to the history file.
-pub(crate) fn save_history_entry(text: &str, backend: &str, language: &str, duration_secs: f64) {
+/// Save a transcription to the history file, unless `[general] history` is
+/// off. `enabled` is a parameter, not a lookup, so no caller can skip the check.
+pub(crate) fn save_history_entry(
+    enabled: bool,
+    text: &str,
+    backend: &str,
+    language: &str,
+    duration_secs: f64,
+) {
+    if !enabled {
+        return;
+    }
     let entry = HistoryEntry {
         timestamp: chrono::Local::now(),
         text: text.to_string(),
@@ -1483,6 +1533,7 @@ mod tests {
             text_rx,
             Arc::clone(&cancel),
             None,
+            None,
             move |text| {
                 let sink_log = Arc::clone(&sink_log);
                 async move {
@@ -1563,6 +1614,28 @@ mod tests {
         assert!(typed.lock().unwrap().is_empty());
     }
 
+    /// `[replacements]` reach the streaming path: the sink, and so the
+    /// clipboard copy and history, get the replaced text.
+    #[tokio::test]
+    async fn typing_batcher_applies_replacements() {
+        let (text_tx, text_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let table = [("package build".to_string(), "PKGBUILD".to_string())].into();
+        let replacer = Replacer::new(&table).unwrap();
+        let batcher = tokio::spawn(run_typing_batcher(
+            text_rx,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            replacer,
+            |text| async move { text },
+        ));
+        text_tx
+            .send("edit the Package Build file".to_string())
+            .await
+            .unwrap();
+        drop(text_tx);
+        assert_eq!(batcher.await.unwrap(), "edit the PKGBUILD file");
+    }
+
     // ── BatchOptions / BatchOrigin decision logic ───────────────────────
 
     /// Pins the exact option set each production caller uses (dictation in
@@ -1580,6 +1653,7 @@ mod tests {
                     save_recovery: true,
                     check_prompt_echo: true,
                     apply_filler: true,
+                    apply_replacements: true,
                     origin: BatchOrigin::Dictation,
                 },
             ),
@@ -1591,6 +1665,7 @@ mod tests {
                     save_recovery: false,
                     check_prompt_echo: false,
                     apply_filler: false,
+                    apply_replacements: false,
                     origin: BatchOrigin::CommandMode,
                 },
             ),
@@ -1602,6 +1677,7 @@ mod tests {
                     save_recovery: false,
                     check_prompt_echo: true,
                     apply_filler: false,
+                    apply_replacements: false,
                     origin: BatchOrigin::LlmCommand { name: "proofread" },
                 },
             ),
@@ -1691,8 +1767,8 @@ mod tests {
     /// and `openai-compatible-realtime` never put it on the wire, so without
     /// that condition genuine speech resembling the user's own
     /// `[general] vocabulary` was discarded as an echo of something the model
-    /// never saw. `openai-realtime` joins them whenever the model puts the
-    /// session in manual-commit mode, which is why the flag is read per
+    /// never saw. `openai-realtime` joins them on gpt-realtime-whisper, the
+    /// one model that takes no prompt, which is why the flag is read per
     /// request rather than per backend.
     #[test]
     fn prompt_echo_guard_conditions() {
@@ -1878,6 +1954,42 @@ mod tests {
             text.is_empty(),
             "a backend that does send the prompt must still have echoes filtered, got {text:?}"
         );
+    }
+
+    /// `[replacements]` is wired into the batch path, not just the streaming
+    /// batcher, and stays off for command mode, whose transcript is an
+    /// instruction for the LLM rather than text to type.
+    #[tokio::test]
+    async fn batch_path_applies_replacements_to_dictation_only() {
+        const SPOKEN: &str = "edit the package build file";
+        let mut context = context_with_backend(StubBackend {
+            text: SPOKEN,
+            sends_prompt: false,
+        });
+        context
+            .config
+            .replacements
+            .insert("package build".to_string(), "PKGBUILD".to_string());
+
+        let dictated = transcribe_batch_audio(
+            &audio_that_passes_the_gate(),
+            &context,
+            "en",
+            &BatchOptions::dictation(),
+        )
+        .await
+        .expect("the stub backend never fails");
+        assert_eq!(dictated, "edit the PKGBUILD file");
+
+        let instruction = transcribe_batch_audio(
+            &audio_that_passes_the_gate(),
+            &context,
+            "en",
+            &BatchOptions::command_mode(),
+        )
+        .await
+        .expect("the stub backend never fails");
+        assert_eq!(instruction, SPOKEN);
     }
 
     // ── Toggle-path LLM post-processing (issue #85) ─────────────────────

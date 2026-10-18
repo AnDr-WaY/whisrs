@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use audio_silence_gate::{AutoStopDetector, SILENCE_RMS_THRESHOLD};
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
@@ -29,7 +29,8 @@ use crate::selection::{acquire_selected_text, capture_selection};
 /// Command mode does not otherwise log — the rewritten text lands on screen,
 /// and the original is still there to compare against. It logs on exactly one
 /// path: a multi-line result refused at a terminal, where the history entry is
-/// the only surviving copy and what `whisrs log` recovers.
+/// the only surviving copy and what `whisrs log` recovers. With
+/// `[general] history = false` it does not log, and the text is discarded.
 const COMMAND_MODE_HISTORY_BACKEND: &str = "command";
 
 /// The toast for a multi-line reply refused at a terminal. `label` names the
@@ -37,16 +38,19 @@ const COMMAND_MODE_HISTORY_BACKEND: &str = "command";
 ///
 /// Names `whisrs log` on purpose: nothing was typed, so the history entry
 /// written alongside this toast is the only surviving copy of the text, and a
-/// message that does not say where it went is a message that loses it.
-fn refused_multi_line_message(label: Option<&str>) -> String {
+/// message that does not say where it went is a message that loses it. With
+/// `[general] history = false` there is no copy, and the toast says so.
+fn refused_multi_line_message(label: Option<&str>, history: bool) -> String {
     let subject = match label {
         Some(name) => format!("'{name}': result"),
         None => "Result".to_string(),
     };
-    format!(
-        "{subject} spans multiple lines and the target is a terminal — not typed. \
-         Recover it with 'whisrs log'."
-    )
+    let recovery = if history {
+        "Recover it with 'whisrs log'."
+    } else {
+        "History is off, so it was discarded."
+    };
+    format!("{subject} spans multiple lines and the target is a terminal — not typed. {recovery}")
 }
 
 /// Claim a command-session context (command mode or llm-command) when audio
@@ -384,7 +388,7 @@ async fn command_mode_background_inner(
         return Ok(());
     }
 
-    info!("command mode: instruction = {:?}", instruction);
+    debug!("command mode: instruction = {:?}", instruction);
 
     // Send to LLM.
     let raw = llm::rewrite_text(&cmd_ctx.llm_config, &cmd_ctx.selected_text, &instruction).await?;
@@ -433,6 +437,7 @@ async fn command_mode_background_inner(
                 text.len()
             );
             save_history_entry(
+                context.config.general.history,
                 &text,
                 COMMAND_MODE_HISTORY_BACKEND,
                 &context.config.general.language,
@@ -445,11 +450,15 @@ async fn command_mode_background_inner(
             // others report progress or a failure; this one is different in
             // kind, because it *withholds text the user would otherwise have
             // received*, and the history entry just written is the only
-            // surviving copy. `notify = false` means "do not narrate normal
+            // surviving copy (or there is none, with `[general] history =
+            // false`). `notify = false` means "do not narrate normal
             // operation", not "silently discard my work": gated, this outcome
             // is a `warn!` in the journal that nobody reads, and from the
             // user's chair the dictation simply vanished.
-            send_notification("whisrs", &refused_multi_line_message(None));
+            send_notification(
+                "whisrs",
+                &refused_multi_line_message(None, context.config.general.history),
+            );
             return Ok(());
         }
     };
@@ -960,6 +969,7 @@ async fn llm_command_background_inner(
                 text.len()
             );
             save_history_entry(
+                context.config.general.history,
                 &text,
                 &history_backend,
                 &context.config.general.language,
@@ -970,7 +980,10 @@ async fn llm_command_background_inner(
             // the notify gate: it withholds text the user would otherwise
             // have received, and `notify = false` means "do not narrate
             // normal operation", not "silently discard my work".
-            send_notification("whisrs", &refused_multi_line_message(Some(&cmd_ctx.name)));
+            send_notification(
+                "whisrs",
+                &refused_multi_line_message(Some(&cmd_ctx.name), context.config.general.history),
+            );
             return Ok(());
         }
     };
@@ -1010,6 +1023,7 @@ async fn llm_command_background_inner(
     }
 
     save_history_entry(
+        context.config.general.history,
         &result,
         &history_backend,
         &context.config.general.language,
@@ -1276,7 +1290,7 @@ mod tests {
     #[test]
     fn the_refusal_message_names_the_recovery_path() {
         for label in [None, Some("german")] {
-            let message = refused_multi_line_message(label);
+            let message = refused_multi_line_message(label, true);
             assert!(
                 message.contains("whisrs log"),
                 "{message:?} does not tell the user how to recover the text"
@@ -1285,8 +1299,16 @@ mod tests {
                 message.contains("not typed"),
                 "{message:?} does not say the text was withheld"
             );
+
+            // With history off there is nothing to recover, so pointing at
+            // `whisrs log` would send the user to an empty log.
+            let message = refused_multi_line_message(label, false);
+            assert!(
+                !message.contains("whisrs log") && message.contains("discarded"),
+                "{message:?} promises a recovery path that does not exist"
+            );
         }
-        assert!(refused_multi_line_message(Some("german")).starts_with("'german':"));
+        assert!(refused_multi_line_message(Some("german"), true).starts_with("'german':"));
     }
 
     /// The refusal toast must never sit behind the notify gate.

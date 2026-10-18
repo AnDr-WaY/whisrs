@@ -11,6 +11,7 @@ pub mod llm;
 #[cfg(feature = "hooks")]
 pub mod mpris;
 pub mod overlay;
+pub mod replacements;
 pub mod service;
 pub mod state;
 pub mod transcription;

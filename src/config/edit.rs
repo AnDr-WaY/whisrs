@@ -185,6 +185,7 @@ fn default_config() -> Config {
         hooks: None,
         overlay: None,
         llm_commands: Vec::new(),
+        replacements: Default::default(),
     }
 }
 

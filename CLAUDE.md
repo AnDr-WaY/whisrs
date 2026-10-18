@@ -60,6 +60,7 @@ src/
 │                           #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ├── history.rs              # Dictation history (whisrs log)
 ├── llm.rs                  # LLM calls for command mode
+├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
 ├── audio/
@@ -216,6 +217,8 @@ Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realti
 
 TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
 
+Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, after filler removal (`src/replacements.rs`).
+
 Environment variable overrides:
 - `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key` (also used by the `deepgram` TTS backend)
 - `WHISRS_GROQ_API_KEY` — overrides `[groq] api_key` (also used by the `groq` TTS backend)
@@ -253,15 +256,16 @@ When a feature or set of changes warrants a version bump:
 4. **Commit** and **push**
 5. **Tag and release on GitHub**: `git tag v<VERSION>; git push origin v<VERSION>`, then create a GitHub release with `gh release create v<VERSION>` including release notes summarizing the changes
 6. **Publish to crates.io**: Always run `cargo publish` after pushing a version bump — do not skip this step
-7. **Update both AUR packages** in their own repos (not this one): bump `pkgver` in the `PKGBUILD`, regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`, commit, and push to AUR.
-   `whisrs-bin` also needs both `sha256sums_x86_64` and `sha256sums_aarch64` refreshed against the new release tarballs — do it **after** step 5, since the assets do not exist until the release workflow finishes
+7. **Update `whisrs-bin`** in its own repo (not this one): bump `pkgver` in the `PKGBUILD`, refresh both `sha256sums_x86_64` and `sha256sums_aarch64` against the new release tarballs, regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`, commit, and push to AUR. Do it **after** step 5, since the assets do not exist until the release workflow finishes.
+   **Never bump `whisrs-git` for a release.** It builds `main` HEAD and `pkgver()` derives the version at build time, and the AUR rules forbid pkgver-only commits on VCS packages. The per-release bumps also made it look tag-pinned on the AUR page. Push to it only when the build itself changes (deps, flags, installed files)
 
 ## Packaging
 
 Packaging files (AUR PKGBUILD, etc.) do NOT belong in this repo. They are maintained externally:
-- **AUR**: two packages, both maintained locally and pushed via `makepkg --printsrcinfo > .SRCINFO; git push`
+- **AUR**: two packages we maintain locally and push via `makepkg --printsrcinfo > .SRCINFO; git push`
   - `whisrs-bin` (`~/Projects/whisrs-bin/`) — prebuilt release tarballs, pinned to a tag. The recommended install
-  - `whisrs-git` (`~/Projects/whisrs-git/`) — builds from `main` HEAD, no tag pin
+  - `whisrs-git` (`~/Projects/whisrs-git/`) — builds from `main` HEAD, no tag pin. Not bumped on release (see step 7)
+  - Not ours: graysky maintains the `whisrs` split package (`whisrs`, `whisrs-cuda`, `whisrs-vulkan`), which compiles the tagged release source. Its CUDA and Vulkan flavors are the only packaged GPU builds
 - **Nix**: `flake.nix` lives in-repo (standard practice for Nix projects)
 - **crates.io**: `cargo publish` manually after version bump
 

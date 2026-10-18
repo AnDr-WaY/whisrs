@@ -9,7 +9,8 @@ use crate::hotkey;
 use crate::llm;
 use crate::transcription::deepgram;
 use crate::transcription::openai_realtime_protocol::{
-    openai_turn_detection_mode_for_model, OpenAiRealtimeProfile, TurnDetectionMode,
+    openai_model_supports_languages, openai_model_supports_prompt, OpenAiRealtimeProfile,
+    TurnDetectionMode,
 };
 use crate::WhisrsError;
 
@@ -61,6 +62,11 @@ pub struct Config {
     /// [`llm::LlmCommandConfig`]). Empty by default.
     #[serde(default)]
     pub llm_commands: Vec<llm::LlmCommandConfig>,
+    /// Word/phrase replacements applied to every dictation before it is
+    /// typed: `"package build" = "PKGBUILD"`. Matching rules are in
+    /// [`crate::replacements`]. Empty by default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub replacements: BTreeMap<String, String>,
 }
 
 /// Global hotkey configuration — key combos that trigger actions.
@@ -278,6 +284,11 @@ pub struct GeneralConfig {
     pub silence_timeout_ms: u64,
     #[serde(default = "default_true")]
     pub notify: bool,
+    /// Save finished dictations to `history.jsonl` for `whisrs log`. On by
+    /// default. `false` stops new writes only: existing entries stay until
+    /// `whisrs log --clear`.
+    #[serde(default = "default_true")]
+    pub history: bool,
     /// Enable automatic filler word removal from transcriptions.
     #[serde(default)]
     pub remove_filler_words: bool,
@@ -336,6 +347,7 @@ impl Default for GeneralConfig {
             language: default_language(),
             silence_timeout_ms: default_silence_timeout(),
             notify: true,
+            history: true,
             remove_filler_words: false,
             filler_words: Vec::new(),
             audio_feedback: false,
@@ -582,6 +594,12 @@ pub struct OpenAiConfig {
     pub api_key: String,
     #[serde(default = "default_openai_model")]
     pub model: String,
+    /// Expected input languages for gpt-live-transcribe or gpt-transcribe on
+    /// `openai-realtime`. Overrides `[general] language`; a per-session `-l`
+    /// overrides it in turn. An empty list preserves the single-language/auto
+    /// behavior.
+    #[serde(default)]
+    pub languages: Vec<String>,
 }
 
 /// Text-to-speech configuration for the read-selection-aloud feature.
@@ -653,6 +671,11 @@ pub struct LocalWhisperConfig {
     /// segmentation mode.
     #[serde(default = "default_phrase_silence_ms")]
     pub phrase_silence_ms: u64,
+    /// Turn on whisper.cpp flash attention when the model loads. Off by
+    /// default: it only helps on some GPU builds and can change output
+    /// slightly.
+    #[serde(default)]
+    pub flash_attn: bool,
 }
 
 impl LocalWhisperConfig {
@@ -662,6 +685,7 @@ impl LocalWhisperConfig {
             model_path,
             segmentation: default_local_whisper_segmentation(),
             phrase_silence_ms: default_phrase_silence_ms(),
+            flash_attn: false,
         }
     }
 
@@ -1736,6 +1760,7 @@ impl Config {
 
         warnings.extend(self.deepgram_keyterm_warnings(backend));
         warnings.extend(self.inert_prompt_warnings(backend));
+        warnings.extend(self.openai_languages_warnings(backend));
 
         // Streaming backends (including local-whisper, unless its
         // `segmentation` is "none") type dictated text
@@ -1990,7 +2015,52 @@ impl Config {
             }
         }
 
+        warnings.extend(self.replacement_warnings());
+
         Ok(warnings)
+    }
+
+    /// Load-time warnings about `[replacements]`: a table that will not
+    /// compile (caught here rather than after the first transcription), blank
+    /// keys (never match), keys with a hyphen at either end (it is dropped)
+    /// and keys that differ only in case or spacing (only one of them wins).
+    fn replacement_warnings(&self) -> Vec<ConfigWarning> {
+        let mut warnings = Vec::new();
+        if let Err(e) = crate::replacements::Replacer::new(&self.replacements) {
+            warnings.push(ConfigWarning {
+                message: format!(
+                    "[replacements] could not be compiled, so dictation will fail: {e}"
+                ),
+            });
+        }
+        let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+        for key in self.replacements.keys() {
+            let norm = crate::replacements::normalize(key);
+            if norm.is_empty() {
+                warnings.push(ConfigWarning {
+                    message: format!("[replacements] key {key:?} is blank and never matches"),
+                });
+                continue;
+            }
+            let trimmed = key.trim();
+            if trimmed.starts_with('-') || trimmed.ends_with('-') {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "[replacements] key {key:?}: a hyphen at the start or end is \
+                         ignored, so it matches {norm:?}"
+                    ),
+                });
+            }
+            if let Some(first) = seen.insert(norm, key) {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "[replacements] keys {first:?} and {key:?} match the same text \
+                         (matching ignores case and spacing), so only {key:?} is used"
+                    ),
+                });
+            }
+        }
+        warnings
     }
 
     /// The Deepgram model this config will actually transcribe with.
@@ -2019,10 +2089,11 @@ impl Config {
     ///
     /// Not [`default_openai_model`], on purpose. `[openai] model` is shared
     /// with the plain `openai` REST backend, whose serde default is
-    /// `gpt-4o-mini-transcribe` — a different string, and one that maps to a
-    /// different turn-detection mode. Resolving the realtime fallback through
-    /// it would silently flip the gate in [`Config::inert_prompt_warnings`] to
-    /// the opposite answer from the one the wire gets.
+    /// `gpt-4o-mini-transcribe`, a different string, and one that takes a
+    /// prompt where gpt-realtime-whisper does not. Resolving the realtime
+    /// fallback through it would silently flip the gate in
+    /// [`Config::inert_prompt_warnings`] to the opposite answer from the one
+    /// the wire gets.
     ///
     /// `pub` for the same reason [`Config::deepgram_model`] above is, and
     /// `get_model_for_backend` calls it rather than keeping its own literal.
@@ -2160,6 +2231,53 @@ impl Config {
         DeepgramHintChannel::Live
     }
 
+    /// Load-time warnings about `[openai] languages` that will not reach the
+    /// wire as written.
+    ///
+    /// The list is sent only on `openai-realtime` with a model that passes
+    /// [`openai_model_supports_languages`], the same gate
+    /// `OpenAiSessionUpdate::new` applies. Anywhere else it is inert, so this
+    /// warns rather than errors: an `Err` would make `whisrs config` refuse to
+    /// save and hide every later warning, over a key that never reaches the
+    /// wire. Called after `validate`'s backend match, not inside an arm of it,
+    /// so a list left behind on any backend (`groq` included) is reported.
+    ///
+    /// Blank codes are dropped by `OpenAIRealtimeBackend::with_languages`
+    /// before they reach the wire; this only says so.
+    fn openai_languages_warnings(&self, backend: &str) -> Vec<ConfigWarning> {
+        let Some(openai) = self.openai.as_ref().filter(|o| !o.languages.is_empty()) else {
+            return Vec::new();
+        };
+        let message = if backend != "openai-realtime" {
+            format!(
+                "[openai] languages is ignored with backend = \"{backend}\": only \
+                 openai-realtime with gpt-live-transcribe or gpt-transcribe sends it. Remove \
+                 it, or switch to backend = \"openai-realtime\" with model = \
+                 \"gpt-live-transcribe\"."
+            )
+        } else if !openai_model_supports_languages(&self.openai_realtime_model()) {
+            format!(
+                "[openai] languages is ignored on [openai] model = \"{}\": only \
+                 gpt-live-transcribe and gpt-transcribe take language hints. Remove it, or \
+                 switch to model = \"gpt-live-transcribe\".",
+                self.openai_realtime_model()
+            )
+        } else {
+            let blanks = openai
+                .languages
+                .iter()
+                .filter(|code| code.trim().is_empty())
+                .count();
+            if blanks == 0 {
+                return Vec::new();
+            }
+            format!(
+                "[openai] languages has {blanks} blank code(s), which are skipped. Remove them."
+            )
+        };
+        vec![ConfigWarning { message }]
+    }
+
     /// Load-time warnings about `[general] prompt` and `[general] vocabulary`
     /// being discarded by a backend that puts no prompt on the wire (#140).
     ///
@@ -2174,10 +2292,10 @@ impl Config {
     /// `TranscriptionBackend::sends_prompt`, which is the authority — that is
     /// the flag the pipeline reads, and a warning that disagrees with it is
     /// worse than no warning at all. `openai-realtime` is per-model rather
-    /// than per-backend there (manual-commit models get `prompt = None` in the
-    /// `session.update`, server-VAD models get a real one), so it is gated on
-    /// the same [`openai_turn_detection_mode_for_model`] call the backend
-    /// itself makes, through [`Config::openai_realtime_model`].
+    /// than per-backend there (gpt-realtime-whisper gets `prompt = None` in the
+    /// `session.update`, every other model gets a real one), so it is gated on
+    /// the same [`openai_model_supports_prompt`] call the backend itself makes,
+    /// through [`Config::openai_realtime_model`].
     ///
     /// Deepgram is deliberately absent from the vocabulary warning, and that
     /// asymmetry is the whole point of splitting the two. Deepgram has a
@@ -2242,11 +2360,12 @@ impl Config {
             /// `openai-compatible-realtime`: `LemonadeSessionUpdate::new`
             /// takes no prompt argument at all, so both keys are inert.
             Lemonade,
-            /// `openai-realtime` on a manual-commit model, which is what
-            /// `whisrs setup` writes. Carries the model, because the
-            /// server-VAD models on the same backend do send the prompt and
-            /// the message has to name which one the user is on.
-            OpenAiRealtimeManualCommit { model: String },
+            /// `openai-realtime` on gpt-realtime-whisper, the model `whisrs
+            /// setup` preselects and the only one that takes no prompt.
+            /// Carries the model, because the other models on the same backend
+            /// do send the prompt and the message has to name which one the
+            /// user is on.
+            OpenAiRealtimePromptless { model: String },
         }
 
         let mut warnings = Vec::new();
@@ -2262,13 +2381,10 @@ impl Config {
             "openai-compatible-realtime" => InertPromptCase::Lemonade,
             "openai-realtime" => {
                 let model = self.openai_realtime_model();
-                match openai_turn_detection_mode_for_model(&model) {
-                    TurnDetectionMode::ManualCommit => {
-                        InertPromptCase::OpenAiRealtimeManualCommit { model }
-                    }
-                    // Server-VAD models carry a real `prompt`, so neither key
-                    // is inert here.
-                    TurnDetectionMode::ServerVad => return warnings,
+                if !openai_model_supports_prompt(&model) {
+                    InertPromptCase::OpenAiRealtimePromptless { model }
+                } else {
+                    return warnings;
                 }
             }
             _ => return warnings,
@@ -2365,12 +2481,12 @@ impl Config {
                          wire. Switch to a backend that sends it (groq, openai, asr-sidecar) to \
                          use a prompt."
                     ),
-                    InertPromptCase::OpenAiRealtimeManualCommit { model } => format!(
+                    InertPromptCase::OpenAiRealtimePromptless { model } => format!(
                         "[general] prompt is ignored with backend = \"{backend}\" on [openai] \
-                         model = \"{model}\": manual-commit models get prompt = None in the \
-                         session.update, so the hint never reaches the wire. Switch to a \
-                         server-VAD model such as gpt-4o-transcribe to send it, or to a backend \
-                         that always does (groq, openai, asr-sidecar)."
+                         model = \"{model}\": gpt-realtime-whisper takes no prompt, so the \
+                         session.update omits it and the hint never reaches the wire. Switch \
+                         [openai] model to gpt-live-transcribe or gpt-4o-transcribe to send it, \
+                         or to a backend that always does (groq, openai, asr-sidecar)."
                     ),
                 },
             });
@@ -2414,13 +2530,12 @@ impl Config {
                          asr-sidecar){deepgram_clause}."
                     ))
                 }
-                InertPromptCase::OpenAiRealtimeManualCommit { model } => Some(format!(
+                InertPromptCase::OpenAiRealtimePromptless { model } => Some(format!(
                     "[general] vocabulary is ignored with backend = \"{backend}\" on [openai] \
                      model = \"{model}\": the {terms} term(s) are folded into the transcription \
-                     prompt, and manual-commit models get prompt = None in the session.update, \
-                     so they reach nothing. Switch to a server-VAD model such as \
-                     gpt-4o-transcribe, or to a backend that always sends the prompt (groq, \
-                     openai, asr-sidecar)."
+                     prompt, and gpt-realtime-whisper takes no prompt, so they reach nothing. \
+                     Switch [openai] model to gpt-live-transcribe or gpt-4o-transcribe, or to a \
+                     backend that always sends the prompt (groq, openai, asr-sidecar)."
                 )),
             };
             if let Some(message) = message {
@@ -2625,12 +2740,39 @@ mod tests {
         assert_eq!(from_serde.model_path, from_default.model_path);
         assert_eq!(from_serde.segmentation, from_default.segmentation);
         assert_eq!(from_serde.phrase_silence_ms, from_default.phrase_silence_ms);
+        assert_eq!(from_serde.flash_attn, from_default.flash_attn);
+        assert!(!from_default.flash_attn);
     }
 
     #[test]
     fn unknown_top_level_key_is_reported() {
         let unknown = unknown_config_keys("bogus = 1\n[general]\nbackend = \"groq\"\n");
         assert_eq!(unknown, vec!["bogus"]);
+    }
+
+    #[test]
+    fn replacements_parse_and_are_known_keys() {
+        let toml = "[replacements]\n\"package build\" = \"PKGBUILD\"\n";
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.replacements["package build"], "PKGBUILD");
+        assert!(unknown_config_keys(toml).is_empty());
+        assert!(unknown_config_keys("[replacements]\n").is_empty());
+    }
+
+    #[test]
+    fn replacements_warn_on_blank_and_colliding_keys() {
+        let config: Config = toml::from_str(
+            "[replacements]\n\" \" = \"x\"\n\"Foo Bar\" = \"a\"\n\"foo-bar\" = \"b\"\n",
+        )
+        .unwrap();
+        let messages: Vec<String> = config
+            .replacement_warnings()
+            .into_iter()
+            .map(|w| w.message)
+            .collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages[0].contains("blank"));
+        assert!(messages[1].contains("\"Foo Bar\" and \"foo-bar\""));
     }
 
     #[test]
@@ -3073,6 +3215,21 @@ mod tests {
     }
 
     #[test]
+    fn config_history_defaults_on_and_can_be_disabled() {
+        let config: Config = toml::from_str("[general]\nbackend = \"groq\"\n").unwrap();
+        assert!(config.general.history, "history must stay on by default");
+        assert!(GeneralConfig::default().history);
+
+        let config: Config =
+            toml::from_str("[general]\nbackend = \"groq\"\nhistory = false\n").unwrap();
+        assert!(!config.general.history);
+        assert!(
+            unknown_config_keys("[general]\nbackend = \"groq\"\nhistory = false\n").is_empty(),
+            "history must not be reported as an unknown key"
+        );
+    }
+
+    #[test]
     fn config_tts_backend_and_url_roundtrip() {
         let config: Config = toml::from_str(
             r#"
@@ -3258,6 +3415,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
         };
         let err = config.validate().unwrap_err();
@@ -3373,6 +3531,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
         };
         let err = config.validate().unwrap_err();
@@ -3404,6 +3563,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
         };
         let result = config.validate();
@@ -3438,6 +3598,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
         };
         let warnings = config.validate().unwrap();
@@ -3468,6 +3629,7 @@ mod tests {
                 openai: Some(OpenAiConfig {
                     api_key: "test-key".to_string(),
                     model: default_openai_model(),
+                    languages: Vec::new(),
                 }),
                 local_whisper: None,
                 local_vosk: None,
@@ -3479,6 +3641,7 @@ mod tests {
                 hotkeys: None,
                 hooks: None,
                 llm_commands: Vec::new(),
+                replacements: BTreeMap::new(),
                 overlay: None,
             };
             let warnings = config.validate().unwrap();
@@ -3557,6 +3720,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
         }
     }
@@ -3780,6 +3944,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
         };
 
@@ -4042,6 +4207,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
         };
         let warnings = config.validate().unwrap();
@@ -4098,6 +4264,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         };
@@ -4132,6 +4299,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         };
@@ -4167,6 +4335,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         };
@@ -4202,6 +4371,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         };
@@ -4237,6 +4407,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         };
@@ -4269,6 +4440,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         };
@@ -4343,6 +4515,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         };
@@ -4383,6 +4556,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         };
@@ -4425,6 +4599,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         };
@@ -4492,6 +4667,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         };
@@ -4530,6 +4706,7 @@ mod tests {
             openai: Some(OpenAiConfig {
                 api_key: "test-key".to_string(),
                 model: default_openai_model(),
+                languages: Vec::new(),
             }),
             local_whisper: None,
             local_vosk: None,
@@ -4546,6 +4723,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            replacements: BTreeMap::new(),
             overlay: None,
             tts: None,
         }
@@ -5032,8 +5210,8 @@ mod tests {
     ];
 
     /// A config on `backend` with a prompt and a vocabulary that both have
-    /// something to lose. `openai-realtime` is pinned to the manual-commit
-    /// model `whisrs setup` writes, which is the promptless case.
+    /// something to lose. `openai-realtime` is pinned to gpt-realtime-whisper,
+    /// the model `whisrs setup` preselects and the promptless case.
     fn inert_prompt_config(backend: &str) -> Config {
         let mut config = validatable_config(backend);
         config.general.prompt = Some("Transcribe technical dictation.".to_string());
@@ -5051,7 +5229,7 @@ mod tests {
     #[test]
     fn config_openai_realtime_model_falls_back_to_the_daemon_literal() {
         // Not default_openai_model(): that is the REST backend's
-        // gpt-4o-mini-transcribe, which is server-VAD and would invert the
+        // gpt-4o-mini-transcribe, which takes a prompt and would invert the
         // gate below.
         let mut config = validatable_config("openai-realtime");
         config.openai = None;
@@ -5085,7 +5263,7 @@ mod tests {
             },
             // No hint channel at all: another model on the same backend, or
             // another backend entirely.
-            "openai-realtime" => &["gpt-4o-transcribe", "groq"],
+            "openai-realtime" => &["gpt-live-transcribe", "gpt-4o-transcribe", "groq"],
             "openai-compatible-realtime" => &["groq"],
             other => panic!(
                 "backend {other} warns that [general] prompt is ignored, but this assertion does \
@@ -5513,16 +5691,20 @@ mod tests {
     }
 
     #[test]
-    fn config_inert_prompt_silent_for_server_vad_openai_realtime_model() {
-        let mut config = inert_prompt_config("openai-realtime");
-        config.openai.as_mut().unwrap().model = "gpt-4o-transcribe".to_string();
+    fn config_inert_prompt_silent_for_prompt_taking_openai_realtime_models() {
+        // gpt-live-transcribe is manual-commit like gpt-realtime-whisper, and
+        // still takes the prompt.
+        for model in ["gpt-4o-transcribe", "gpt-live-transcribe"] {
+            let mut config = inert_prompt_config("openai-realtime");
+            config.openai.as_mut().unwrap().model = model.to_string();
 
-        let warnings = config.inert_prompt_warnings("openai-realtime");
-        assert!(
-            warnings.is_empty(),
-            "server-VAD models get a real prompt in the session.update; nothing is inert: \
-             {warnings:?}"
-        );
+            let warnings = config.inert_prompt_warnings("openai-realtime");
+            assert!(
+                warnings.is_empty(),
+                "{model} gets a real prompt in the session.update; nothing is inert: \
+                 {warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -5547,27 +5729,91 @@ mod tests {
         }
     }
 
-    /// The gate and `sends_prompt` both read
-    /// `openai_turn_detection_mode_for_model`, so the totality test below
-    /// cannot catch that mapping itself moving: both sides move with it and
-    /// keep agreeing. This pins its absolute answers instead. The mixed-case
-    /// row is the one that matters in practice, since the mapping is
-    /// `eq_ignore_ascii_case` and a config is free to spell the model with
-    /// capitals; making it case-sensitive leaves every other test green.
+    /// A validatable config on `backend` with `[openai] model` and
+    /// `[openai] languages` set.
+    fn openai_languages_config(backend: &str, model: &str, languages: &[&str]) -> Config {
+        let mut config = validatable_config(backend);
+        let openai = config.openai.as_mut().unwrap();
+        openai.model = model.to_string();
+        openai.languages = languages.iter().map(|code| code.to_string()).collect();
+        config
+    }
+
+    /// The `[openai] languages` warnings out of `validate()`, which must
+    /// never fail over that key: it never reaches the wire where it is inert.
+    fn openai_languages_warnings_through_validate(config: &Config) -> Vec<String> {
+        config
+            .validate()
+            .expect("[openai] languages warns, it never fails validation")
+            .into_iter()
+            .map(|w| w.message)
+            .filter(|m| m.contains("[openai] languages"))
+            .collect()
+    }
+
     #[test]
-    fn openai_turn_detection_mapping_is_case_insensitive() {
-        for (model, manual_commit) in [
-            ("gpt-realtime-whisper", true),
-            ("GPT-Realtime-Whisper", true),
-            ("gpt-4o-transcribe", false),
+    fn config_validate_silent_for_openai_languages_on_gpt_live_transcribe() {
+        let config =
+            openai_languages_config("openai-realtime", "gpt-live-transcribe", &["ru", "en"]);
+        let warnings = openai_languages_warnings_through_validate(&config);
+        assert!(
+            warnings.is_empty(),
+            "gpt-live-transcribe sends the list: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_warns_openai_languages_ignored_elsewhere() {
+        // groq is the case an arm-local check misses: a list left behind in
+        // [openai] after switching backends.
+        for (backend, model) in [
+            ("openai-realtime", "gpt-4o-transcribe"),
+            ("openai-realtime", "gpt-realtime-whisper"),
+            ("openai", "gpt-live-transcribe"),
+            ("groq", "gpt-live-transcribe"),
+        ] {
+            let config = openai_languages_config(backend, model, &["ru", "en"]);
+            let warnings = openai_languages_warnings_through_validate(&config);
+            assert!(
+                warnings.len() == 1 && warnings[0].contains("is ignored"),
+                "backend {backend} on model {model} never sends [openai] languages; expected \
+                 one warning saying so, got: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validate_warns_blank_openai_language_codes() {
+        let config =
+            openai_languages_config("openai-realtime", "gpt-live-transcribe", &["ru", "", "  "]);
+        let warnings = openai_languages_warnings_through_validate(&config);
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("2 blank code(s)"),
+            "blank codes are dropped before the wire, and the warning must count them: \
+             {warnings:?}"
+        );
+    }
+
+    /// The gate and `sends_prompt` both read `openai_model_supports_prompt`,
+    /// so the totality test below cannot catch that function itself moving:
+    /// both sides move with it and keep agreeing. This pins its absolute
+    /// answers instead. The mixed-case row is the one that matters in
+    /// practice, since the check is `eq_ignore_ascii_case` and a config is
+    /// free to spell the model with capitals; making it case-sensitive leaves
+    /// every other test green.
+    #[test]
+    fn openai_prompt_support_is_case_insensitive() {
+        for (model, takes_prompt) in [
+            ("gpt-realtime-whisper", false),
+            ("GPT-Realtime-Whisper", false),
+            ("gpt-live-transcribe", true),
+            ("gpt-4o-transcribe", true),
         ] {
             assert_eq!(
-                matches!(
-                    openai_turn_detection_mode_for_model(model),
-                    TurnDetectionMode::ManualCommit
-                ),
-                manual_commit,
-                "the turn-detection mapping for {model} moved; the inert-prompt gate                  and every backend's sends_prompt move silently with it"
+                openai_model_supports_prompt(model),
+                takes_prompt,
+                "the prompt-support answer for {model} moved; the inert-prompt gate and \
+                 openai-realtime's sends_prompt move silently with it"
             );
         }
     }
@@ -5652,8 +5898,10 @@ mod tests {
                 backend: Box::new(OpenAIRestBackend::new(String::new())),
             },
             // Both sides of the per-model split, on one backend struct: the
-            // manual-commit model `whisrs setup` writes, and a server-VAD one.
-            // The gate has to follow the model here, not the backend name.
+            // promptless model `whisrs setup` preselects, a server-VAD one,
+            // and gpt-live-transcribe, which is manual-commit and still takes
+            // the prompt. The gate has to follow the model here, not the
+            // backend name or the turn-detection mode.
             SendsPromptCase {
                 name: "openai-realtime",
                 model: "gpt-realtime-whisper",
@@ -5664,9 +5912,14 @@ mod tests {
                 model: "gpt-4o-transcribe",
                 backend: Box::new(OpenAIRealtimeBackend::new(String::new())),
             },
-            // The mapping is `eq_ignore_ascii_case`, so a config that spells
-            // the model with capitals still resolves to manual-commit. The
-            // gate reads the same function, so it has to agree here too.
+            SendsPromptCase {
+                name: "openai-realtime",
+                model: "gpt-live-transcribe",
+                backend: Box::new(OpenAIRealtimeBackend::new(String::new())),
+            },
+            // The check is `eq_ignore_ascii_case`, so a config that spells
+            // the model with capitals is still promptless. The gate reads the
+            // same function, so it has to agree here too.
             SendsPromptCase {
                 name: "openai-realtime",
                 model: "GPT-Realtime-Whisper",

@@ -16,6 +16,7 @@ use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 use crate::config::types::{unknown_config_keys, unknown_keys_warning, PreservedKeys};
 use crate::llm::LlmConfig;
 use crate::service::{ServiceManager, OPENRC_SERVICE, SYSTEMD_UNIT};
+use crate::transcription::openai_realtime_protocol::openai_model_supports_languages;
 use crate::{
     AsrSidecarConfig, AudioConfig, Config, DeepgramConfig, GeneralConfig, GroqConfig,
     InjectorBackend, InputConfig, LocalWhisperConfig, OpenAiCompatibleRealtimeConfig, OpenAiConfig,
@@ -378,6 +379,7 @@ pub fn run_setup() -> Result<()> {
         hooks: None,
         overlay: if overlay { overlay_config } else { None },
         llm_commands: Vec::new(),
+        replacements: Default::default(),
     };
 
     let config_path = write_config(&config)?;
@@ -560,7 +562,31 @@ pub(crate) fn configure_backend(
                 "WHISRS_OPENAI_API_KEY",
             )?;
             let model = if backend == "openai-realtime" {
-                "gpt-realtime-whisper".to_string()
+                let choices = [
+                    "gpt-realtime-whisper (manual-commit, no prompt or vocabulary)",
+                    "gpt-live-transcribe  (manual-commit, prompt, vocabulary and language hints)",
+                    "gpt-4o-transcribe    (server-vad, prompt and vocabulary)",
+                ];
+                let current = existing
+                    .and_then(|c| c.openai.as_ref())
+                    .map(|o| o.model.as_str());
+                let default = match current {
+                    Some("gpt-live-transcribe") => 1,
+                    Some("gpt-4o-transcribe") => 2,
+                    _ => 0,
+                };
+                let selection = Select::new()
+                    .with_prompt("Select OpenAI Realtime model")
+                    .items(&choices)
+                    .default(default)
+                    .interact()
+                    .context("failed to read realtime model selection")?;
+                match selection {
+                    1 => "gpt-live-transcribe",
+                    2 => "gpt-4o-transcribe",
+                    _ => "gpt-realtime-whisper",
+                }
+                .to_string()
             } else {
                 let selection = Select::new()
                     .with_prompt("Select OpenAI model")
@@ -580,7 +606,20 @@ pub(crate) fn configure_backend(
                 .to_string()
             };
             Ok(BackendConfigSelection {
-                openai: Some(OpenAiConfig { api_key, model }),
+                openai: Some(OpenAiConfig {
+                    api_key,
+                    languages: if backend == "openai-realtime"
+                        && openai_model_supports_languages(&model)
+                    {
+                        existing
+                            .and_then(|c| c.openai.as_ref())
+                            .map(|o| o.languages.clone())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
+                    model,
+                }),
                 ..BackendConfigSelection::default()
             })
         }
@@ -1604,7 +1643,7 @@ fn setup_uinput_permissions() {
                         }
                     } else {
                         // Write the rule inline if contrib file not found.
-                        let rule = "KERNEL==\"uinput\", SUBSYSTEM==\"misc\", MODE=\"0660\", GROUP=\"input\", TAG+=\"uaccess\"\nKERNEL==\"uinput\", SUBSYSTEM==\"misc\", TEST==\"/usr/bin/setfacl\", RUN+=\"/usr/bin/setfacl -m g:input:rw /dev/$name\"";
+                        let rule = "KERNEL==\"uinput\", SUBSYSTEM==\"misc\", MODE=\"0660\", GROUP=\"input\", TAG+=\"uaccess\", OPTIONS+=\"static_node=uinput\"\nKERNEL==\"uinput\", SUBSYSTEM==\"misc\", TEST==\"/usr/bin/setfacl\", RUN+=\"/usr/bin/setfacl -m g:input:rw /dev/$name\"";
                         let status = std::process::Command::new("sudo")
                             .args([
                                 "bash",

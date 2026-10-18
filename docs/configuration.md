@@ -12,6 +12,9 @@ backend = "groq"            # groq | deepgram-streaming | deepgram | openai-real
 language = "en"             # ISO 639-1 or "auto"
 silence_timeout_ms = 2000   # auto-stop after silence (streaming only)
 notify = true               # desktop notifications
+history = true              # save dictations to ~/.local/share/whisrs/history.jsonl for
+                            # `whisrs log`. false stops new writes only: existing
+                            # entries stay until `whisrs log --clear`
 remove_filler_words = true  # strip "um", "uh", "you know", etc.
 filler_words = []           # custom list (empty = use built-in defaults)
 audio_feedback = true       # play tones on record start/stop/done
@@ -31,9 +34,9 @@ prompt = "Speech is in English or Spanish. Transcribe in the language spoken; ne
                             # asr-sidecar, which takes it as its `hotwords` field.
                             # Deepgram sends no prompt — use vocabulary there instead.
                             # openai-compatible-realtime sends neither, so neither key
-                            # reaches it. openai-realtime sends a prompt only on
-                            # server-VAD models like gpt-4o-transcribe, not on the
-                            # gpt-realtime-whisper that `whisrs setup` writes for it)
+                            # reaches it. openai-realtime sends a prompt with
+                            # gpt-live-transcribe and gpt-4o-transcribe, but not
+                            # with gpt-realtime-whisper)
                             # `whisrsd` warns at startup if either key targets a backend
                             # that discards it. `whisrs config` warns the same on save.
 tray = true                 # system tray icon (requires SNI host like waybar)
@@ -230,7 +233,8 @@ clipboard_only = false
 #     screen takes Ctrl+A as its prefix, and many tmux users rebind theirs to
 #     match.
 #   * a multi-line LLM reply is refused at a terminal and kept in `whisrs log`
-#     instead of being typed, including inside a terminal-hosted editor.
+#     instead of being typed (discarded with `[general] history = false`),
+#     including inside a terminal-hosted editor.
 #   * the selection copy fallback sends Ctrl+Shift+C instead of Ctrl+C. Stock
 #     xterm and urxvt do not bind Ctrl+Shift+C. The primary selection is tried
 #     first and covers a highlighted selection, so this affects the fallback
@@ -252,6 +256,17 @@ model = "nova-3"
 [openai]
 api_key = "sk-..."
 model = "gpt-4o-mini-transcribe"
+
+# For backend = "openai-realtime", select model = "gpt-live-transcribe".
+# languages = ["ru", "en"]  # expected input languages for mixed-language dictation
+
+# gpt-live-transcribe streams text as you speak and commits the final transcript
+# when recording stops. languages are hints, not an output-language guarantee.
+# Precedence for this model: a per-session `whisrs toggle -l <code>`, then
+# languages, then [general] language sent as a one-item list, then no hint when
+# it is "auto". A -l equal to [general] language counts as no override and keeps
+# the list. On any other model or backend, languages is ignored and `whisrsd`
+# warns at startup. OpenAI also accepts some three-letter and regional codes.
 
 # External OpenAI-compatible realtime server (WebSocket).
 # Use this for Lemonade-style services that speak the OpenAI Realtime
@@ -298,6 +313,11 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 # mode (ignored by "window" and "none"). Lower = snappier output, higher =
 # fewer mid-sentence splits.
 # phrase_silence_ms = 400
+# flash_attn: enable whisper.cpp flash attention (default false). It can cut
+# decode time on GPU builds (cuda), most on long recordings, and may change
+# the output slightly. Little to gain on CPU. Takes effect when the daemon
+# loads the model, so restart it after changing this.
+# flash_attn = false
 
 # Generic local ASR sidecar — talks to a small HTTP service that hosts the
 # model (Moonshine, NVIDIA Parakeet, Microsoft VibeVoice-ASR, …). Keeps
@@ -471,8 +491,9 @@ since both type the model's reply at the cursor.
   the line breaks are kept.
 - **A multi-line reply is refused when the focused window is a terminal.** There
   a line break is an Enter, which would run a command before you have read it.
-  The text is not lost: it goes to the history, so `whisrs log` prints it and you
-  can copy it from there. Ask for a one-liner to get an injected result.
+  The text goes to the history, so `whisrs log` prints it and you can copy it
+  from there. With `[general] history = false` there is no copy, so the result
+  is discarded. Ask for a one-liner to get an injected result.
   You are told when this happens: the "not typed" notification fires even with
   `[general] notify = false`, because that setting means "don't narrate normal
   operation", not "discard my dictation quietly".
@@ -550,6 +571,41 @@ shown — saving other settings touches neither store: your `vocabulary.txt`
 keeps its comments and config.toml keeps its terms. Only
 `vocabulary` gets this treatment; `prompt` and everything else stay in
 `config.toml`.
+
+## Word replacements
+
+`vocabulary` only hints the model. When it still mis-hears a term the same way
+every time, map the wrong text to the right one:
+
+```toml
+[replacements]
+"package build" = "PKGBUILD"
+"whisper s" = "whisrs"
+```
+
+Every dictation is rewritten before it is typed, copied or logged. Keys match
+ignoring case, on whole words, with any spaces or hyphens between the words,
+so "Package-build" matches too. Quote every key: unquoted,
+`node.js = "Node.js"` is a nested table in TOML, so config.toml fails to
+parse and the daemon falls back to built-in defaults. Surrounding punctuation is kept
+("package build." becomes "PKGBUILD."). Values are inserted exactly as
+written. Text is scanned left to right: where several keys start at the same
+word the longest one wins, and a replacement is never itself replaced again.
+An empty value deletes the match and the spaces after it, but not the
+punctuation next to it. Leave filler words to `remove_filler_words`, which
+takes their commas too. Command mode and `[[llm_commands]]` instructions are
+left alone. With `llm_post_process` on, replacements run first, so the LLM
+sees the corrected text (and can still rewrite it).
+
+On streaming backends the text is rewritten one typed chunk at a time. With
+`local-whisper` phrase segmentation or `openai-compatible-realtime` a chunk is
+a whole phrase, so this only misses if you pause in the middle of a key.
+`deepgram-streaming` sends only final results, which end between words: it can
+split a multi-word key across two chunks where Deepgram closes a segment
+(usually a pause), in which case it does not match, but never cuts a word.
+`openai-realtime` streams tokens, so a chunk can also end in the middle of a
+word, and a key like "pack" can match the first half of "package". Batch
+backends see the whole transcript and are not affected.
 
 ## Environment variables
 

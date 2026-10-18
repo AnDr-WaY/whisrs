@@ -103,7 +103,15 @@ impl LocalWhisperBackend {
     /// Defaults to silence-delimited phrase segmentation; see
     /// [`Self::with_segmentation`].
     pub fn new(model_path: String) -> Self {
-        let ctx = match Self::load_model(&model_path) {
+        Self::with_flash_attn(model_path, false)
+    }
+
+    /// Like [`Self::new`], with whisper.cpp flash attention on or off.
+    ///
+    /// It is a context parameter, so it is fixed when the model loads. It
+    /// disables DTW token timestamps, which whisrs does not use.
+    pub fn with_flash_attn(model_path: String, flash_attn: bool) -> Self {
+        let ctx = match Self::load_model(&model_path, flash_attn) {
             Ok(ctx) => {
                 info!("loaded whisper model from {model_path}");
                 Some(Arc::new(ctx))
@@ -134,12 +142,13 @@ impl LocalWhisperBackend {
         self
     }
 
-    fn load_model(path: &str) -> anyhow::Result<whisper_rs::WhisperContext> {
+    fn load_model(path: &str, flash_attn: bool) -> anyhow::Result<whisper_rs::WhisperContext> {
         if !std::path::Path::new(path).exists() {
             anyhow::bail!("model file not found: {path}. Run 'whisrs setup' to download a model.");
         }
 
-        let params = whisper_rs::WhisperContextParameters::default();
+        let mut params = whisper_rs::WhisperContextParameters::default();
+        params.flash_attn(flash_attn);
 
         whisper_rs::WhisperContext::new_with_params(path, params)
             .map_err(|e| anyhow::anyhow!("failed to initialize whisper context: {e}"))

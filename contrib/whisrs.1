@@ -1,4 +1,4 @@
-.TH WHISRS 1 "2026-10-01" "whisrs 0.1.28" "User Commands"
+.TH WHISRS 1 "2026-10-08" "whisrs 0.1.29" "User Commands"
 .SH NAME
 whisrs \- Linux-first voice-to-text dictation CLI
 .SH SYNOPSIS
@@ -62,7 +62,10 @@ Cancel the current recording and discard captured audio. Returns the
 daemon to the idle state. Has no effect if the daemon is not recording.
 .TP
 .B log
-Show recent transcription history.
+Show recent transcription history. Nothing is recorded when
+.B [general] history
+is
+.BR false .
 .RS
 .TP
 \fB\-n\fR, \fB\-\-limit\fR \fIN\fR
@@ -144,9 +147,14 @@ A reply spanning several lines is typed normally \(em translating a paragraph
 or drafting an email is exactly what these commands are for. The one exception
 is a terminal: there a line break is an Enter that runs a command you have not
 read, so a multi-line reply aimed at a terminal is refused rather than typed.
-It is not lost \(em it is written to the history, where
+It is written to the history, where
 .B whisrs log
-recovers it. Ask for a one\-liner to get an injected result. The refusal also
+recovers it; with
+.B [general] history
+set to
+.B false
+there is no copy and it is discarded.
+Ask for a one\-liner to get an injected result. The refusal also
 applies with
 .B [input] paste
 set, since bracketed paste is the foreground program's choice and cannot be

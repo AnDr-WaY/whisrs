@@ -358,10 +358,10 @@ fn strip_wrapping_code_fence(text: &str) -> &str {
         // Content on the fence line: stripping would drop it. Leave the reply
         // whole and let the caller decide (see `is_fence_language_tag`).
         warn!(
-            "llm: fenced reply carries content on the fence line ({:?}); \
-             leaving the fence in place rather than dropping it",
-            info.trim()
+            "llm: fenced reply carries content on the fence line; \
+             leaving the fence in place rather than dropping it"
         );
+        debug!("fence line: {:?}", info.trim());
         return text;
     }
     let Some(body) = body.trim_end().strip_suffix("```") else {
@@ -386,10 +386,8 @@ pub async fn rewrite_text(
     instruction: &str,
 ) -> anyhow::Result<String> {
     let api_key = resolve_api_key(config)?;
-    info!(
-        "llm: sending to LLM (model={}, instruction={:?})",
-        config.model, instruction
-    );
+    info!("llm: sending to LLM (model={})", config.model);
+    debug!("instruction: {:?}", instruction);
     debug!("selected text: {:?}", selected_text);
 
     chat_with_key(

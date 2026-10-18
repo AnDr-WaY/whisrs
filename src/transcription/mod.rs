@@ -15,6 +15,9 @@ pub mod local_whisper {
         pub fn new(_model_path: String) -> Self {
             Self
         }
+        pub fn with_flash_attn(_model_path: String, _flash_attn: bool) -> Self {
+            Self
+        }
         pub fn with_segmentation(self, _mode: &str, _phrase_silence_ms: u64) -> Self {
             self
         }
@@ -141,10 +144,10 @@ pub trait TranscriptionBackend: Send + Sync {
     /// code, not from what the backend "should" do.
     ///
     /// Takes the request because for the realtime profiles the answer is not a
-    /// property of the backend at all — the model is. `openai-realtime` derives
-    /// its turn-detection mode from `config.model`, and the manual-commit arm
-    /// of `OpenAiSessionUpdate::new` drops the prompt, so one backend struct
-    /// sends it for one model and not for another. Backends whose answer is
-    /// fixed ignore the argument.
+    /// property of the backend at all: the model is. `openai-realtime` asks
+    /// `openai_model_supports_prompt(config.model)`, and
+    /// `OpenAiSessionUpdate::new` drops the prompt for gpt-realtime-whisper,
+    /// so one backend struct sends it for one model and not for another.
+    /// Backends whose answer is fixed ignore the argument.
     fn sends_prompt(&self, config: &TranscriptionConfig) -> bool;
 }

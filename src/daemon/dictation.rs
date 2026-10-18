@@ -112,6 +112,7 @@ pub(crate) async fn handle_toggle(
                     silence_timeout_ms: context.config.general.silence_timeout_ms,
                     filler_enabled: context.config.general.remove_filler_words,
                     filler_words: context.config.general.filler_words.clone(),
+                    replacements: context.config.replacements.clone(),
                     audio_feedback: context.config.general.audio_feedback,
                     audio_feedback_volume: context.config.general.audio_feedback_volume,
                     backend_name: context.config.general.backend.clone(),
@@ -119,6 +120,7 @@ pub(crate) async fn handle_toggle(
                     clipboard_fallback: context.config.input.clipboard_fallback,
                     clipboard_only: context.config.input.clipboard_only,
                     terminal_classes: context.config.input.terminal_classes.clone(),
+                    history: context.config.general.history,
                 };
 
                 let task = tokio::spawn(run_streaming_pipeline(params));
@@ -280,6 +282,7 @@ pub(crate) async fn handle_toggle(
                                         // LLM that rewrote them, so `whisrs
                                         // log` can tell the two apart.
                                         save_history_entry(
+                                            context.config.general.history,
                                             &dictation.text,
                                             &history_backend_tag(
                                                 &context.config.general.backend,
