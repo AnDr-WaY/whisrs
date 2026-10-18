@@ -384,8 +384,8 @@ pub enum InjectorBackend {
     /// Force `zwp_virtual_keyboard_v1` (errors at startup if unsupported).
     WaylandVk,
     /// Force the X11 XTEST extension (errors at startup without an X server,
-    /// on Xwayland, or when the XTEST keyboard's layout differs from the
-    /// detected one).
+    /// on Xwayland, or when the XTEST keyboard types differently than the
+    /// detected layout, e.g. an XKB option moved Ctrl or Shift).
     Xtest,
 }
 

@@ -114,7 +114,8 @@ key_delay_ms = 2
 # keys. auto never picks it. It refuses to start on Xwayland, and when the X
 # server's XTEST keyboard has a different layout than the one whisrs detected
 # (a layout set only in xorg.conf, e.g. by `localectl set-x11-keymap`, does
-# not reach that keyboard); run setxkbmap with your layout to fix that.
+# not reach that keyboard; run setxkbmap with your layout to fix that), or
+# when an XKB option moves Ctrl or Shift (e.g. ctrl:swapcaps; use auto).
 backend = "auto"
 # How long to wait, in milliseconds, for physically held modifier keys (Super,
 # Alt, Ctrl, Shift) to be released before whisrs sends a keystroke with a

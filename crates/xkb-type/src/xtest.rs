@@ -56,7 +56,9 @@ fn group1_keysyms(first_keycode: u8, maps: &[xkb::KeySymMap]) -> Group1Keysyms {
 /// The modifiers [`Keyboard`](crate::Keyboard) presses by keycode, with the
 /// keysym each must give: Shift for shifted characters and the terminal
 /// paste (Ctrl+Shift+V), Ctrl for the paste batch's Ctrl+V and
-/// `send_combo` shortcuts.
+/// `send_combo` shortcuts. Each is checked on its own, so an option that
+/// acts only on a combination (`grp:ctrl_shift_toggle` switching group on
+/// Ctrl+Shift) is not caught; the physical keyboard behaves the same.
 const MODIFIERS: [(Key, u32, &str); 2] = [
     (Key::KEY_LEFTSHIFT, KEY_Shift_L, "Shift_L"),
     (Key::KEY_LEFTCTRL, KEY_Control_L, "Control_L"),
@@ -261,8 +263,9 @@ impl XtestSink {
         let mismatches = layout_mismatches(&server, keymap);
         if !mismatches.is_empty() {
             anyhow::bail!(
-                "the X server's XTEST keyboard uses a different layout than the detected one \
-                 (keys for {} differ); run setxkbmap with your layout to fix it",
+                "the X server's XTEST keyboard types differently than the detected layout \
+                 (keys for {} differ); run setxkbmap with your layout, or, if an XKB option \
+                 moves one of these keys (e.g. ctrl:swapcaps), use backend = \"auto\"",
                 mismatches.sample()
             );
         }
