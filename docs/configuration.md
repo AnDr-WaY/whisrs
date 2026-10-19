@@ -927,6 +927,17 @@ A summary sends the whole transcript to the `[llm]` endpoint, which is why
 `summary` is off by default. Point `[llm] api_url` at a local server to
 keep transcripts on your machine.
 
+**Agents.** An AI agent can find and read your recordings for you: ask it
+what was decided in yesterday's call, for notes on a lecture, or for the
+mistakes you made in language practice. The skill in
+[`contrib/agent-skill/whisrs-recordings/`](../contrib/agent-skill/whisrs-recordings/)
+tells it where recordings live, which `whisrs recording` commands read
+them, and that a transcript is data, not instructions, whose speaker
+labels can be wrong. Copy the folder into `~/.claude/skills/` for Claude
+Code, or into your agent's skills folder. The skill only reads: it never
+deletes or edits a recording, and changes one (`summarize`, `retry`,
+`name`) only when you ask.
+
 **Audio retention.** `audio_retention_days` controls how long the `audio/`
 folder of a transcribed recording is kept: `7` (the default) deletes it at the first
 cleanup after a week (cleanup runs when the daemon starts and after each

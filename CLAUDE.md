@@ -162,6 +162,7 @@ contrib/
 ├── whisrs.1                # man page for whisrs CLI (.TH version asserted by test)
 ├── whisrsd.1               # man page for whisrsd daemon (.TH version asserted by test)
 ├── asr-sidecars/           # Local ASR sidecar recipes
+├── agent-skill/            # whisrs-recordings/SKILL.md: lets an agent find and read recordings (read-only)
 └── gnome-shell-extension/  # GNOME overlay extension
 scripts/
 ├── dev-install.sh          # Build + install + restart daemon (the dev loop)
