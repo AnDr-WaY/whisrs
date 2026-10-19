@@ -1158,7 +1158,7 @@ fn speaker_id(kind: TrackKind) -> &'static str {
 
 /// Name for the "me" speaker: `[recording] user_name`, else the passwd full
 /// name, else `$USER`, else "Me".
-fn user_name(recording: &RecordingConfig) -> String {
+pub(crate) fn user_name(recording: &RecordingConfig) -> String {
     recording
         .user_name
         .as_deref()
@@ -1205,7 +1205,7 @@ fn gecos_full_name(gecos: &str) -> Option<String> {
 }
 
 /// Write a file atomically with mode 0600, like `recording.json`.
-fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
     let tmp = path.with_file_name(tmp_name);

@@ -247,6 +247,20 @@ Print the recording's folder.
 \fBcopy\fR \fIID\fR
 Copy the transcript to the clipboard.
 .TP
+\fBname\fR \fIID\fR \fISPEAKER\fR \fINAME\fR
+Name a speaker of a transcribed recording.
+.I SPEAKER
+is its id (such as
+.BR S2 ),
+\(lqSpeaker 2\(rq, or the name it has now;
+.I NAME
+may be several words, and an empty one (\fB""\fR) clears the name you gave.
+The transcript and
+.I recording.json
+are rewritten at once, nothing is transcribed again, and
+.B retry
+keeps the name. Refused while the recording is queued or being transcribed.
+.TP
 \fBretry\fR \fIID\fR [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR] [\fB\-\-with\fR \fINAMES\fR]
 Transcribe the recording again, for example after a failure or in another
 language. A language given here replaces the one the recording saved (as for

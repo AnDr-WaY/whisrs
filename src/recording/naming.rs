@@ -30,11 +30,14 @@
 //! does not count as a voice.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use tracing::info;
 
+use super::render::render_markdown;
 use super::speakers::{ME, MIC, MIC_LABEL, OTHERS, SOURCE_CHANNEL, SOURCE_NONE, SOURCE_SELF};
-use super::{RecordingMeta, Speaker, TrackKind, TranscriptSegment};
+use super::{store, RecordingMeta, RecordingState, Speaker, TrackKind, TranscriptSegment};
+use crate::{Config, RecordingConfig};
 
 /// Most people `--with` may name.
 pub const PARTICIPANTS_MAX: usize = 20;
@@ -252,15 +255,16 @@ fn base(speaker: &Speaker, naming: &Naming<'_>) -> Option<Named> {
     }
 }
 
-/// Whether a speaker already goes by participant `person`'s name. Only the
-/// names given to people count: a track's label or the user's own name never
-/// assigns a participant.
+/// Whether a speaker already goes by participant `person`'s name, or a
+/// name that `person` names in turn (the user calling "Omar" "Omar
+/// Haddad"). Only the names given to people count: a track's label or the
+/// user's own name never assigns a participant.
 fn assigned(person: &str, named: &[Option<Named>]) -> bool {
     named.iter().flatten().any(|n| {
         matches!(
             n.source.as_str(),
             SOURCE_USER | SOURCE_WITH | SOURCE_LLM | SOURCE_LAST
-        ) && names_participant(&n.name, person)
+        ) && (names_participant(&n.name, person) || names_participant(person, &n.name))
     })
 }
 
@@ -516,6 +520,119 @@ pub fn to_ask(meta: &RecordingMeta, user_name: &str) -> Ask {
         }
     }
     ask
+}
+
+/// The LLM's names a processed recording keeps (`source` `llm`), to name
+/// its speakers again without asking ([`rename_speaker`]): a name the user
+/// gives one speaker can take another's.
+pub fn kept_claims(speakers: &[Speaker]) -> Claims {
+    speakers
+        .iter()
+        .filter(|s| s.source == SOURCE_LLM)
+        .map(|s| {
+            (
+                s.id.clone(),
+                Claim {
+                    name: s.name.clone(),
+                    evidence: s.evidence.clone().unwrap_or_default(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The speaker `query` means: its id (`S2`, case aside), else the name it
+/// has now (`Speaker 2`, `Sarah`; case and spacing aside), which must be
+/// one speaker's.
+pub fn resolve_speaker<'a>(speakers: &'a [Speaker], query: &str) -> Result<&'a Speaker, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("which speaker? Give its id (S2), \"Speaker N\" or its name".to_string());
+    }
+    if let Some(speaker) = speakers.iter().find(|s| s.id.eq_ignore_ascii_case(query)) {
+        return Ok(speaker);
+    }
+    let by_name: Vec<&Speaker> = speakers
+        .iter()
+        .filter(|s| normalize(&s.name) == normalize(query))
+        .collect();
+    match by_name.as_slice() {
+        [speaker] => Ok(speaker),
+        [] => {
+            let all: Vec<String> = speakers
+                .iter()
+                .map(|s| format!("{} ({})", s.id, s.name))
+                .collect();
+            Err(format!(
+                "no speaker {query:?}; the speakers are {}",
+                if all.is_empty() {
+                    "none".to_string()
+                } else {
+                    all.join(", ")
+                }
+            ))
+        }
+        several => {
+            let ids: Vec<&str> = several.iter().map(|s| s.id.as_str()).collect();
+            Err(format!(
+                "{} speakers are called {query:?} ({}): give its id",
+                several.len(),
+                ids.join(", ")
+            ))
+        }
+    }
+}
+
+/// Refuse a recording without a transcript: its speakers are not known
+/// until it is transcribed.
+pub fn ensure_transcribed(meta: &RecordingMeta) -> anyhow::Result<()> {
+    if meta.status == RecordingState::Done {
+        return Ok(());
+    }
+    let state = serde_json::to_string(&meta.status).unwrap_or_default();
+    anyhow::bail!(
+        "recording {} has no transcript yet (status {}): name its speakers once it is \
+         transcribed",
+        meta.id,
+        state.trim_matches('"')
+    )
+}
+
+/// `whisrs recording name`: in the transcribed recording in `dir`, give the
+/// speaker `speaker` means ([`resolve_speaker`]) the name `name`, or clear
+/// the name the user gave it when `name` is blank. The name is kept in
+/// `speaker_names`, every speaker is named again (the LLM's names are kept,
+/// [`kept_claims`], and it is not asked again), and `recording.json` and the
+/// transcript are written; nothing is transcribed. Returns the speaker's id
+/// and the new meta. The caller keeps the recording from being processed
+/// meanwhile.
+pub fn rename_speaker(
+    dir: &Path,
+    config: &Config,
+    speaker: &str,
+    name: &str,
+) -> anyhow::Result<(String, RecordingMeta)> {
+    let mut meta = store::read_meta(dir)?;
+    ensure_transcribed(&meta)?;
+    let id = resolve_speaker(&meta.speakers, speaker)
+        .map_err(|e| anyhow::anyhow!("recording {}: {e}", meta.id))?
+        .id
+        .clone();
+    if name.trim().is_empty() {
+        meta.speaker_names.remove(&id);
+    } else {
+        let name = validate_person_name(name).map_err(anyhow::Error::msg)?;
+        meta.speaker_names.insert(id.clone(), name);
+    }
+    let claims = kept_claims(&meta.speakers);
+    let user = super::process::user_name(&RecordingConfig::effective(config));
+    name_speakers(&mut meta, &user, &claims);
+    super::process::write_private(
+        &store::transcript_path(dir, &meta.id),
+        render_markdown(&meta).as_bytes(),
+    )?;
+    store::write_meta(dir, &meta)?;
+    Ok((id, meta))
 }
 
 #[cfg(test)]
@@ -1187,6 +1304,195 @@ mod tests {
                 known: vec![("S1".into(), "Sarah".into())],
             }
         );
+    }
+
+    /// A speaker is found by its id, case aside, or by the name it has
+    /// now, case and spacing aside; an unknown or shared name is refused.
+    #[test]
+    fn speakers_are_found_by_id_or_name() {
+        let (mut speakers, _) = three_voices();
+        for (s, name) in speakers
+            .iter_mut()
+            .zip(["Yosif", "Speaker 1", "Sarah Smith", "Speaker 2"])
+        {
+            s.name = name.into();
+        }
+        let id = |query: &str| resolve_speaker(&speakers, query).map(|s| s.id.as_str());
+        assert_eq!(id("S2"), Ok("S2"));
+        assert_eq!(id(" s3 "), Ok("S3"));
+        assert_eq!(id("ME"), Ok("me"));
+        assert_eq!(id("Speaker 2"), Ok("S3"));
+        assert_eq!(id("speaker  1"), Ok("S1"));
+        assert_eq!(id("sarah smith"), Ok("S2"));
+        let err = id("Speaker 9").unwrap_err();
+        assert!(err.contains("no speaker \"Speaker 9\""), "{err}");
+        assert!(err.contains("S1 (Speaker 1)"), "{err}");
+        assert!(id(" ").unwrap_err().contains("which speaker"));
+        speakers[3].name = "Sarah Smith".into();
+        let err = resolve_speaker(&speakers, "Sarah Smith").unwrap_err();
+        assert!(
+            err.contains("2 speakers are called") && err.contains("S2, S3"),
+            "{err}"
+        );
+    }
+
+    /// A transcribed recording of three voices and three participants,
+    /// with its transcript, in a temporary folder.
+    fn transcribed(participants: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (id, dir) = store::create(tmp.path(), chrono::Local::now(), Some("sync")).unwrap();
+        let mut meta = RecordingMeta::new(id, Some("sync".into()), chrono::Local::now());
+        let (speakers, segments) = three_voices();
+        meta.speakers = speakers;
+        meta.segments = segments;
+        meta.participants = people(participants);
+        meta.status = RecordingState::Done;
+        name_speakers(&mut meta, "Tester", &Claims::new());
+        store::write_meta(&dir, &meta).unwrap();
+        (tmp, dir)
+    }
+
+    fn config() -> Config {
+        toml::from_str("[recording]\nuser_name = \"Tester\"\n").unwrap()
+    }
+
+    fn names_in(dir: &Path) -> Vec<(String, String)> {
+        store::read_meta(dir)
+            .unwrap()
+            .speakers
+            .iter()
+            .map(|s| (s.id.clone(), format!("{} ({})", s.name, s.source)))
+            .collect()
+    }
+
+    /// Naming a speaker rewrites the stored names and the transcript at
+    /// once, and the other steps run again around it: the unnamed are
+    /// numbered again and the last voice left is the last participant.
+    #[test]
+    fn renaming_a_speaker_names_the_rest_again() {
+        let (_tmp, dir) = transcribed(&["Sarah", "Omar", "Dana"]);
+        let (id, meta) = rename_speaker(&dir, &config(), "Speaker 2", " Omar ").unwrap();
+        assert_eq!(id, "S2");
+        assert_eq!(
+            meta.speaker_names,
+            BTreeMap::from([("S2".into(), "Omar".into())])
+        );
+        assert_eq!(
+            names_in(&dir),
+            expect(&[
+                ("me", "Tester (self)"),
+                ("S1", "Speaker 1 (none)"),
+                ("S2", "Omar (user)"),
+                ("S3", "Speaker 2 (none)"),
+            ])
+        );
+        let md = std::fs::read_to_string(store::transcript_path(&dir, &meta.id)).unwrap();
+        assert!(md.contains("  - \"Omar\"\n"), "{md}");
+        assert!(md.contains("] Omar:** words"), "{md}");
+
+        // By its current name; the last voice left is then Dana.
+        rename_speaker(&dir, &config(), "speaker 1", "Sarah").unwrap();
+        assert_eq!(
+            names_in(&dir),
+            expect(&[
+                ("me", "Tester (self)"),
+                ("S1", "Sarah (user)"),
+                ("S2", "Omar (user)"),
+                ("S3", "Dana (last)"),
+            ])
+        );
+        // A longer name for a participant still assigns them.
+        rename_speaker(&dir, &config(), "omar", "Omar Haddad").unwrap();
+        assert_eq!(names_in(&dir)[3].1, "Dana (last)");
+
+        // An empty name clears the user's: S2 is unnamed again.
+        let (_, meta) = rename_speaker(&dir, &config(), "S2", "  ").unwrap();
+        assert_eq!(
+            meta.speaker_names,
+            BTreeMap::from([("S1".into(), "Sarah".into())])
+        );
+        assert_eq!(
+            names_in(&dir),
+            expect(&[
+                ("me", "Tester (self)"),
+                ("S1", "Sarah (user)"),
+                ("S2", "Speaker 1 (none)"),
+                ("S3", "Speaker 2 (none)"),
+            ])
+        );
+        let md = std::fs::read_to_string(store::transcript_path(&dir, &meta.id)).unwrap();
+        assert!(!md.contains("Omar"), "{md}");
+    }
+
+    /// The LLM's names stay when another speaker is named, and give way
+    /// to the user's: a name the user takes is no longer the LLM's.
+    #[test]
+    fn the_llms_names_stay_unless_the_user_takes_them() {
+        let (_tmp, dir) = transcribed(&[]);
+        let mut meta = store::read_meta(&dir).unwrap();
+        let claims = Claims::from([(
+            "S1".to_string(),
+            Claim {
+                name: "Sarah".into(),
+                evidence: "I'm Sarah".into(),
+            },
+        )]);
+        name_speakers(&mut meta, "Tester", &claims);
+        store::write_meta(&dir, &meta).unwrap();
+
+        rename_speaker(&dir, &config(), "S2", "Omar").unwrap();
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(
+            (
+                meta.speakers[1].name.as_str(),
+                meta.speakers[1].source.as_str()
+            ),
+            ("Sarah", "llm")
+        );
+        assert_eq!(meta.speakers[1].evidence.as_deref(), Some("I'm Sarah"));
+
+        rename_speaker(&dir, &config(), "S3", "sarah").unwrap();
+        assert_eq!(
+            names_in(&dir),
+            expect(&[
+                ("me", "Tester (self)"),
+                ("S1", "Speaker 1 (none)"),
+                ("S2", "Omar (user)"),
+                ("S3", "sarah (user)"),
+            ])
+        );
+    }
+
+    /// An unknown speaker, a bad name and a recording without a
+    /// transcript are refused, and nothing is written.
+    #[test]
+    fn renaming_refuses_what_it_cannot_name() {
+        let (_tmp, dir) = transcribed(&[]);
+        let before = std::fs::read(dir.join("recording.json")).unwrap();
+        for (speaker, name, want) in [
+            ("S9", "Dana", "no speaker \"S9\""),
+            ("S1", "Dana\nSmith", "single line"),
+            ("S1", &"x".repeat(PERSON_NAME_MAX + 1), "at most 64"),
+        ] {
+            let err = rename_speaker(&dir, &config(), speaker, name).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(want),
+                "{speaker} {name}: {err:#}"
+            );
+        }
+        assert_eq!(std::fs::read(dir.join("recording.json")).unwrap(), before);
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.status = RecordingState::Processing;
+        store::write_meta(&dir, &meta).unwrap();
+        let before = std::fs::read(dir.join("recording.json")).unwrap();
+        let err = rename_speaker(&dir, &config(), "S1", "Dana").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("has no transcript yet (status processing)"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(dir.join("recording.json")).unwrap(), before);
+        assert!(!store::transcript_path(&dir, &meta.id).exists());
     }
 
     #[test]

@@ -630,6 +630,7 @@ pub(crate) async fn handle_recording(
         RecordingAction::Status => Ok(()),
         RecordingAction::Retry => retry(&context, id.as_deref().unwrap_or("last"), &options).await,
         RecordingAction::Copy => copy(&context, id.as_deref().unwrap_or("last")).await,
+        RecordingAction::Name => name(&context, id.as_deref().unwrap_or("last"), &options).await,
     };
     match result {
         Ok(()) => recording_response(&context),
@@ -1432,6 +1433,48 @@ async fn retry(
             .system_language
             .as_deref()
             .unwrap_or("the configured language")
+    );
+    Ok(())
+}
+
+/// Name a speaker of a transcribed recording (`whisrs recording name`):
+/// `options` give the speaker and the name (empty clears it). The
+/// recording is reserved like a retry while its files are rewritten, so a
+/// recording that is queued or being transcribed is refused, and a retry
+/// cannot start under the rename.
+async fn name(context: &Arc<DaemonContext>, query: &str, options: &RecordingOptions) -> Result<()> {
+    let (Some(speaker), Some(name)) = (options.speaker.clone(), options.name.clone()) else {
+        bail!("naming a speaker needs the speaker and its name (an empty name clears it)");
+    };
+    let root = recordings_root(&context.config);
+    let dir = store::resolve(&root, query)?;
+    let meta = store::read_meta(&dir)?;
+    // Checked before the reservation too, so one never holds back the stop
+    // of a recording in progress.
+    whisrs::recording::naming::ensure_transcribed(&meta)?;
+    let active = ActiveRecording::from_meta(&dir, &meta);
+    if context.recording.reserve(&active).is_err() {
+        bail!(
+            "recording {} is queued or being transcribed: name its speakers once its \
+             transcript is ready",
+            meta.id
+        );
+    }
+    let ctx = Arc::clone(context);
+    let rename_dir = dir.clone();
+    let renamed = tokio::task::spawn_blocking(move || {
+        whisrs::recording::naming::rename_speaker(&rename_dir, &ctx.config, &speaker, &name)
+    })
+    .await
+    .context("speaker naming panicked")
+    .and_then(|r| r);
+    context.recording.unreserve(&meta.id);
+    let (id, renamed) = renamed?;
+    let speaker = renamed.speakers.iter().find(|s| s.id == id);
+    info!(
+        "recording {}: speaker {id} is now {:?}",
+        renamed.id,
+        speaker.map_or("", |s| s.name.as_str())
     );
     Ok(())
 }
@@ -2672,6 +2715,136 @@ mod tests {
         let meta = store::read_meta(&dir).unwrap();
         assert_eq!(meta.shared_mic, Some(false));
         assert_eq!(meta.participants, ["Omar", "Dana"]);
+    }
+
+    /// `recording name` for `speaker` and `name`, as the CLI sends it.
+    async fn name_speaker(context: &Arc<DaemonContext>, speaker: &str, name: &str) -> Response {
+        let options = options_from_ipc(&format!(
+            r#"{{"cmd":"recording","action":"name","id":"last","speaker":{},"name":{}}}"#,
+            serde_json::to_string(speaker).unwrap(),
+            serde_json::to_string(name).unwrap()
+        ));
+        handle_recording(
+            Arc::clone(context),
+            RecordingAction::Name,
+            None,
+            Some("last".into()),
+            options,
+        )
+        .await
+    }
+
+    /// A recording that crashed, recovered and transcribed: one speaker,
+    /// the user ("Tester").
+    async fn transcribed_recording(
+        root: &Path,
+    ) -> (
+        Arc<DaemonContext>,
+        mpsc::UnboundedReceiver<QueuedRecording>,
+        PathBuf,
+    ) {
+        let dir = crashed_recording(root);
+        let (context, mut queue) = test_context(root, working_backend());
+        recover_on_startup(Arc::clone(&context)).await;
+        process_one(&context, queue.try_recv().unwrap()).await;
+        assert_eq!(store::read_meta(&dir).unwrap().status, RecordingState::Done);
+        (context, queue, dir)
+    }
+
+    /// `recording name` renames a speaker at once (recording.json and the
+    /// transcript, without transcribing), a retry keeps the name, and an
+    /// empty name clears it.
+    #[tokio::test]
+    async fn naming_a_speaker_rewrites_the_transcript_and_survives_a_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue, dir) = transcribed_recording(tmp.path()).await;
+        let speaker = |dir: &Path| {
+            let meta = store::read_meta(dir).unwrap();
+            let me = &meta.speakers[0];
+            (me.id.clone(), me.name.clone(), me.source.clone())
+        };
+        assert_eq!(speaker(&dir), ("me".into(), "Tester".into(), "self".into()));
+
+        let response = name_speaker(&context, "Tester", "Yo").await;
+        assert!(
+            matches!(response, Response::Recording { .. }),
+            "{response:?}"
+        );
+        assert!(queue.try_recv().is_err(), "nothing is transcribed");
+        assert_eq!(speaker(&dir), ("me".into(), "Yo".into(), "user".into()));
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.speaker_names.get("me").map(String::as_str), Some("Yo"));
+        let md = std::fs::read_to_string(store::transcript_path(&dir, &meta.id)).unwrap();
+        assert!(md.contains("] Yo:** fine"), "{md}");
+        assert_eq!(context.recording.status(), RecordingStatus::default());
+
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
+        process_one(&context, queue.try_recv().unwrap()).await;
+        assert_eq!(speaker(&dir), ("me".into(), "Yo".into(), "user".into()));
+
+        let response = name_speaker(&context, "me", "").await;
+        assert!(
+            matches!(response, Response::Recording { .. }),
+            "{response:?}"
+        );
+        assert_eq!(speaker(&dir), ("me".into(), "Tester".into(), "self".into()));
+        assert!(store::read_meta(&dir).unwrap().speaker_names.is_empty());
+    }
+
+    /// A recording queued or being transcribed, or without a transcript,
+    /// is refused, as are an unknown speaker and a bad name, and nothing is
+    /// written.
+    #[tokio::test]
+    async fn naming_is_refused_while_a_recording_is_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        crashed_recording(tmp.path());
+        let (context, _queue) = test_context(tmp.path(), working_backend());
+        let refused = |response: Response, want: &str| {
+            let Response::Error { message } = &response else {
+                panic!("accepted: {response:?}");
+            };
+            assert!(message.contains(want), "{want:?} not in {message:?}");
+        };
+        refused(
+            name_speaker(&context, "me", "Yo").await,
+            "has no transcript yet (status recording)",
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue, dir) = transcribed_recording(tmp.path()).await;
+        let before = std::fs::read(dir.join("recording.json")).unwrap();
+        // Queued for a retry, or being transcribed: reserved.
+        let meta = store::read_meta(&dir).unwrap();
+        let active = ActiveRecording::from_meta(&dir, &meta);
+        context.recording.reserve(&active).unwrap();
+        refused(
+            name_speaker(&context, "me", "Yo").await,
+            "is queued or being transcribed",
+        );
+        context.recording.unreserve(&meta.id);
+
+        refused(
+            name_speaker(&context, "S4", "Yo").await,
+            "no speaker \"S4\"",
+        );
+        refused(name_speaker(&context, " ", "Yo").await, "which speaker?");
+        refused(
+            name_speaker(&context, "me", "Yo\u{7}").await,
+            "single line of text",
+        );
+        let response = handle_recording(
+            Arc::clone(&context),
+            RecordingAction::Name,
+            None,
+            Some("last".into()),
+            RecordingOptions::default(),
+        )
+        .await;
+        refused(response, "needs the speaker and its name");
+        assert_eq!(std::fs::read(dir.join("recording.json")).unwrap(), before);
+        assert_eq!(context.recording.status(), RecordingStatus::default());
     }
 
     /// Bad values from a client other than the CLI are refused before a

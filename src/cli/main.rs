@@ -126,7 +126,18 @@ impl LanguageArgs {
             shared_mic: speakers.shared_mic,
             num_speakers: speakers.num_speakers,
             participants: speakers.with.map(|p| p.0),
+            ..Default::default()
         }
+    }
+}
+
+/// What `whisrs recording name` sends: the speaker, and the name's words
+/// joined with spaces (an empty one clears it, which the daemon decides).
+fn name_options(speaker: String, name: &[String]) -> RecordingOptions {
+    RecordingOptions {
+        speaker: Some(speaker),
+        name: Some(name.join(" ")),
+        ..Default::default()
     }
 }
 
@@ -241,6 +252,18 @@ enum RecordingCmd {
         languages: LanguageArgs,
         #[command(flatten)]
         speakers: SpeakerArgs,
+    },
+    /// Name a speaker of a transcribed recording. The transcript is
+    /// rewritten at once (nothing is transcribed again), and `retry` keeps
+    /// the name
+    Name {
+        /// Recording id, a unique id prefix, or `last`
+        id: String,
+        /// The speaker: its id (S2), "Speaker 2", or the name it has now
+        speaker: String,
+        /// The new name, quoted or not; "" clears the name you gave
+        #[arg(required = true, num_args = 1..)]
+        name: Vec<String>,
     },
 }
 
@@ -531,6 +554,12 @@ async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
             Some(id),
             languages.into_options(None, speakers),
         ),
+        RecordingCmd::Name { id, speaker, name } => (
+            RecordingAction::Name,
+            None,
+            Some(id),
+            name_options(speaker, &name),
+        ),
         RecordingCmd::List { json } => return recording_list(json),
         RecordingCmd::Show { id, format } => return recording_show(&id, format),
         RecordingCmd::Path { id } => {
@@ -540,6 +569,7 @@ async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
         }
     };
 
+    let query = id.clone();
     let response = request(Command::Recording {
         action,
         title,
@@ -548,6 +578,9 @@ async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
     })
     .await?;
     match response {
+        Response::Recording { .. } if action == RecordingAction::Name => {
+            print_speakers(query.as_deref().unwrap_or("last"));
+        }
         Response::Recording { recording } => {
             match action {
                 RecordingAction::Copy => println!("Transcript copied to the clipboard."),
@@ -681,6 +714,30 @@ fn recording_state_name(state: RecordingState) -> &'static str {
         RecordingState::Failed => "failed",
         RecordingState::Waiting => "waiting",
     }
+}
+
+/// After `whisrs recording name`: the recording's speakers as the daemon
+/// just wrote them, one per line with its id and how it got its name.
+fn print_speakers(query: &str) {
+    let dir = resolve_or_exit(query);
+    let meta = match store::read_meta(&dir) {
+        Ok(meta) => meta,
+        Err(e) => exit_with_error(&format!("{e:#}")),
+    };
+    println!("{}", format_speakers(&meta));
+}
+
+/// `Speakers of <id>:` and a line per speaker: `  S2  Sarah  (user)`.
+fn format_speakers(meta: &RecordingMeta) -> String {
+    let width = meta.speakers.iter().map(|s| s.id.len()).max().unwrap_or(0);
+    let mut out = format!("Speakers of {}:", meta.id);
+    for speaker in &meta.speakers {
+        out.push_str(&format!(
+            "\n  {:width$}  {}  ({})",
+            speaker.id, speaker.name, speaker.source
+        ));
+    }
+    out
 }
 
 /// `whisrs recording show`.
@@ -878,6 +935,7 @@ mod tests {
             shared_mic: None,
             num_speakers: None,
             participants: None,
+            ..Default::default()
         };
         for action in ["start", "toggle"] {
             let cmd = parse_recording(&[
@@ -1060,6 +1118,56 @@ mod tests {
                 assert!(Cli::try_parse_from(argv).is_err(), "{head:?} {bad}");
             }
         }
+    }
+
+    /// `name` takes the recording, the speaker and the name, which may be
+    /// several words; an empty name clears it, and none at all is refused.
+    #[test]
+    fn recording_name_parses() {
+        let options = |args: &[&str]| match parse_recording(args) {
+            RecordingCmd::Name { id, speaker, name } => {
+                let options = name_options(speaker, &name);
+                (id, options.speaker.unwrap(), options.name.unwrap())
+            }
+            _ => panic!("expected name"),
+        };
+        assert_eq!(
+            options(&["name", "last", "S2", "Sarah"]),
+            ("last".into(), "S2".into(), "Sarah".into())
+        );
+        assert_eq!(
+            options(&["name", "2026-10", "Speaker 2", "Omar", "Haddad"]),
+            ("2026-10".into(), "Speaker 2".into(), "Omar Haddad".into())
+        );
+        assert_eq!(options(&["name", "last", "S2", ""]).2, "");
+        for bad in [&["name", "last", "S2"][..], &["name", "last"]] {
+            let mut argv = vec!["whisrs", "recording"];
+            argv.extend_from_slice(bad);
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn speakers_print_with_their_ids_and_sources() {
+        let mut meta = RecordingMeta::new("m1".into(), None, chrono::Local::now());
+        let speaker = |id: &str, name: &str, source: &str| whisrs::recording::Speaker {
+            id: id.into(),
+            name: name.into(),
+            source: source.into(),
+            evidence: None,
+            talk_ms: 0,
+            channel: None,
+            minor: false,
+        };
+        meta.speakers = vec![
+            speaker("me", "Yosif", "self"),
+            speaker("S1", "Sarah", "user"),
+            speaker("S12", "Speaker 1", "none"),
+        ];
+        assert_eq!(
+            format_speakers(&meta),
+            "Speakers of m1:\n  me   Yosif  (self)\n  S1   Sarah  (user)\n  S12  Speaker 1  (none)"
+        );
     }
 
     #[test]

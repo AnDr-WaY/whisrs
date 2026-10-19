@@ -39,7 +39,8 @@ whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
 whisrs config    # interactive config editor
 whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sarah, Omar"] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
-whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id>
+whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id> [--with "..."]
+whisrs recording name <id> <S2|"Speaker 2"|current name> <name>   # "" clears; rewrites the .md at once
 
 # Dev loop: rebuild this checkout and restart the daemon
 ./scripts/dev-install.sh             # build + install to ~/.cargo/bin + restart
@@ -222,11 +223,12 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
-{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy", "title": "...", "id": "...",
+{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name", "title": "...", "id": "...",
  "language": "de", "mic_language": "de", "system_language": "auto", "others": "Video",
- "shared_mic": true, "num_speakers": 3, "participants": ["Sarah", "Omar"]}
-                                     // all but action optional: title (start/toggle), id (retry/copy,
-                                     // default "last"), the languages, shared_mic, num_speakers and
+ "shared_mic": true, "num_speakers": 3, "participants": ["Sarah", "Omar"],
+ "speaker": "S2", "name": "Sarah"}
+                                     // all but action optional: title (start/toggle), id (retry/copy/name,
+                                     // default "last"), speaker + name (name; "" clears), the languages, shared_mic, num_speakers and
                                      // participants (--with) (start/toggle/retry;
                                      // a track's own language wins over "language"), others = system track
                                      // label (start/toggle). Validated by the daemon
@@ -238,7 +240,8 @@ a `History` variant carrying log entries, and a `Recording` variant carrying the
 
 Adding a command means a new `Command` variant plus a daemon handler. Never put logic in
 `src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording
-list/show/path` read the recordings folder directly, which keeps transcript bodies off IPC.
+list/show/path` read the recordings folder directly, which keeps transcript bodies off IPC
+(as does the speaker list `whisrs recording name` prints after the daemon renamed one).
 
 ## Configuration
 

@@ -10,7 +10,10 @@ use crate::recording::{RecordingAction, RecordingOptions, RecordingStatus};
 // IPC protocol
 // ---------------------------------------------------------------------------
 
-/// Commands sent from the CLI to the daemon over the Unix socket.
+/// Commands sent from the CLI to the daemon over the Unix socket. One is
+/// built per request and dropped once handled, so the size of the
+/// `Recording` variant does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 pub enum Command {
@@ -54,11 +57,12 @@ pub enum Command {
     Speak,
     /// The recording feature: record mic + system audio, then transcribe.
     /// `title` names a new recording (`start`/`toggle`); `id` selects an
-    /// existing one (`retry`/`copy`). `options` (flat on the wire:
+    /// existing one (`retry`/`copy`/`name`). `options` (flat on the wire:
     /// `language`, `mic_language`, `system_language`, `others`,
     /// `shared_mic`, `num_speakers`, `participants`) set the languages and
     /// speaker settings of a new recording or a retry and the label of the
     /// system track; a request without them gets the config defaults.
+    /// `name` takes `speaker` and `name` (blank clears it).
     Recording {
         action: RecordingAction,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -548,6 +552,7 @@ mod tests {
             shared_mic: Some(true),
             num_speakers: Some(3),
             participants: Some(vec!["Sarah".to_string(), "Omar".to_string()]),
+            ..Default::default()
         };
         let cmd = Command::Recording {
             action: RecordingAction::Start,
@@ -591,6 +596,33 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    /// `name` carries the speaker and its new name beside the id.
+    #[test]
+    fn recording_name_roundtrip() {
+        let json = r#"{"cmd":"recording","action":"name","id":"last","speaker":"Speaker 2","name":"Sarah"}"#;
+        let Command::Recording {
+            action,
+            id,
+            options,
+            ..
+        } = serde_json::from_str(json).unwrap()
+        else {
+            panic!("not a recording command");
+        };
+        assert_eq!(action, RecordingAction::Name);
+        assert_eq!(id.as_deref(), Some("last"));
+        assert_eq!(options.speaker.as_deref(), Some("Speaker 2"));
+        assert_eq!(options.name.as_deref(), Some("Sarah"));
+        let back = serde_json::to_string(&Command::Recording {
+            action,
+            title: None,
+            id,
+            options,
+        })
+        .unwrap();
+        assert_eq!(back, json);
     }
 
     #[test]

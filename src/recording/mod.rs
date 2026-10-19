@@ -69,8 +69,8 @@ pub fn validate_others_label(label: &str) -> Result<String, String> {
 /// Per-recording settings a `recording` command may carry, all optional.
 /// The languages, `num_speakers`, `shared_mic` and `participants` apply to
 /// `start`, a `toggle` that starts, and `retry`; `others` to `start` and
-/// `toggle`. What is left out keeps the config default, or for a retry what
-/// the recording stored.
+/// `toggle`; `speaker` and `name` to `name`. What is left out keeps the
+/// config default, or for a retry what the recording stored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingOptions {
     /// Language of both tracks.
@@ -97,6 +97,13 @@ pub struct RecordingOptions {
     /// speakers ([`naming`]). An empty list names nobody.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub participants: Option<Vec<String>>,
+    /// The speaker `name` renames: its id (`S2`), `Speaker N`, or the name
+    /// it has now ([`naming::resolve_speaker`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    /// Its new name; blank clears the name the user gave it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl RecordingOptions {
@@ -119,6 +126,23 @@ impl RecordingOptions {
             participants: self
                 .participants
                 .map(naming::validate_participants)
+                .transpose()?,
+            speaker: self
+                .speaker
+                .map(|s| match s.trim() {
+                    "" => {
+                        Err("which speaker? Give its id (S2), \"Speaker N\" or its name"
+                            .to_string())
+                    }
+                    s => Ok(s.to_string()),
+                })
+                .transpose()?,
+            name: self
+                .name
+                .map(|n| match n.trim() {
+                    "" => Ok(String::new()),
+                    n => naming::validate_person_name(n),
+                })
                 .transpose()?,
         })
     }
@@ -145,6 +169,8 @@ pub enum RecordingAction {
     Toggle,
     Retry,
     Copy,
+    /// Name a speaker of a transcribed recording (`whisrs recording name`).
+    Name,
 }
 
 /// Daemon-level recording phase, reported over IPC and to the tray.
@@ -725,6 +751,7 @@ mod tests {
             shared_mic: Some(true),
             num_speakers: Some(NUM_SPEAKERS_MAX),
             participants: Some(vec![" Sarah ".into(), "Omar".into()]),
+            ..Default::default()
         }
         .validated()
         .unwrap();
@@ -738,6 +765,7 @@ mod tests {
                 shared_mic: Some(true),
                 num_speakers: Some(NUM_SPEAKERS_MAX),
                 participants: Some(vec!["Sarah".into(), "Omar".into()]),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -802,6 +830,41 @@ mod tests {
             .validated()
             .unwrap_err();
             assert!(err.contains(want), "{names:?}: {err}");
+        }
+        // The speaker and the name of `name`: trimmed; a blank name clears.
+        let named = RecordingOptions {
+            speaker: Some(" S2 ".into()),
+            name: Some(" Sarah Smith ".into()),
+            ..Default::default()
+        }
+        .validated()
+        .unwrap();
+        assert_eq!(
+            (named.speaker.as_deref(), named.name.as_deref()),
+            (Some("S2"), Some("Sarah Smith"))
+        );
+        let cleared = RecordingOptions {
+            name: Some("  ".into()),
+            ..Default::default()
+        }
+        .validated()
+        .unwrap();
+        assert_eq!(cleared.name.as_deref(), Some(""));
+        for bad in [
+            RecordingOptions {
+                speaker: Some(" ".into()),
+                ..Default::default()
+            },
+            RecordingOptions {
+                name: Some("Sarah\u{7}".into()),
+                ..Default::default()
+            },
+            RecordingOptions {
+                name: Some("x".repeat(65)),
+                ..Default::default()
+            },
+        ] {
+            assert!(bad.clone().validated().is_err(), "{bad:?}");
         }
         // An empty list is nobody: a retry clears the participants with it.
         assert_eq!(

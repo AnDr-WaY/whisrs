@@ -625,12 +625,14 @@ given the option replaces it.
 it is; every other voice stays "Speaker N". These steps run in order, and
 the first one that names a speaker wins:
 
-1. Your mic is you (`user_name`), when it holds one voice.
-2. `--with "Sarah, Omar"` on `start` or `toggle` says who the recording is
+1. A name you give with `whisrs recording name` (see below) wins over
+   everything else.
+2. Your mic is you (`user_name`), when it holds one voice.
+3. `--with "Sarah, Omar"` on `start` or `toggle` says who the recording is
    with: names separated by commas, at most 20, each up to 64 characters.
    When the system audio holds exactly one voice and you list exactly one
    person, that voice is them.
-3. With `name_speakers = true`, the LLM of the `[llm]` section (the one
+4. With `name_speakers = true`, the LLM of the `[llm]` section (the one
    command mode uses) is asked who the voices still unnamed are. It must
    quote the words that show each name, such as "I'm Sarah" or "Thanks,
    Sarah", and a name is kept only when that quote is in the transcript
@@ -640,10 +642,10 @@ the first one that names a speaker wins:
    ("Sam" for "Samantha"), and the name is written as you listed it. A name
    the LLM gives two speakers, a name another speaker already has, and
    your own name are refused. Anything else stays unnamed.
-4. When every voice on the system audio but one has a name, one person you
+5. When every voice on the system audio but one has a name, one person you
    listed is left, there are as many voices as people listed, and
    `shared_mic` is off, the last voice is that person.
-5. Everyone else is "Speaker N", numbered in the order they first speak. A
+6. Everyone else is "Speaker N", numbered in the order they first speak. A
    single voice on the system audio keeps the others label instead.
 
 `name_speakers` is off by default, because it sends parts of every
@@ -665,9 +667,29 @@ room with you. `--with` names only voices that were told apart: with one
 speaker per track, name the system audio with `--others` instead.
 `whisrs recording retry <id> --with "..."` replaces the names, and
 `--with ""` clears them. `recording.json` keeps them as `participants`, and
-each speaker's `source` says how it got its name: `self`, `with`, `llm`
-(with the quote as `evidence`), `last`, `channel` (the others label) or
-`none` (Speaker N).
+each speaker's `source` says how it got its name: `user`, `self`, `with`,
+`llm` (with the quote as `evidence`), `last`, `channel` (the others label)
+or `none` (Speaker N).
+
+To name a speaker yourself, give the recording, the speaker as its id
+(`S2`), as "Speaker 2" or by the name it has now, and the name:
+
+```
+whisrs recording name last "Speaker 2" Sarah
+whisrs recording name last S3 Omar Haddad
+whisrs recording name last Sarah ""        # clear the name you gave
+```
+
+The transcript and `recording.json` are rewritten at once, without
+transcribing anything again, and the other steps run again around your
+name: the voices still unnamed are numbered again (so "Speaker 3" can
+become "Speaker 2"), and the last voice left can now be the last person you
+listed. The command prints each speaker's id, name and source. Your names
+are kept in `recording.json` as `speaker_names`, apart from the computed
+`speakers`, so `whisrs recording retry` keeps them. A retry that changes
+how the voices are told apart (`--num-speakers`, `--shared-mic`) can number
+them differently, so check the names after one. A recording that is queued
+or being transcribed is refused until its transcript is ready.
 
 **A diarization sidecar.** A local server that only finds who speaks when,
 so speakers can be told apart offline or with a backend that cannot do it
