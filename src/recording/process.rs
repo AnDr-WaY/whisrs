@@ -301,6 +301,10 @@ async fn process_with_timing(
     };
     meta.speakers = speakers::assign(&mut mic, &mut system, &context);
     meta.segments = merge_channels(mic, system);
+    // An earlier attempt's notes of names that lost their voice go; this
+    // one adds its own.
+    meta.errors
+        .retain(|note| !note.starts_with(naming::USER_NAME_LOST));
     let claims = llm_names::claims(config, &mut meta, &user, llm_names::LLM_TIMEOUT).await;
     naming::name_speakers(&mut meta, &user, &claims);
     meta.diarization = Some(if separated {
@@ -2782,7 +2786,11 @@ mod tests {
         let (tmp, _) = call();
         let mut meta = store::read_meta(tmp.path()).unwrap();
         meta.participants = vec!["Sarah".into(), "Omar".into()];
-        meta.speaker_names = [("S1".to_string(), "Sarah".to_string())].into();
+        meta.speaker_names = [(
+            "S1".to_string(),
+            crate::recording::SpeakerName::plain("Sarah"),
+        )]
+        .into();
         store::write_meta(tmp.path(), &meta).unwrap();
         let config = speaker_config("diarization = \"backend\"\n");
         let meta = run_labelled(tmp.path(), call_voices(), &config).await;
@@ -3053,6 +3061,51 @@ mod tests {
         assert!(
             md.contains("## Notes\n\n- speakers were not named by the LLM: "),
             "{md}"
+        );
+    }
+
+    /// A name the user gave a voice never moves to another voice when a
+    /// retry tells them apart differently: here the backend hears the
+    /// named voice's lines as the first voice's, and the voice now second
+    /// is someone else, so the name is dropped with a note.
+    #[tokio::test]
+    async fn a_users_name_never_moves_to_another_voice() {
+        let (tmp, _) = call();
+        let config = speaker_config("diarization = \"backend\"\n");
+        run_labelled(tmp.path(), call_voices(), &config).await;
+        let (id, _) = naming::rename_speaker(tmp.path(), &config, "S2", "Omar").unwrap();
+        assert_eq!(id, "S2", "the voice first heard at 9 s");
+
+        let mut backend = call_voices();
+        backend.voices = vec![
+            ("hi all", "0"),
+            ("hello there", "0"),
+            ("good morning", "0"),
+            ("so the plan", "1"),
+        ];
+        let meta = run_labelled(tmp.path(), backend, &config).await;
+        assert_eq!(
+            speaker_names(&meta),
+            [("me", "Tester"), ("S1", "Speaker 1"), ("S2", "Speaker 2")],
+            "S2 is now the voice first heard at 14 s: not Omar"
+        );
+        assert!(meta.speaker_names.is_empty(), "{:?}", meta.speaker_names);
+        let notes: Vec<&String> = meta
+            .errors
+            .iter()
+            .filter(|n| n.starts_with(naming::USER_NAME_LOST))
+            .collect();
+        assert_eq!(notes.len(), 1, "{:?}", meta.errors);
+        assert!(notes[0].contains("\"Omar\" (was S2)"), "{notes:?}");
+
+        // The next attempt's notes replace this one's.
+        let meta = run_labelled(tmp.path(), call_voices(), &config).await;
+        assert!(
+            meta.errors
+                .iter()
+                .all(|n| !n.starts_with(naming::USER_NAME_LOST)),
+            "{:?}",
+            meta.errors
         );
     }
 

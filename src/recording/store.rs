@@ -305,6 +305,20 @@ pub fn waiting(root: &Path) -> Vec<(PathBuf, RecordingMeta)> {
 /// a negative value keeps audio forever. `Failed`, `Waiting`, `Recording` and
 /// `Processing` recordings are never touched, so their audio stays retryable.
 pub fn sweep_retention(root: &Path, days: i64, now: DateTime<Local>) -> Vec<PathBuf> {
+    sweep_retention_guarded(root, days, now, |_| Some(()))
+}
+
+/// [`sweep_retention`], taking `guard(id)` before a recording is touched and
+/// holding it until its `recording.json` is written. A recording `guard`
+/// refuses (another writer has it, a rename) is skipped until the next
+/// sweep, and the meta is read again under the guard, so what that writer
+/// wrote is kept.
+pub fn sweep_retention_guarded<G>(
+    root: &Path,
+    days: i64,
+    now: DateTime<Local>,
+    mut guard: impl FnMut(&str) -> Option<G>,
+) -> Vec<PathBuf> {
     if days < 0 {
         return Vec::new();
     }
@@ -317,14 +331,31 @@ pub fn sweep_retention(root: &Path, days: i64, now: DateTime<Local>) -> Vec<Path
     };
     let max_age = chrono::Duration::days(days);
     let mut swept = Vec::new();
-    for (dir, mut meta) in recordings {
-        if meta.status != RecordingState::Done || meta.audio_deleted {
+    for (dir, listed) in recordings {
+        let due = |meta: &RecordingMeta| {
+            let reference = meta.ended_at.unwrap_or(meta.started_at);
+            meta.status == RecordingState::Done
+                && !meta.audio_deleted
+                && now.signed_duration_since(reference) >= max_age
+        };
+        if !due(&listed) {
             continue;
         }
-        let reference = meta.ended_at.unwrap_or(meta.started_at);
-        if now.signed_duration_since(reference) < max_age {
+        let Some(_held) = guard(&listed.id) else {
+            debug!("recording {} is busy; its audio is swept later", listed.id);
             continue;
-        }
+        };
+        let mut meta = match read_meta(&dir) {
+            Ok(meta) if due(&meta) => meta,
+            Ok(_) => continue,
+            Err(e) => {
+                warn!(
+                    "failed to read {} for audio retention: {e:#}",
+                    dir.display()
+                );
+                continue;
+            }
+        };
         let audio = dir.join(AUDIO_DIR);
         match fs::remove_dir_all(&audio) {
             Ok(()) => {}
@@ -548,6 +579,47 @@ mod tests {
         assert_eq!(interrupted(root), vec![proc_, rec]);
         let waiting: Vec<PathBuf> = waiting(root).into_iter().map(|(dir, _)| dir).collect();
         assert_eq!(waiting, vec![earlier, later], "oldest first");
+    }
+
+    /// The sweep skips a recording its guard refuses, and reads the meta
+    /// again under the guard: what another writer wrote between the
+    /// listing and the guard is kept.
+    #[test]
+    fn the_sweep_skips_what_is_busy_and_keeps_what_was_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = at(2026, 1, 1, 9, 0);
+        let busy = seed(
+            tmp.path(),
+            old,
+            Some("busy"),
+            RecordingState::Done,
+            Some(old),
+        );
+        let renamed = seed(
+            tmp.path(),
+            old,
+            Some("renamed"),
+            RecordingState::Done,
+            Some(old),
+        );
+        let busy_id = read_meta(&busy).unwrap().id;
+        let swept = sweep_retention_guarded(tmp.path(), 0, at(2026, 2, 1, 9, 0), |id| {
+            if id == busy_id {
+                return None;
+            }
+            // A rename lands just before the guard is taken.
+            let mut meta = read_meta(&renamed).unwrap();
+            meta.speaker_names
+                .insert("S1".into(), crate::recording::SpeakerName::plain("Sarah"));
+            write_meta(&renamed, &meta).unwrap();
+            Some(())
+        });
+        assert_eq!(swept, vec![renamed.clone()]);
+        assert!(audio_path(&busy, TrackKind::Mic).exists(), "skipped");
+        assert!(!read_meta(&busy).unwrap().audio_deleted);
+        let meta = read_meta(&renamed).unwrap();
+        assert!(meta.audio_deleted);
+        assert_eq!(meta.speaker_names["S1"].name, "Sarah", "the rename is kept");
     }
 
     #[test]

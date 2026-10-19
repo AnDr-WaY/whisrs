@@ -641,11 +641,14 @@ the first one that names a speaker wins:
 4. With `name_speakers = true`, the LLM of the `[llm]` section (the one
    command mode uses) is asked who the voices still unnamed are. It must
    quote the words that show each name, such as "I'm Sarah" or "Thanks,
-   Sarah", and a name is kept only when that quote is in the transcript
-   (case and spacing aside) and holds the name or its first name. When you
-   listed people, the name must be one of them: a full name, a first name,
-   or a short form of three letters or more that starts a first name
-   ("Sam" for "Samantha"), and the name is written as you listed it. A name
+   Sarah", and a name is kept only when that quote's words are words of
+   one line of the transcript, in order (case, spacing and punctuation
+   aside), and hold the name or its first name. When you listed people,
+   the name must be one of them: a full name, a first name, or a short
+   form of three letters or more that starts a first name ("Sam" for
+   "Samantha"), and the name is written as you listed it. When you did
+   not, only the part of the name the quote holds is kept ("Thanks, Sarah"
+   names "Sarah", never "Sarah Jones"). A name
    the LLM gives two speakers, a name another speaker already has, and
    your own name are refused. Anything else stays unnamed.
 5. When every voice on the system audio but one has a name, one person you
@@ -666,7 +669,8 @@ not JSON), the transcript is still written, without its names, and
 `recording.json` notes why under `errors`.
 
 A `minor` voice is never named after someone you listed, and does not count
-as a voice. Your own name in the `--with` list is you and is not counted.
+as a voice. Your own name in the `--with` list (your full name, your first
+name, or a short form of it) is you and is not counted.
 With a shared mic that holds other voices, one person listed is not enough
 to name the one voice on the system audio, since that person may be in the
 room with you. `--with` names only voices that were told apart: with one
@@ -692,10 +696,18 @@ name: the voices still unnamed are numbered again (so "Speaker 3" can
 become "Speaker 2"), and the last voice left can now be the last person you
 listed. The command prints each speaker's id, name and source. Your names
 are kept in `recording.json` as `speaker_names`, apart from the computed
-`speakers`, so `whisrs recording retry` keeps them. A retry that changes
-how the voices are told apart (`--num-speakers`, `--shared-mic`) can number
-them differently, so check the names after one. A recording that is queued
-or being transcribed is refused until its transcript is ready.
+`speakers`, so `whisrs recording retry` keeps them. A retry sends the audio
+again, and the voices can come back numbered differently, so a name you
+gave a voice remembers where that voice first spoke (`anchor`: its track
+and `first_ms`) and follows it: after a retry it goes to the voice first
+heard on that track within a second of that moment, whatever its number is
+now. When no voice is, the name is dropped rather than put on someone
+else, and the transcript's notes ask you to name the speakers again. A name
+you gave a track's own speaker (you, or the system audio when its voices
+are not told apart) stays with it. Clearing a name you gave over the LLM's
+brings the LLM's name back only with the next retry, which asks it again.
+A recording that is queued or being transcribed is refused until its
+transcript is ready.
 
 **A diarization sidecar.** A local server that only finds who speaks when,
 so speakers can be told apart offline or with a backend that cannot do it

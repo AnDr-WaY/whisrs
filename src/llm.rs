@@ -441,6 +441,9 @@ fn resolve_api_key(config: &LlmConfig) -> anyhow::Result<String> {
     Ok(key)
 }
 
+/// How much of an error answer's body an error carries.
+const ERROR_BODY_CHARS: usize = 300;
+
 /// POST a prepared messages array to the configured `/chat/completions`
 /// endpoint.
 ///
@@ -476,14 +479,16 @@ async fn chat_with_key(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         if status.as_u16() == 401 {
-            anyhow::bail!("LLM API: invalid API key — check [llm] api_key in config.toml");
+            anyhow::bail!("LLM API: invalid API key; check [llm] api_key in config.toml");
         }
-        anyhow::bail!("LLM API error ({status}): {body}");
+        let detail: String = body.trim().chars().take(ERROR_BODY_CHARS).collect();
+        anyhow::bail!("LLM API error ({status}): {detail}");
     }
 
     let chat_response: ChatResponse = response
         .json()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("failed to parse LLM response")?;
 
     let result = chat_response
@@ -539,6 +544,37 @@ mod tests {
         assert_eq!(body["model"], "local-model");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "hello");
+    }
+
+    /// An answer that is not a chat completion, and an error answer, leave
+    /// the URL out and carry at most 300 characters of the body.
+    #[tokio::test]
+    async fn chat_errors_are_short_and_leave_the_url_out() {
+        use crate::transcription::test_server::serve_responses;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions?key=s3cret",
+            listener.local_addr().unwrap()
+        );
+        let long: &'static str = Box::leak("x".repeat(5000).into_boxed_str());
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![(200, "<html>not json</html>"), (500, long), (401, "{}")],
+        ));
+        let config = local(url);
+        let send = || chat(&config, Vec::new(), Duration::from_secs(10));
+        let err = format!("{:#}", send().await.unwrap_err());
+        assert!(err.starts_with("failed to parse LLM response"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+        let err = format!("{:#}", send().await.unwrap_err());
+        assert!(err.starts_with("LLM API error (500"), "{err}");
+        assert_eq!(err.matches('x').count(), 300, "{err}");
+        let err = format!("{:#}", send().await.unwrap_err());
+        assert_eq!(
+            err,
+            "LLM API: invalid API key; check [llm] api_key in config.toml"
+        );
+        server.await.unwrap();
     }
 
     /// A server that never answers ends in a clear error at the timeout.

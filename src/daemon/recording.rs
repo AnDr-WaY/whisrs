@@ -232,6 +232,10 @@ struct RecordingView {
     /// Waiting for the network ([`RecordingState::Waiting`]) and neither
     /// queued nor processing: what [`retry_waiting`] looks at.
     waiting: Vec<ActiveRecording>,
+    /// Ids of finished recordings whose files are being rewritten (a
+    /// rename, the retention sweep): not shown, but neither queued nor
+    /// rewritten by anyone else meanwhile ([`RecordingRuntime::hold`]).
+    held: Vec<String>,
 }
 
 impl RecordingView {
@@ -261,6 +265,7 @@ impl RecordingView {
     fn is_pending(&self, id: &str) -> bool {
         self.processing.as_ref().is_some_and(|p| p.id == id)
             || self.queued.iter().any(|q| q.id == id)
+            || self.held.iter().any(|h| h == id)
     }
 }
 
@@ -477,6 +482,27 @@ impl RecordingRuntime {
 
     fn unreserve(&self, id: &str) {
         self.update(|v| v.queued.retain(|q| q.id != id));
+    }
+
+    /// Claim recording `id` while its files are rewritten, like
+    /// [`Self::reserve`] but without showing it as queued: the tray and
+    /// `status` see nothing. Refuses one that is queued, being processed
+    /// or held. Follow with [`Self::release`].
+    fn hold(&self, id: &str) -> Result<()> {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if view.is_pending(id) {
+            bail!("recording {id} is queued, being transcribed or being rewritten");
+        }
+        view.held.push(id.to_string());
+        Ok(())
+    }
+
+    fn release(&self, id: &str) {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .held
+            .retain(|h| h != id);
     }
 
     /// Hand a reserved recording to the worker. A recording waiting for the
@@ -1439,9 +1465,10 @@ async fn retry(
 
 /// Name a speaker of a transcribed recording (`whisrs recording name`):
 /// `options` give the speaker and the name (empty clears it). The
-/// recording is reserved like a retry while its files are rewritten, so a
-/// recording that is queued or being transcribed is refused, and a retry
-/// cannot start under the rename.
+/// recording is held while its files are rewritten
+/// ([`RecordingRuntime::hold`]), so a recording that is queued or being
+/// transcribed is refused, and neither a retry nor the retention sweep
+/// rewrites it under the rename.
 async fn name(context: &Arc<DaemonContext>, query: &str, options: &RecordingOptions) -> Result<()> {
     let (Some(speaker), Some(name)) = (options.speaker.clone(), options.name.clone()) else {
         bail!("naming a speaker needs the speaker and its name (an empty name clears it)");
@@ -1449,11 +1476,10 @@ async fn name(context: &Arc<DaemonContext>, query: &str, options: &RecordingOpti
     let root = recordings_root(&context.config);
     let dir = store::resolve(&root, query)?;
     let meta = store::read_meta(&dir)?;
-    // Checked before the reservation too, so one never holds back the stop
-    // of a recording in progress.
+    // Checked before the hold too, so one never holds back the stop of a
+    // recording in progress.
     whisrs::recording::naming::ensure_transcribed(&meta)?;
-    let active = ActiveRecording::from_meta(&dir, &meta);
-    if context.recording.reserve(&active).is_err() {
+    if context.recording.hold(&meta.id).is_err() {
         bail!(
             "recording {} is queued or being transcribed: name its speakers once its \
              transcript is ready",
@@ -1468,7 +1494,7 @@ async fn name(context: &Arc<DaemonContext>, query: &str, options: &RecordingOpti
     .await
     .context("speaker naming panicked")
     .and_then(|r| r);
-    context.recording.unreserve(&meta.id);
+    context.recording.release(&meta.id);
     let (id, renamed) = renamed?;
     let speaker = renamed.speakers.iter().find(|s| s.id == id);
     info!(
@@ -1838,13 +1864,35 @@ pub(crate) async fn run_network_retries(context: Arc<DaemonContext>) {
     }
 }
 
-async fn sweep(context: &DaemonContext) {
+/// A [`RecordingRuntime::hold`] on one recording, released when dropped.
+struct Held {
+    context: Arc<DaemonContext>,
+    id: String,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.context.recording.release(&self.id);
+    }
+}
+
+/// Delete the audio of finished recordings past `audio_retention_days`,
+/// each held while its `recording.json` is rewritten, so a rename is never
+/// lost to it; one that is busy is swept next time.
+async fn sweep(context: &Arc<DaemonContext>) {
     let root = recordings_root(&context.config);
     let days = RecordingConfig::effective(&context.config).audio_retention_days;
-    let swept =
-        tokio::task::spawn_blocking(move || store::sweep_retention(&root, days, Local::now()))
-            .await
-            .unwrap_or_default();
+    let ctx = Arc::clone(context);
+    let swept = tokio::task::spawn_blocking(move || {
+        store::sweep_retention_guarded(&root, days, Local::now(), |id| {
+            ctx.recording.hold(id).ok().map(|()| Held {
+                context: Arc::clone(&ctx),
+                id: id.to_string(),
+            })
+        })
+    })
+    .await
+    .unwrap_or_default();
     for dir in swept {
         info!("deleted recording audio past retention: {}", dir.display());
     }
@@ -2773,7 +2821,14 @@ mod tests {
         assert!(queue.try_recv().is_err(), "nothing is transcribed");
         assert_eq!(speaker(&dir), ("me".into(), "Yo".into(), "user".into()));
         let meta = store::read_meta(&dir).unwrap();
-        assert_eq!(meta.speaker_names.get("me").map(String::as_str), Some("Yo"));
+        assert_eq!(
+            meta.speaker_names.get("me").map(|n| n.name.as_str()),
+            Some("Yo")
+        );
+        assert_eq!(
+            meta.speaker_names["me"].anchor, None,
+            "the user's own track"
+        );
         let md = std::fs::read_to_string(store::transcript_path(&dir, &meta.id)).unwrap();
         assert!(md.contains("] Yo:** fine"), "{md}");
         assert_eq!(context.recording.status(), RecordingStatus::default());
@@ -2845,6 +2900,52 @@ mod tests {
         refused(response, "needs the speaker and its name");
         assert_eq!(std::fs::read(dir.join("recording.json")).unwrap(), before);
         assert_eq!(context.recording.status(), RecordingStatus::default());
+    }
+
+    /// A rename holds its recording without showing it as queued, and
+    /// meanwhile a retry, another rename and the retention sweep leave it
+    /// alone.
+    #[tokio::test]
+    async fn a_held_recording_is_hidden_and_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = test_context_with(
+            tmp.path(),
+            working_backend(),
+            "audio_retention_days = 0
+",
+        );
+        let (id, dir) = store::create(tmp.path(), Local::now(), Some("done")).unwrap();
+        let mut meta = RecordingMeta::new(id.clone(), Some("done".into()), Local::now());
+        meta.status = RecordingState::Done;
+        meta.ended_at = Some(Local::now() - chrono::Duration::days(1));
+        meta.tracks.push(track_meta(TrackKind::Mic, "test".into()));
+        store::write_meta(&dir, &meta).unwrap();
+        let audio = store::audio_path(&dir, TrackKind::Mic);
+        std::fs::write(&audio, whisrs::audio::wav::encode_wav(&[0; 1600]).unwrap()).unwrap();
+
+        context.recording.hold(&id).unwrap();
+        assert_eq!(
+            context.recording.status(),
+            RecordingStatus::default(),
+            "not shown"
+        );
+        assert!(context.recording.hold(&id).is_err());
+        assert!(retry(&context, "last", &RecordingOptions::default())
+            .await
+            .is_err());
+        assert!(queue.try_recv().is_err());
+        sweep(&context).await;
+        assert!(audio.exists(), "the sweep waits for it");
+
+        context.recording.release(&id);
+        sweep(&context).await;
+        assert!(!audio.exists());
+        assert!(store::read_meta(&dir).unwrap().audio_deleted);
+        assert_eq!(context.recording.status(), RecordingStatus::default());
+        assert!(
+            context.recording.hold(&id).is_ok(),
+            "the sweep let go of it"
+        );
     }
 
     /// Bad values from a client other than the CLI are refused before a

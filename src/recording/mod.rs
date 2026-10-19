@@ -340,6 +340,59 @@ pub struct Speaker {
     pub minor: bool,
 }
 
+/// A name the user gave a speaker, in `recording.json` `speaker_names`.
+/// Written as `{"name": "Sarah", "anchor": {"channel": "system",
+/// "first_ms": 4000}}`; a plain string (a file written before anchors were
+/// stored) loads as a name without one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "SpeakerNameEntry")]
+pub struct SpeakerName {
+    pub name: String,
+    /// Where the voice was heard first when it was named. `None` for a
+    /// track's own speaker (`me`, `others`, `mic`) and in an older file:
+    /// then the id alone says whose name it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<VoiceAnchor>,
+}
+
+impl SpeakerName {
+    /// A name tied to its speaker's id alone.
+    pub fn plain(name: impl Into<String>) -> Self {
+        SpeakerName {
+            name: name.into(),
+            anchor: None,
+        }
+    }
+}
+
+/// The track and the time a voice first speaks ([`SpeakerName::anchor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceAnchor {
+    pub channel: TrackKind,
+    pub first_ms: u64,
+}
+
+/// The two shapes a [`SpeakerName`] loads from.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SpeakerNameEntry {
+    Plain(String),
+    Full {
+        name: String,
+        #[serde(default)]
+        anchor: Option<VoiceAnchor>,
+    },
+}
+
+impl From<SpeakerNameEntry> for SpeakerName {
+    fn from(entry: SpeakerNameEntry) -> Self {
+        match entry {
+            SpeakerNameEntry::Plain(name) => SpeakerName::plain(name),
+            SpeakerNameEntry::Full { name, anchor } => SpeakerName { name, anchor },
+        }
+    }
+}
+
 /// One line of the final transcript, on the recording timeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptSegment {
@@ -396,9 +449,11 @@ pub struct RecordingMeta {
     pub participants: Vec<String>,
     /// The names the user gave speakers (`whisrs recording name`), by
     /// speaker id. Kept apart from `speakers`, which processing computes
-    /// again, so a retry keeps them; they win over every other name.
+    /// again, so a retry keeps them; they win over every other name. A
+    /// voice's name carries where it first spoke, so it follows the voice
+    /// when a retry numbers the voices differently ([`naming`]).
     #[serde(default)]
-    pub speaker_names: BTreeMap<String, String>,
+    pub speaker_names: BTreeMap<String, SpeakerName>,
     /// How the voices were told apart, set by processing: `"off"`, or the
     /// method and model, e.g. `"deepgram:latest"`. `None` in a recording
     /// processed before speakers were separated.
@@ -585,7 +640,19 @@ mod tests {
         meta.shared_mic = Some(true);
         meta.num_speakers = Some(3);
         meta.participants = vec!["Sarah".into(), "Omar".into()];
-        meta.speaker_names = BTreeMap::from([("S2".to_string(), "Dana".to_string())]);
+        meta.speaker_names = BTreeMap::from([
+            ("me".to_string(), SpeakerName::plain("Yo")),
+            (
+                "S2".to_string(),
+                SpeakerName {
+                    name: "Dana".into(),
+                    anchor: Some(VoiceAnchor {
+                        channel: TrackKind::System,
+                        first_ms: 4200,
+                    }),
+                },
+            ),
+        ]);
         meta.diarization = Some("deepgram:latest".into());
         meta.speakers = vec![Speaker {
             id: "S1".into(),
@@ -627,6 +694,32 @@ mod tests {
         assert_eq!(meta.diarization, None);
         assert!(meta.participants.is_empty());
         assert!(meta.speaker_names.is_empty());
+    }
+
+    /// A user's name loads as written before anchors were stored (a plain
+    /// string) and as written now; a name without an anchor is written
+    /// back without one.
+    #[test]
+    fn speaker_names_load_old_and_new() {
+        let meta: RecordingMeta = serde_json::from_str(
+            r#"{"version":1,"id":"m","title":null,"status":"done",
+                "started_at":"2026-10-02T14:00:00+02:00","sample_rate":16000,"tracks":[],
+                "speaker_names":{"S1":"Sarah",
+                    "S2":{"name":"Omar","anchor":{"channel":"system","first_ms":9000}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(meta.speaker_names["S1"], SpeakerName::plain("Sarah"));
+        assert_eq!(
+            meta.speaker_names["S2"].anchor,
+            Some(VoiceAnchor {
+                channel: TrackKind::System,
+                first_ms: 9000
+            })
+        );
+        assert_eq!(
+            serde_json::to_string(&meta.speaker_names["S1"]).unwrap(),
+            r#"{"name":"Sarah"}"#
+        );
     }
 
     /// A `recording.json` processed before speakers were separated loads:

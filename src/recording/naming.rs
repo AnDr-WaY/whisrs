@@ -7,7 +7,9 @@
 //!
 //! 1. **User.** A name given with `whisrs recording name`, kept in
 //!    `recording.json` `speaker_names` apart from the computed list, so a
-//!    retry keeps it (`user`).
+//!    retry keeps it (`user`). A voice's name follows the voice, by where
+//!    it first spoke, when a retry numbers the voices differently
+//!    ([`rebind_user_names`]).
 //! 2. **Self.** The mic, when it is one voice (`me`), is the user
 //!    (`[recording] user_name`, `self`).
 //! 3. **Participants.** With exactly one remote voice and exactly one
@@ -36,7 +38,10 @@ use tracing::info;
 
 use super::render::render_markdown;
 use super::speakers::{ME, MIC, MIC_LABEL, OTHERS, SOURCE_CHANNEL, SOURCE_NONE, SOURCE_SELF};
-use super::{store, RecordingMeta, RecordingState, Speaker, TrackKind, TranscriptSegment};
+use super::{
+    store, RecordingMeta, RecordingState, Speaker, SpeakerName, TrackKind, TranscriptSegment,
+    VoiceAnchor,
+};
 use crate::{Config, RecordingConfig};
 
 /// Most people `--with` may name.
@@ -175,7 +180,7 @@ pub struct Naming<'a> {
     /// Several people share the mic.
     pub shared_mic: bool,
     /// Names the user gave, by speaker id (`whisrs recording name`).
-    pub user_names: &'a BTreeMap<String, String>,
+    pub user_names: &'a BTreeMap<String, SpeakerName>,
 }
 
 impl<'a> Naming<'a> {
@@ -191,13 +196,13 @@ impl<'a> Naming<'a> {
     }
 
     /// The participants other than the user, who is on the mic: a listed
-    /// name equal to the user's (case and spacing aside) is the user.
+    /// name that names the user ([`names_participant`]: their full name,
+    /// first name or a short form of it) is the user.
     fn listed_people(&self) -> Vec<&'a str> {
-        let user = normalize(self.user_name);
         self.participants
             .iter()
             .map(String::as_str)
-            .filter(|p| normalize(p) != user)
+            .filter(|p| !names_participant(p, self.user_name))
             .collect()
     }
 }
@@ -291,8 +296,8 @@ fn before_llm(speakers: &[Speaker], naming: &Naming<'_>) -> Vec<Option<Named>> {
 
     // 1. The user, over everything else.
     for (i, speaker) in speakers.iter().enumerate() {
-        if let Some(name) = naming.user_names.get(&speaker.id) {
-            named[i] = Some(Named::new(name, SOURCE_USER));
+        if let Some(given) = naming.user_names.get(&speaker.id) {
+            named[i] = Some(Named::new(&given.name, SOURCE_USER));
         }
     }
 
@@ -476,11 +481,74 @@ fn decide(
         .collect()
 }
 
+/// How far from where a named voice first spoke its voice is found again
+/// ([`rebind_user_names`]).
+pub const ANCHOR_TOLERANCE_MS: u64 = 1000;
+
+/// Start of the note `recording.json` keeps in `errors` when a name the
+/// user gave matches no voice any more ([`rebind_user_names`]).
+pub const USER_NAME_LOST: &str = "a speaker name you gave was dropped: ";
+
+/// Where speaker `id` is first heard in `segments`, and on which track.
+fn anchor_of(segments: &[TranscriptSegment], id: &str) -> Option<VoiceAnchor> {
+    segments
+        .iter()
+        .filter(|s| s.speaker == id)
+        .min_by_key(|s| s.start_ms)
+        .map(|s| VoiceAnchor {
+            channel: s.channel,
+            first_ms: s.start_ms,
+        })
+}
+
+/// Give each name the user gave a voice to the voice that first speaks on
+/// its track within [`ANCHOR_TOLERANCE_MS`] of where the named one did,
+/// whatever its id is now: a retry sends the audio again, and the voices
+/// can come back numbered differently. A name that finds no voice is
+/// dropped, and the returned note says so. A name without an anchor (a
+/// track's own speaker, or a name stored before anchors) stays on its id.
+pub fn rebind_user_names(meta: &mut RecordingMeta) -> Vec<String> {
+    let old = std::mem::take(&mut meta.speaker_names);
+    let (plain, anchored): (Vec<_>, Vec<_>) = old
+        .into_iter()
+        .partition(|(_, given)| given.anchor.is_none());
+    let mut names: BTreeMap<String, SpeakerName> = plain.into_iter().collect();
+    let mut notes = Vec::new();
+    for (id, given) in anchored {
+        let anchor = given.anchor.expect("partitioned on the anchor");
+        let found = meta
+            .speakers
+            .iter()
+            .filter(|s| voice_track(&s.id).is_some() && !names.contains_key(&s.id))
+            .filter_map(|s| {
+                let at = anchor_of(&meta.segments, &s.id)?;
+                let off = at.first_ms.abs_diff(anchor.first_ms);
+                (at.channel == anchor.channel && off <= ANCHOR_TOLERANCE_MS).then_some((s, off))
+            })
+            .min_by_key(|(_, off)| *off);
+        match found {
+            Some((speaker, _)) => {
+                names.insert(speaker.id.clone(), given);
+            }
+            None => notes.push(format!(
+                "{USER_NAME_LOST}{:?} (was {id}) matches no voice after the speakers were \
+                 told apart again; name them again with whisrs recording name",
+                given.name
+            )),
+        }
+    }
+    meta.speaker_names = names;
+    notes
+}
+
 /// Name `meta`'s speakers, from scratch: every step of the module docs, for
 /// a user called `user_name`, with the LLM's `claims` (already checked
-/// against the transcript, [`super::llm_names::verify`]). Their ids, talk
-/// times and order stay.
+/// against the transcript, [`super::llm_names::verify`]). The user's names
+/// follow their voices first ([`rebind_user_names`]; the notes of names
+/// that found none go to `errors`). Their ids, talk times and order stay.
 pub fn name_speakers(meta: &mut RecordingMeta, user_name: &str, claims: &Claims) {
+    let lost = rebind_user_names(meta);
+    meta.errors.extend(lost);
     let named = decide(
         &meta.speakers,
         &meta.segments,
@@ -501,13 +569,20 @@ pub struct Ask {
     pub voices: Vec<String>,
     /// The speakers those steps named after a person, as (id, name).
     pub known: Vec<(String, String)>,
+    /// People other than the user are listed (`--with`): the LLM's names
+    /// must be theirs ([`super::llm_names::verify`]).
+    pub listed: bool,
 }
 
 /// Which of `meta`'s voices the LLM is asked about: those the user, the
 /// user's name and the participants leave unnamed.
 pub fn to_ask(meta: &RecordingMeta, user_name: &str) -> Ask {
-    let named = before_llm(&meta.speakers, &Naming::of(meta, user_name));
-    let mut ask = Ask::default();
+    let naming = Naming::of(meta, user_name);
+    let named = before_llm(&meta.speakers, &naming);
+    let mut ask = Ask {
+        listed: !naming.listed_people().is_empty(),
+        ..Ask::default()
+    };
     for (speaker, named) in meta.speakers.iter().zip(named) {
         match named {
             None if voice_track(&speaker.id).is_some() && !speaker.minor => {
@@ -622,7 +697,11 @@ pub fn rename_speaker(
         meta.speaker_names.remove(&id);
     } else {
         let name = validate_person_name(name).map_err(anyhow::Error::msg)?;
-        meta.speaker_names.insert(id.clone(), name);
+        // A voice's name follows where it first spoke; a track's own
+        // speaker is one per track, so its id is enough.
+        let anchor = voice_track(&id).and_then(|_| anchor_of(&meta.segments, &id));
+        meta.speaker_names
+            .insert(id.clone(), SpeakerName { name, anchor });
     }
     let claims = kept_claims(&meta.speakers);
     let user = super::process::user_name(&RecordingConfig::effective(config));
@@ -693,7 +772,7 @@ mod tests {
     struct Case {
         participants: Vec<String>,
         shared_mic: bool,
-        user_names: BTreeMap<String, String>,
+        user_names: BTreeMap<String, SpeakerName>,
         claims: Claims,
     }
 
@@ -708,7 +787,7 @@ mod tests {
         }
 
         fn user(mut self, id: &str, name: &str) -> Self {
-            self.user_names.insert(id.into(), name.into());
+            self.user_names.insert(id.into(), SpeakerName::plain(name));
             self
         }
 
@@ -854,6 +933,18 @@ mod tests {
                 ("S1", "Sarah (with)"),
                 ("S2", "Speaker 1 (none)"),
             ])
+        );
+        // The user listed by first name, with the full name as the user's
+        // name (the passwd default): still the user.
+        let case = Case::with(&["Yosif", "Sarah"]);
+        let naming = Naming {
+            user_name: "Yosif Soliman",
+            ..case.naming()
+        };
+        let named = decide(&speakers, &segments, &naming, &Claims::new());
+        assert_eq!(
+            (named[1].name.as_str(), named[1].source.as_str()),
+            ("Sarah", "with")
         );
         // The user listed among the participants is the user, on the mic.
         let (speakers, segments) = call(&[speaker("S1", TrackKind::System)]);
@@ -1285,12 +1376,13 @@ mod tests {
         ]);
         meta.speakers = speakers;
         meta.segments = segments;
-        meta.speaker_names = [("S3".to_string(), "Omar".to_string())].into();
+        meta.speaker_names = [("S3".to_string(), SpeakerName::plain("Omar"))].into();
         assert_eq!(
             to_ask(&meta, "Tester"),
             Ask {
                 voices: vec!["S1".into(), "S4".into()],
                 known: vec![("S3".into(), "Omar".into())],
+                listed: false,
             }
         );
         // One voice and one participant: nobody is left to ask about.
@@ -1302,6 +1394,7 @@ mod tests {
             Ask {
                 voices: Vec::new(),
                 known: vec![("S1".into(), "Sarah".into())],
+                listed: true,
             }
         );
     }
@@ -1334,6 +1427,95 @@ mod tests {
             err.contains("2 speakers are called") && err.contains("S2, S3"),
             "{err}"
         );
+    }
+
+    /// A user's name for a system voice first heard at `first_ms`.
+    fn anchored(name: &str, first_ms: u64) -> SpeakerName {
+        SpeakerName {
+            name: name.into(),
+            anchor: Some(VoiceAnchor {
+                channel: TrackKind::System,
+                first_ms,
+            }),
+        }
+    }
+
+    /// The user's names follow their voices by where they first spoke:
+    /// a name moves to the voice now first heard within a second of its
+    /// anchor, on its track, whatever its id; one that finds none is
+    /// dropped with a note; one without an anchor keeps its id.
+    #[test]
+    fn user_names_follow_their_voice() {
+        let mut meta = RecordingMeta::new("m".into(), None, chrono::Local::now());
+        // Sarah was S1, first heard at 2.0 s; a voice heard at 1.0 s is S1 now.
+        let (speakers, segments) = three_voices();
+        meta.speakers = speakers;
+        meta.segments = segments;
+        meta.speaker_names = BTreeMap::from([
+            ("S1".into(), anchored("Sarah", 2000)),
+            ("S2".into(), anchored("Omar", 3900)),
+            ("S3".into(), anchored("Lost", 6000)),
+            ("me".into(), SpeakerName::plain("Yo")),
+        ]);
+        name_speakers(&mut meta, "Tester", &Claims::new());
+        let names: Vec<(&str, &str, &str)> = meta
+            .speakers
+            .iter()
+            .map(|s| (s.id.as_str(), s.name.as_str(), s.source.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("me", "Yo", "user"),
+                ("S1", "Speaker 1", "none"),
+                ("S2", "Sarah", "user"),
+                ("S3", "Omar", "user"),
+            ]
+        );
+        assert_eq!(
+            meta.speaker_names.keys().collect::<Vec<_>>(),
+            ["S2", "S3", "me"],
+            "stored under the ids they have now"
+        );
+        assert_eq!(
+            meta.speaker_names["S2"],
+            anchored("Sarah", 2000),
+            "anchor kept"
+        );
+        assert_eq!(meta.errors.len(), 1, "{:?}", meta.errors);
+        assert!(
+            meta.errors[0].starts_with(USER_NAME_LOST)
+                && meta.errors[0].contains("\"Lost\" (was S3)"),
+            "{:?}",
+            meta.errors
+        );
+
+        // More than a second away, or on the other track: no voice.
+        for given in [
+            anchored("Far", 1000 + ANCHOR_TOLERANCE_MS + 1),
+            SpeakerName {
+                name: "Mic".into(),
+                anchor: Some(VoiceAnchor {
+                    channel: TrackKind::Mic,
+                    first_ms: 1000,
+                }),
+            },
+        ] {
+            let mut meta = meta.clone();
+            meta.errors.clear();
+            meta.segments
+                .retain(|s| s.speaker != "S2" && s.speaker != "S3");
+            meta.speakers.truncate(2);
+            meta.speaker_names = BTreeMap::from([("S1".into(), given.clone())]);
+            name_speakers(&mut meta, "Tester", &Claims::new());
+            assert!(meta.speaker_names.is_empty(), "{given:?}");
+            assert_eq!(meta.speakers[1].name, "Others", "{given:?}");
+        }
+        // A name stored without an anchor stays on its id.
+        let mut meta = meta.clone();
+        meta.speaker_names = BTreeMap::from([("S1".into(), SpeakerName::plain("Kim"))]);
+        name_speakers(&mut meta, "Tester", &Claims::new());
+        assert_eq!(meta.speakers[1].name, "Kim");
     }
 
     /// A transcribed recording of three voices and three participants,
@@ -1375,7 +1557,8 @@ mod tests {
         assert_eq!(id, "S2");
         assert_eq!(
             meta.speaker_names,
-            BTreeMap::from([("S2".into(), "Omar".into())])
+            BTreeMap::from([("S2".into(), anchored("Omar", 2000))]),
+            "with where S2 first spoke"
         );
         assert_eq!(
             names_in(&dir),
@@ -1409,7 +1592,7 @@ mod tests {
         let (_, meta) = rename_speaker(&dir, &config(), "S2", "  ").unwrap();
         assert_eq!(
             meta.speaker_names,
-            BTreeMap::from([("S1".into(), "Sarah".into())])
+            BTreeMap::from([("S1".into(), anchored("Sarah", 1000))])
         );
         assert_eq!(
             names_in(&dir),
