@@ -42,7 +42,7 @@ prompt = "Speech is in English or Spanish. Transcribe in the language spoken; ne
                             # Recordings (whisrs recording) never send the prompt,
                             # only the vocabulary (and with local-whisper, neither).
 tray = true                 # system tray icon (requires SNI host like waybar)
-overlay = false             # on-screen recording overlay (Hyprland/Sway, GNOME extension)
+overlay = false             # on-screen dictation overlay (Hyprland/Sway, GNOME extension)
 
 # Run every dictation through the [llm] backend before it is typed.
 # Default: false. This is the always-on flavor of [[llm_commands]] below:
@@ -290,12 +290,12 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 #   20 s (hard ceiling 28 s) so it still emits.
 # - "window": legacy 8s/2s overlapping sliding window with text-based dedup.
 # - "none": no splitting, no streaming. Nothing is typed while you talk;
-#   when you stop, the whole recording is transcribed in one pass and typed
+#   when you stop, the whole dictation is transcribed in one pass and typed
 #   at once. Use it for long dictation you don't want split into phrases.
-#   The wait after stopping grows with the recording (a few seconds per
+#   The wait after stopping grows with the dictation (a few seconds per
 #   minute of speech with large-v3-turbo on a GPU, longer on CPU). It also
 #   makes [general] llm_post_process and [input] paste apply to dictation.
-#   A very long recording is still a single decode, not reset per phrase
+#   A very long dictation is still a single decode, not reset per phrase
 #   like "silence". The recording feature (whisrs recording) ignores this
 #   setting and always decodes in phrases.
 # segmentation = "silence"
@@ -433,17 +433,18 @@ command = "Super+Shift+G"
 speak = "Super+Shift+R"
 recording = "Super+Shift+M"   # start or stop a recording (mic + system audio)
 
-# Recording-lifecycle hooks: pause playing MPRIS media while dictating, run
-# shell commands fire-and-forget on record start/stop.  The child inherits the
+# Dictation-lifecycle hooks: pause playing MPRIS media while dictating, run
+# shell commands fire-and-forget on dictation start/stop.  The child inherits the
 # daemon's environment and stdout/stderr (journal under systemd --user).
+# A recording (whisrs recording) fires none of them.
 [hooks]
 media_auto_pause = true        # pause MPRIS players that are playing, resume those on stop
-# on_record_start = ""         # shell command on recording start
-# on_record_stop = ""          # shell command on recording stop
+# on_record_start = ""         # shell command on dictation start
+# on_record_stop = ""          # shell command on dictation stop
 ```
 
 `media_auto_pause` only touches players that report `PlaybackStatus = "Playing"`
-when recording starts, and resumes exactly those when it stops. A tab you paused
+when a dictation starts, and resumes exactly those when it stops. A tab you paused
 yourself stays paused. If a player's bus name changes mid-session (a browser
 switching media sessions) its resume is skipped rather than guessed at.
 
@@ -566,7 +567,7 @@ Uses that work today:
 - interviews
 
 `whisrs recording start [--title ...]` (or the `[hotkeys] recording` binding,
-or "Start recording (mic + system audio)" in the tray menu) starts a
+or "Record mic and system audio" in the tray menu) starts a
 recording; `whisrs recording stop` ends it and queues the transcript.
 `whisrs recording cancel` stops and deletes it (with no recording in progress,
 it stops the automatic tries of recordings waiting for the network, see below).
@@ -598,6 +599,8 @@ with it: a later config change does not reach it. To redo a recording in
 another language, run `whisrs recording retry <id> -l <language>` (or
 `--mic-language`/`--system-language` to change one track); a language you
 give replaces the saved one, and a track you leave out keeps its own. The
+saved languages are those of the latest attempt: a retry with `-l` that fails
+leaves the new languages saved, with the recording marked failed. The
 transcript's front matter shows `language` (or `mic_language` and
 `system_language` when they differ) and the `model` it was made with.
 
@@ -605,7 +608,9 @@ transcript's front matter shows `language` (or `mic_language` and
 your microphone. whisrs filters that echo out of your track before transcribing
 it, using the system audio as the reference. Echoed lines that still get
 through are dropped, but headphones give a cleaner transcript and avoid the
-occasional miss.
+occasional miss. Echo is also harder to catch when the two tracks are
+transcribed in different languages, since a line heard on both no longer
+reads the same.
 
 **Dictation is off while a recording is in progress.** The microphone is
 shared with the recording, so the transcript would record a dictation as your
@@ -615,7 +620,8 @@ notification saying why. A dictation already running when the recording
 started finishes normally, and read-aloud keeps working. The tray icon turns
 into a red outlined bubble with a dot while a recording is in progress, and an
 amber outlined bubble with three dots while it is transcribed (as long as you
-are not dictating at that moment).
+are not dictating at that moment). A recording shows no on-screen overlay and
+fires no `[hooks]`, so media that is playing is not paused.
 
 **Backends.** A recording is transcribed from its audio files after it ends,
 so it needs a backend that can transcribe a recorded file: groq, openai,
@@ -715,7 +721,8 @@ such as a 524 timeout on a long upload) is retried three times, 5, 15 and 30
 seconds apart, except a 500 from `asr-sidecar`, which is usually an error in
 the sidecar itself. Each finished chunk is saved in the recording's `.cache/`
 folder, so a retry after a failure only sends what was not transcribed yet.
-The cache is deleted once the transcript is written.
+The cache is deleted once the transcript is written, so a retry of a finished
+recording sends both tracks again.
 
 **No network.** A chunk that gets no answer at all (no network, a name that
 does not resolve, a refused or dropped connection, a TLS error) is retried 5,

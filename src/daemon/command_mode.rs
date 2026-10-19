@@ -151,7 +151,7 @@ pub(crate) async fn handle_command_mode(
             };
             if !is_command_mode {
                 return Response::Error {
-                    message: "recording is active but not in command mode — use toggle or cancel"
+                    message: "a dictation is active but not in command mode: use toggle or cancel"
                         .to_string(),
                 };
             }
@@ -568,7 +568,7 @@ pub(crate) async fn handle_llm_command(
             };
             if !is_llm_command {
                 return Response::Error {
-                    message: "recording is active but not for an llm-command — use toggle, \
+                    message: "a dictation is active but not for an llm-command: use toggle, \
                               command, or cancel"
                         .to_string(),
                 };

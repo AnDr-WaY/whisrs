@@ -112,7 +112,9 @@ stops playback. Alias:
 .BR read .
 .TP
 .B status
-Query the daemon state. Prints one of:
+Query the dictation state (for a recording, see
+.BR "whisrs recording status" ).
+Prints one of:
 .BR idle ,
 .BR recording ,
 .BR transcribing ,
@@ -132,11 +134,9 @@ to be running \(em
 will start a stopped service.
 .TP
 .B recording
-Record the microphone and the system audio and turn them into a
-transcript, for a meeting or call, a lecture, a video or language practice.
-Captures the microphone
-and the system audio (the default output's monitor) as two separate tracks,
-then transcribes them after
+Record the microphone and the system audio (the default output's monitor) as
+two separate tracks and turn them into a transcript, for a meeting or call, a
+lecture, a video or language practice. The tracks are transcribed after
 .B stop
 into a Markdown transcript whose speaker labels are your name
 .RB ( [recording]
@@ -233,8 +233,9 @@ language. A language given here replaces the one the recording saved (as for
 covers both tracks); a track left out keeps its own. A recording whose
 transcription was interrupted three times (by a crash each time) is marked
 failed instead of being resumed at startup; retry resets that count and
-queues it again. Chunks already transcribed with the same backend and
-settings, language included, are reused.
+queues it again. After a failure, chunks already transcribed with the same
+backend and settings, language included, are reused; a recording that finished
+keeps none, so its retry sends both tracks again.
 .RE
 .IP
 .BR list ,

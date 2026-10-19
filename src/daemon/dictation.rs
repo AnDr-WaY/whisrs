@@ -395,7 +395,7 @@ pub(crate) async fn handle_cancel(
             }
             info!("cancelled recording");
             if context.notify_state() {
-                send_notification("whisrs", "Recording cancelled");
+                send_notification("whisrs", "Dictation cancelled");
             }
             Response::Ok { state: new_state }
         }

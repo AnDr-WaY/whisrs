@@ -105,7 +105,7 @@ pub fn run_config_menu() -> Result<()> {
             "Clipboard-only mode (no injection)",
             "Hotkeys",
             "Tray & overlay",
-            "Recording hooks",
+            "Dictation hooks",
             "Command mode (LLM)",
             "Custom LLM commands",
             "Recording",
@@ -843,7 +843,7 @@ fn parse_optional_language(input: &str) -> std::result::Result<Option<String>, S
 }
 
 fn edit_media_hooks(config: &mut Config) -> Result<()> {
-    println!("\n  {BOLD}Recording hooks{RESET}");
+    println!("\n  {BOLD}Dictation hooks{RESET}");
     println!(
         "  {DIM}Pause MPRIS media that is playing (browsers, Spotify, VLC, MPV,\n   \
          KDE Connect) while dictating, and resume exactly those afterwards.\n   \
@@ -853,15 +853,15 @@ fn edit_media_hooks(config: &mut Config) -> Result<()> {
     let mut hooks = config.hooks.clone().unwrap_or_default();
 
     hooks.media_auto_pause = Confirm::new()
-        .with_prompt("Pause playing MPRIS media while recording?")
+        .with_prompt("Pause playing MPRIS media while dictating?")
         .default(hooks.media_auto_pause)
         .interact()
         .unwrap_or(hooks.media_auto_pause);
 
     hooks.on_record_start =
-        prompt_optional_string("Shell command on record start", &hooks.on_record_start)?;
+        prompt_optional_string("Shell command on dictation start", &hooks.on_record_start)?;
     hooks.on_record_stop =
-        prompt_optional_string("Shell command on record stop", &hooks.on_record_stop)?;
+        prompt_optional_string("Shell command on dictation stop", &hooks.on_record_stop)?;
 
     // Drop the whole section if nothing is configured — keeps the TOML clean.
     let any_set =

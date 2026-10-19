@@ -143,7 +143,7 @@ pub(crate) fn refuse_while_recording(
     context: &DaemonContext,
     start: DictationStart<'_>,
 ) -> Option<Response> {
-    if !context.recording.is_active() {
+    if !context.recording.is_capturing() {
         return None;
     }
     let (what, subject) = match start {
@@ -382,7 +382,7 @@ impl RecordingRuntime {
     /// lock, so it answers at once while a start or stop holds that lock for
     /// seconds opening or closing devices. A start counts once its devices
     /// are open, a stop until its tracks are finalized.
-    pub(crate) fn is_active(&self) -> bool {
+    pub(crate) fn is_capturing(&self) -> bool {
         self.view
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -853,7 +853,7 @@ async fn start(
     context.recording.update(|v| v.capturing = Some(active));
     drop(slot);
 
-    notify(context, "Recording started (mic + system audio)");
+    notify(context, "Recording your mic and system audio");
     if let Some(e) = system_error {
         notify(
             context,
@@ -1224,10 +1224,7 @@ async fn stop(
             context,
             "Recording stopped: the disk is almost full. Transcribing...",
         ),
-        _ => notify(
-            context,
-            "Recording stopped (mic + system audio). Transcribing...",
-        ),
+        _ => notify(context, "Recording stopped. Transcribing..."),
     }
     queued
 }
@@ -1247,10 +1244,7 @@ async fn cancel(context: &Arc<DaemonContext>) -> Result<()> {
     remove_recording_dir(&session.dir).await;
     context.recording.clear_capturing(&session.meta.id);
     info!("recording {} cancelled and deleted", session.meta.id);
-    notify(
-        context,
-        "Recording (mic + system audio) cancelled and deleted",
-    );
+    notify(context, "Recording cancelled and deleted");
     Ok(())
 }
 
@@ -3411,7 +3405,10 @@ mod tests {
             matches!(response, Response::Ok { state: State::Idle }),
             "{response:?}"
         );
-        assert!(context.recording.is_active(), "the recording is untouched");
+        assert!(
+            context.recording.is_capturing(),
+            "the recording is untouched"
+        );
     }
 
     /// Only a recording in progress refuses: one being transcribed or queued
@@ -3508,7 +3505,7 @@ mod tests {
             )
         );
         assert!(!root.exists(), "no folder was created");
-        assert!(!context.recording.is_active());
+        assert!(!context.recording.is_capturing());
 
         assert!(check_space_to_start(unreadable_free_space, &root)
             .await
@@ -3557,7 +3554,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(item.recording.id, id);
-        assert!(!context.recording.is_active());
+        assert!(!context.recording.is_capturing());
     }
 
     /// Plenty of room: the watch keeps checking and leaves the recording be.
@@ -3577,7 +3574,7 @@ mod tests {
         show_recording(&context, session).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(context.recording.session.lock().await.is_some());
-        assert!(context.recording.is_active());
+        assert!(context.recording.is_capturing());
         assert!(queue.try_recv().is_err());
         let session = context.recording.session.lock().await.take().unwrap();
         session.watch.unwrap().abort();
@@ -4135,7 +4132,7 @@ mod tests {
 
         assert_eq!(queue.try_recv().unwrap().recording.id, first_id);
         assert!(
-            context.recording.is_active(),
+            context.recording.is_capturing(),
             "the next recording is hidden"
         );
         assert_eq!(
@@ -4147,6 +4144,6 @@ mod tests {
         // Its own stop still clears it.
         drop(next_tx);
         stop(&context, None, EndReason::Stopped).await.unwrap();
-        assert!(!context.recording.is_active());
+        assert!(!context.recording.is_capturing());
     }
 }

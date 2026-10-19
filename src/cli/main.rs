@@ -61,7 +61,8 @@ enum SubCmd {
     },
     /// Cancel the current dictation and discard its audio
     Cancel,
-    /// Query the daemon state (idle, recording, transcribing)
+    /// Query the dictation state (idle, recording, transcribing); for a
+    /// recording see `whisrs recording status`
     Status,
     /// Show recent transcription history
     Log {

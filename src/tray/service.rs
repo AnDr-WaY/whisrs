@@ -145,7 +145,7 @@ fn recording_line(recording: &RecordingStatus) -> Option<String> {
     match recording.phase {
         RecordingPhase::Idle => None,
         RecordingPhase::Recording => {
-            let mut line = "Recording mic + system audio".to_string();
+            let mut line = "Recording mic and system audio".to_string();
             if let Some(started) = recording.started_at {
                 line.push_str(&format!(" since {}", started.format("%H:%M")));
             }
@@ -206,7 +206,7 @@ impl ksni::Tray for WhisrsTray {
         // matters more in the moment.
         match (self.state.current, self.state.recording.phase) {
             (State::Idle, RecordingPhase::Recording) => {
-                "whisrs: recording mic + system audio".to_string()
+                "whisrs: recording mic and system audio".to_string()
             }
             (State::Idle, RecordingPhase::Processing) => "whisrs: processing recording".to_string(),
             (state, _) => format!("whisrs: {}", state_word(state)),
@@ -313,9 +313,9 @@ fn recording_menu_items(recording: &RecordingStatus) -> Vec<MenuItem<WhisrsTray>
     let capturing = recording.phase == RecordingPhase::Recording;
     items.push(MenuItem::Standard(StandardItem {
         label: if capturing {
-            "Stop recording (mic + system audio)"
+            "Stop recording and transcribe"
         } else {
-            "Start recording (mic + system audio)"
+            "Record mic and system audio"
         }
         .to_string(),
         activate: Box::new(|tray: &mut WhisrsTray| {
@@ -325,7 +325,7 @@ fn recording_menu_items(recording: &RecordingStatus) -> Vec<MenuItem<WhisrsTray>
     }));
     if capturing {
         items.push(MenuItem::Standard(StandardItem {
-            label: "Cancel recording (mic + system audio)".to_string(),
+            label: "Cancel recording and delete it".to_string(),
             activate: Box::new(|tray: &mut WhisrsTray| {
                 tray.send(recording_command(RecordingAction::Cancel));
             }),
@@ -561,11 +561,11 @@ mod tests {
         assert_eq!(recording_line(&RecordingStatus::default()), None);
         assert_eq!(
             recording_line(&active_recording(Some("standup"))).as_deref(),
-            Some("Recording mic + system audio since 09:30 (standup)")
+            Some("Recording mic and system audio since 09:30 (standup)")
         );
         assert_eq!(
             recording_line(&active_recording(None)).as_deref(),
-            Some("Recording mic + system audio since 09:30")
+            Some("Recording mic and system audio since 09:30")
         );
         let processing = RecordingStatus {
             phase: RecordingPhase::Processing,
@@ -581,7 +581,7 @@ mod tests {
     fn idle_recording_menu_offers_only_start() {
         assert_eq!(
             labels(&recording_menu_items(&RecordingStatus::default())),
-            vec![("Start recording (mic + system audio)".to_string(), true)]
+            vec![("Record mic and system audio".to_string(), true)]
         );
     }
 
@@ -591,11 +591,11 @@ mod tests {
             labels(&recording_menu_items(&active_recording(None))),
             vec![
                 (
-                    "Recording mic + system audio since 09:30".to_string(),
+                    "Recording mic and system audio since 09:30".to_string(),
                     false
                 ),
-                ("Stop recording (mic + system audio)".to_string(), true),
-                ("Cancel recording (mic + system audio)".to_string(), true),
+                ("Stop recording and transcribe".to_string(), true),
+                ("Cancel recording and delete it".to_string(), true),
             ]
         );
     }
@@ -605,8 +605,8 @@ mod tests {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
         let mut tray = tray_with(cmd_tx, State::Idle, active_recording(None));
 
-        click(&mut tray, "Stop recording (mic + system audio)");
-        click(&mut tray, "Cancel recording (mic + system audio)");
+        click(&mut tray, "Stop recording and transcribe");
+        click(&mut tray, "Cancel recording and delete it");
 
         for expected in [RecordingAction::Toggle, RecordingAction::Cancel] {
             let cmd = cmd_rx.try_recv().expect("a recording command is queued");
@@ -639,7 +639,7 @@ mod tests {
         );
         assert_eq!(
             idle.tool_tip().description,
-            "Recording mic + system audio since 09:30 (x)"
+            "Recording mic and system audio since 09:30 (x)"
         );
 
         let processing = RecordingStatus {
@@ -664,7 +664,7 @@ mod tests {
         assert!(dictating
             .tool_tip()
             .description
-            .ends_with("Recording mic + system audio since 09:30 (x)"));
+            .ends_with("Recording mic and system audio since 09:30 (x)"));
 
         let transcribing = tray_with(cmd_tx, State::Transcribing, processing);
         assert_eq!(

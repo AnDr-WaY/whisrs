@@ -244,7 +244,8 @@ TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drive
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 
 Recording (mic + system audio, transcribed after the stop): the `[recording]` section (`backend`,
-`user_name`, `mic_device`, `system_device`, `max_duration_minutes`, `audio_retention_days`, `dir`)
+`user_name`, `language`, `mic_language`, `system_language`, `mic_device`, `system_device`,
+`max_duration_minutes`, `audio_retention_days`, `dir`)
 plus `[hotkeys] recording`. Recordings live in `~/.local/share/whisrs/recordings/<id>/`
 (`recording.json`, `<id>.md`, `audio/`, and a `.cache/` of finished chunks kept until the
 transcript is written or the audio is deleted). The recording backend
