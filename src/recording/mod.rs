@@ -7,6 +7,7 @@
 
 pub mod diarize;
 pub mod echo;
+pub mod llm_names;
 pub mod naming;
 pub mod process;
 pub mod recorder;
@@ -291,12 +292,13 @@ pub struct Speaker {
     pub id: String,
     pub name: String,
     /// How the name was found ([`naming`]): `"user"` (`whisrs recording
-    /// name`), `"self"` (the user), `"with"` (the one participant), `"last"`
-    /// (the last participant left), `"channel"` (the track's label: the
-    /// others label), or `"none"` (unnamed: `Speaker N`).
+    /// name`), `"self"` (the user), `"with"` (the one participant), `"llm"`
+    /// (the LLM, with `evidence`), `"last"` (the last participant left),
+    /// `"channel"` (the track's label: the others label), or `"none"`
+    /// (unnamed: `Speaker N`).
     pub source: String,
     /// The words that named the speaker, when a name came from the
-    /// transcript.
+    /// transcript: the LLM's quote (`source` `"llm"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
     /// How long the speaker talks in the transcript, in milliseconds.

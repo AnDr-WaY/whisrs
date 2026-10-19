@@ -419,6 +419,8 @@ audio_retention_days = 7      # 0 = delete audio once transcribed, negative = ke
 # diarization_url = "http://127.0.0.1:8770/diarize"  # a diarization sidecar (local server)
 # num_speakers = 0            # voices the sidecar should find; 0 = let it decide (0 to 20)
 # shared_mic = false          # several people share your mic: tell its voices apart too
+# name_speakers = false       # ask the [llm] who the unnamed voices are; sends excerpts
+#                             #   of each transcript to it (see "Naming the speakers")
 
 # Built-in global hotkeys (optional, works without WM keybinds)
 # Triggers: A-Z, 0-9, F1-F24, space, enter, escape, tab, backspace, delete,
@@ -628,11 +630,32 @@ the first one that names a speaker wins:
    with: names separated by commas, at most 20, each up to 64 characters.
    When the system audio holds exactly one voice and you list exactly one
    person, that voice is them.
-3. When every voice on the system audio but one has a name, one person you
+3. With `name_speakers = true`, the LLM of the `[llm]` section (the one
+   command mode uses) is asked who the voices still unnamed are. It must
+   quote the words that show each name, such as "I'm Sarah" or "Thanks,
+   Sarah", and a name is kept only when that quote is in the transcript
+   (case and spacing aside) and holds the name or its first name. When you
+   listed people, the name must be one of them: a full name, a first name,
+   or a short form of three letters or more that starts a first name
+   ("Sam" for "Samantha"), and the name is written as you listed it. A name
+   the LLM gives two speakers, a name another speaker already has, and
+   your own name are refused. Anything else stays unnamed.
+4. When every voice on the system audio but one has a name, one person you
    listed is left, there are as many voices as people listed, and
    `shared_mic` is off, the last voice is that person.
-4. Everyone else is "Speaker N", numbered in the order they first speak. A
+5. Everyone else is "Speaker N", numbered in the order they first speak. A
    single voice on the system audio keeps the others label instead.
+
+`name_speakers` is off by default, because it sends parts of every
+transcript to the `[llm]` endpoint: the title, your name, the people you
+listed, and for each voice it asks about, its first 2000 or so characters of
+speech with the lines around them. Point `[llm] api_url` at a local server
+to keep them on your machine. The LLM is only asked when a voice is left to
+name after the steps before it, gets 60 seconds to answer, and is told that
+the transcript is data, not instructions, and that the speaker labels can be
+wrong. If it fails (no `[llm]` section, no answer in time, an answer that is
+not JSON), the transcript is still written, without its names, and
+`recording.json` notes why under `errors`.
 
 A `minor` voice is never named after someone you listed, and does not count
 as a voice. Your own name in the `--with` list is you and is not counted.
@@ -642,8 +665,9 @@ room with you. `--with` names only voices that were told apart: with one
 speaker per track, name the system audio with `--others` instead.
 `whisrs recording retry <id> --with "..."` replaces the names, and
 `--with ""` clears them. `recording.json` keeps them as `participants`, and
-each speaker's `source` says how it got its name: `self`, `with`, `last`,
-`channel` (the others label) or `none` (Speaker N).
+each speaker's `source` says how it got its name: `self`, `with`, `llm`
+(with the quote as `evidence`), `last`, `channel` (the others label) or
+`none` (Speaker N).
 
 **A diarization sidecar.** A local server that only finds who speaks when,
 so speakers can be told apart offline or with a backend that cannot do it

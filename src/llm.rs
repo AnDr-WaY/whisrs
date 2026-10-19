@@ -8,7 +8,11 @@
 //! `model` to whatever the server has loaded; local servers don't validate
 //! `api_key`, so any placeholder string works.
 //!
-//! One entry point, [`rewrite_text`], shared by both callers: `whisrs command`
+//! [`chat`] is the plain entry point for any other use: a prepared
+//! conversation in, the reply out as it arrived, with a time limit. The
+//! recording feature names speakers with it.
+//!
+//! One rewrite entry point, [`rewrite_text`], shared by both callers: `whisrs command`
 //! applies a spoken instruction to the text the user selected, and an
 //! `[[llm_commands]]` entry does the same with the roles swapped (dictated
 //! text + a preset instruction). A generic instruction — "treat the following
@@ -22,6 +26,8 @@
 //! question the injection site needs in order to decide whether a reply may be
 //! sent to a terminal. The decision itself is not here — see
 //! `daemon/injection.rs`, which knows what is focused.
+
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -97,21 +103,22 @@ struct ChatRequest {
     temperature: f32,
 }
 
+/// One message of a chat request ([`chat`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ChatMessage {
+pub struct ChatMessage {
     role: String,
     content: String,
 }
 
 impl ChatMessage {
-    fn system(content: &str) -> Self {
+    pub fn system(content: &str) -> Self {
         Self {
             role: "system".to_string(),
             content: content.to_string(),
         }
     }
 
-    fn user(content: String) -> Self {
+    pub fn user(content: String) -> Self {
         Self {
             role: "user".to_string(),
             content,
@@ -398,6 +405,23 @@ pub async fn rewrite_text(
     .await
 }
 
+/// Send `messages` to the configured `/chat/completions` endpoint and return
+/// the reply as it arrived: unlike command mode's, it is not run through
+/// [`clean_llm_output`], so a caller that wants JSON or Markdown gets it
+/// whole. Gives up after `timeout`.
+pub async fn chat(
+    config: &LlmConfig,
+    messages: Vec<ChatMessage>,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let api_key = resolve_api_key(config)?;
+    info!("llm: sending a chat request (model={})", config.model);
+    match tokio::time::timeout(timeout, chat_with_key(config, &api_key, messages)).await {
+        Ok(reply) => reply,
+        Err(_) => anyhow::bail!("the LLM did not answer within {timeout:?}"),
+    }
+}
+
 /// The configured key, or the env-var fallback when `[llm] api_key` is empty.
 fn resolve_api_key(config: &LlmConfig) -> anyhow::Result<String> {
     if !config.api_key.is_empty() {
@@ -443,7 +467,7 @@ async fn chat_with_key(
         .json(&request)
         .send()
         .await
-        .context("failed to reach LLM API — check your internet connection")?;
+        .context("failed to reach the LLM API; check your internet connection")?;
 
     let status = response.status();
     if !status.is_success() {
@@ -472,6 +496,70 @@ async fn chat_with_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local(url: String) -> LlmConfig {
+        LlmConfig {
+            api_key: "local-key".into(),
+            model: "local-model".into(),
+            api_url: url,
+        }
+    }
+
+    /// `chat` posts the messages as given and returns the reply untouched:
+    /// a fenced answer keeps its fence for the caller to read.
+    #[tokio::test]
+    async fn chat_returns_the_reply_as_it_arrived() {
+        use crate::transcription::test_server::serve_once;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"choices":[{"message":{"role":"assistant","content":"```json\n{\"S1\": null}\n```"}}]}"#,
+        ));
+        let reply = chat(
+            &local(url),
+            vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("hello".into()),
+            ],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, "```json\n{\"S1\": null}\n```");
+        let request = server.await.unwrap();
+        assert_eq!(request.header("authorization"), Some("Bearer local-key"));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "local-model");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["content"], "hello");
+    }
+
+    /// A server that never answers ends in a clear error at the timeout.
+    #[tokio::test]
+    async fn chat_gives_up_at_the_timeout() {
+        use crate::transcription::test_server::accept_request;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = accept_request(&listener).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(stream);
+        });
+        let started = std::time::Instant::now();
+        let err = chat(&local(url), Vec::new(), Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(err.to_string(), "the LLM did not answer within 300ms");
+        server.abort();
+    }
 
     #[test]
     fn default_config() {

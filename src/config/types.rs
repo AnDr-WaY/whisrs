@@ -123,6 +123,11 @@ pub struct RecordingConfig {
     /// told apart too. `false` makes the whole mic track the user.
     #[serde(default)]
     pub shared_mic: bool,
+    /// Ask the `[llm]` who the voices left unnamed are, from excerpts of the
+    /// transcript ([`crate::recording::llm_names`]). Off by default: it
+    /// sends the transcript's words to the LLM.
+    #[serde(default)]
+    pub name_speakers: bool,
 }
 
 /// `[recording] diarization`: how the voices of a recording are told apart.
@@ -168,6 +173,7 @@ impl Default for RecordingConfig {
             diarization_url: None,
             num_speakers: 0,
             shared_mic: false,
+            name_speakers: false,
         }
     }
 }
@@ -2348,6 +2354,16 @@ impl Config {
                     });
                 }
             }
+        }
+
+        // Naming speakers with the LLM needs the LLM.
+        if recording.name_speakers && self.llm.is_none() {
+            warnings.push(ConfigWarning {
+                message: "[recording] name_speakers = true but there is no [llm] section, so \
+                          the LLM names no speakers (each recording notes why). Add [llm] \
+                          api_key, model and api_url, as for command mode, or remove the key."
+                    .to_string(),
+            });
         }
 
         // Device sanity. Only an explicit system source can be wrong here:
@@ -5272,6 +5288,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(blank.diarization_url(), None, "blank is unset");
+    }
+
+    /// `name_speakers` is off by default and a known key; turned on
+    /// without an `[llm]` section it warns, since the LLM can name nobody.
+    #[test]
+    fn name_speakers_needs_an_llm() {
+        assert!(!RecordingConfig::default().name_speakers);
+        let text = "[recording]\nname_speakers = true\n";
+        let config: Config = toml::from_str(text).unwrap();
+        assert!(RecordingConfig::effective(&config).name_speakers);
+        assert!(unknown_config_keys(text).is_empty());
+
+        let mut config = validatable_config("groq");
+        config.recording = recording_config(|r| r.name_speakers = true);
+        config.llm = None;
+        let warnings = recording_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("name_speakers = true but there is no [llm] section"),
+            "{warnings:?}"
+        );
+        config.llm = Some(crate::llm::LlmConfig::default());
+        assert!(recording_warnings(&config).is_empty());
+        config.llm = None;
+        config.recording = recording_config(|r| r.name_speakers = false);
+        assert!(recording_warnings(&config).is_empty());
     }
 
     /// The sidecar's URL must be http(s), `sidecar` needs one, and the

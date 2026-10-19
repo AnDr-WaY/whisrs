@@ -649,6 +649,11 @@ fn edit_recording(config: &mut Config) -> Result<()> {
         .default(recording.shared_mic)
         .interact()
         .context("failed to read shared mic")?;
+    recording.name_speakers = Confirm::new()
+        .with_prompt("Name the speakers with the [llm] (sends excerpts of each transcript to it)?")
+        .default(recording.name_speakers)
+        .interact()
+        .context("failed to read speaker naming")?;
 
     // Devices.
     let devices = list_input_devices();

@@ -29,12 +29,12 @@ use tracing::{debug, info, warn};
 
 use super::diarize::{DiarizationSidecar, Timing};
 use super::echo::{cancel_echo, EchoOutcome};
-use super::naming;
 use super::render::render_markdown;
 use super::speakers::{self, Labels, Method, Turn};
 use super::speech::{self, TimeMap};
 use super::split::frame_len;
 use super::store::{self, CACHE_DIR};
+use super::{llm_names, naming};
 use super::{RecordingMeta, RecordingState, Segment, TrackKind, TranscriptSegment};
 use crate::audio::wav::encode_wav;
 use crate::replacements::Replacer;
@@ -289,7 +289,8 @@ async fn process_with_timing(
     };
     meta.speakers = speakers::assign(&mut mic, &mut system, &context);
     meta.segments = merge_channels(mic, system);
-    naming::name_speakers(&mut meta, &user);
+    let claims = llm_names::claims(config, &mut meta, &user, llm_names::LLM_TIMEOUT).await;
+    naming::name_speakers(&mut meta, &user, &claims);
     meta.diarization = Some(plan.method.label().to_string());
     meta.backend = Some(name);
     meta.model = Some(model);
@@ -2748,6 +2749,121 @@ mod tests {
         assert_eq!(meta.speaker_names.len(), 1, "kept as given");
         let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
         assert!(md.contains("**[00:00:09] Omar:** good morning"), "{md}");
+    }
+
+    /// A call where the first remote voice says its name.
+    fn introduced_voices() -> Labelled {
+        Labelled {
+            inner: FakeBackend::new(
+                &[
+                    (3000, "hi all"),
+                    (5000, "hello i'm sarah"),
+                    (6000, "good morning"),
+                    (7000, "so the plan"),
+                ],
+                None,
+            ),
+            voices: vec![
+                ("hi all", "0"),
+                ("hello i'm sarah", "1"),
+                ("good morning", "0"),
+                ("so the plan", "1"),
+            ],
+        }
+    }
+
+    /// With `name_speakers`, the LLM is asked about the voices left
+    /// unnamed after alignment; the name it shows with a quote is kept, and
+    /// the last voice is then the last participant.
+    #[tokio::test]
+    async fn the_llm_names_speakers_during_processing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(crate::transcription::test_server::serve_once(
+            listener,
+            r#"{"choices":[{"message":{"role":"assistant","content":
+               "{\"S1\": {\"name\": \"Sarah\", \"evidence\": \"i'm sarah\"}, \"S2\": null}"}}]}"#,
+        ));
+        let (tmp, _) = call();
+        let mut meta = store::read_meta(tmp.path()).unwrap();
+        meta.participants = vec!["Sarah".into(), "Omar".into()];
+        store::write_meta(tmp.path(), &meta).unwrap();
+        let config = speaker_config(&format!(
+            "diarization = \"backend\"\nname_speakers = true\n\
+             [llm]\napi_key = \"k\"\napi_url = \"{url}\"\n"
+        ));
+        let meta = run_labelled(tmp.path(), introduced_voices(), &config).await;
+        let request = server.await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let prompt = body["messages"][1]["content"].as_str().unwrap();
+        assert!(prompt.contains("Participants: Sarah, Omar.\n"), "{prompt}");
+        assert!(prompt.contains("[S1] hello i'm sarah\n"), "{prompt}");
+
+        let named: Vec<(&str, &str, &str, Option<&str>)> = meta
+            .speakers
+            .iter()
+            .map(|s| {
+                (
+                    s.id.as_str(),
+                    s.name.as_str(),
+                    s.source.as_str(),
+                    s.evidence.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("me", "Tester", "self", None),
+                ("S1", "Sarah", "llm", Some("i'm sarah")),
+                ("S2", "Omar", "last", None),
+            ]
+        );
+        assert!(meta.errors.is_empty(), "{:?}", meta.errors);
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(
+            md.contains("**[00:00:04] Sarah:** hello i'm sarah\n"),
+            "{md}"
+        );
+        assert!(md.contains("**[00:00:09] Omar:** good morning\n"), "{md}");
+    }
+
+    /// An LLM that cannot be reached is noted, and the transcript is
+    /// written with the voices unnamed.
+    #[tokio::test]
+    async fn an_llm_failure_never_fails_the_recording() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        drop(listener);
+        let (tmp, _) = call();
+        let config = speaker_config(&format!(
+            "diarization = \"backend\"\nname_speakers = true\n\
+             [llm]\napi_key = \"k\"\napi_url = \"{url}\"\n"
+        ));
+        let meta = run_labelled(tmp.path(), introduced_voices(), &config).await;
+        assert_eq!(meta.status, RecordingState::Done);
+        assert_eq!(
+            speaker_names(&meta),
+            [("me", "Tester"), ("S1", "Speaker 1"), ("S2", "Speaker 2")]
+        );
+        assert_eq!(meta.errors.len(), 1, "{:?}", meta.errors);
+        assert!(
+            meta.errors[0].starts_with(llm_names::NAMING_FAILED)
+                && meta.errors[0].contains("failed to reach the LLM API"),
+            "{:?}",
+            meta.errors
+        );
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(
+            md.contains("## Notes\n\n- speakers were not named by the LLM: "),
+            "{md}"
+        );
     }
 
     /// The mic is the user unless it is shared: then its voices are told

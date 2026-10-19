@@ -144,7 +144,14 @@ into a Markdown transcript whose speaker labels are your name
 and \(lqOthers\(rq, or, when
 .B [recording] diarization
 tells the voices on the system audio apart, \(lqSpeaker 1\(rq,
-\(lqSpeaker 2\(rq and so on (a single voice keeps \(lqOthers\(rq).
+\(lqSpeaker 2\(rq and so on (a single voice keeps \(lqOthers\(rq), unless a
+voice is named: by the people given with
+.BR \-\-with ,
+or, with
+.B [recording] name_speakers
+(off by default; it sends transcript excerpts to the
+.B [llm]
+endpoint), by the LLM from a quote of the transcript that shows the name.
 Each track is transcribed in its own language:
 .B [recording] mic_language
 and

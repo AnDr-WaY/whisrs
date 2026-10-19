@@ -76,7 +76,8 @@ src/
 │   ├── process.rs          #   Echo-cancel, send the speech, transcribe (cached, rate-limit retry), merge, write
 │   ├── speakers.rs         #   Speaker separation: plan, align words to voices, ids by first appearance
 │   ├── diarize.rs          #   Diarization sidecar client (contract, timeout, retries)
-│   ├── naming.rs           #   Speaker names: user > self > --with > last voice > Speaker N
+│   ├── naming.rs           #   Speaker names: user > self > --with > LLM > last voice > Speaker N
+│   ├── llm_names.rs        #   Opt-in LLM naming (name_speakers): bounded excerpt, quoted evidence
 │   ├── split.rs            #   Cut long tracks into backend-sized chunks at silence
 │   └── render.rs           #   Markdown transcript rendering
 ├── audio/
@@ -252,7 +253,7 @@ Word replacements: the top-level `[replacements]` table (`"package build" = "PKG
 Recording (mic + system audio, transcribed after the stop): the `[recording]` section (`backend`,
 `user_name`, `language`, `mic_language`, `system_language`, `mic_device`, `system_device`,
 `max_duration_minutes`, `audio_retention_days`, `dir`, `diarization`, `diarization_url`,
-`num_speakers`, `shared_mic`)
+`num_speakers`, `shared_mic`, `name_speakers`)
 plus `[hotkeys] recording`. Recordings live in `~/.local/share/whisrs/recordings/<id>/`
 (`recording.json`, `<id>.md`, `audio/`, and a `.cache/` of finished chunks kept until the
 transcript is written or the audio is deleted; a diarization sidecar's voices stay until the
