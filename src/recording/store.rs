@@ -15,7 +15,9 @@ use tracing::{debug, warn};
 
 use serde::Deserialize;
 
-use super::{RecordingMeta, RecordingState, Speaker, TitleSource, TrackKind, TrackMeta};
+use super::{
+    RecordingMeta, RecordingState, Speaker, SummaryRequest, TitleSource, TrackKind, TrackMeta,
+};
 
 const META_FILE: &str = "recording.json";
 const META_TMP: &str = ".recording.json.tmp";
@@ -219,6 +221,8 @@ pub struct RecordingHeader {
     #[serde(default)]
     pub summary_stale: bool,
     #[serde(default)]
+    pub summary_pending: Option<SummaryRequest>,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -346,6 +350,11 @@ pub fn resolve(root: &Path, query: &str) -> anyhow::Result<PathBuf> {
             )
         }
     }
+}
+
+/// Path of `recording.json` in a recording's folder.
+pub fn meta_path(dir: &Path) -> PathBuf {
+    dir.join(META_FILE)
 }
 
 /// Path of the rendered transcript: `<dir>/<id>.md`.

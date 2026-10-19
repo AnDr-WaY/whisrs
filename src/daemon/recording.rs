@@ -36,8 +36,8 @@ use whisrs::recording::summary::{self, SUMMARY_FAILED, SUMMARY_TIMEOUT};
 use whisrs::recording::wav_repair::repair_wav;
 use whisrs::recording::{
     store, EndReason, NetworkWait, RecordingAction, RecordingMeta, RecordingOptions,
-    RecordingPhase, RecordingState, RecordingStatus, TrackKind, TrackMeta, DEFAULT_OTHERS_LABEL,
-    NETWORK_RETRY_EVERY, NETWORK_RETRY_FOR, NETWORK_RETRY_MAX,
+    RecordingPhase, RecordingState, RecordingStatus, SummaryRequest, TrackKind, TrackMeta,
+    DEFAULT_OTHERS_LABEL, NETWORK_RETRY_EVERY, NETWORK_RETRY_FOR, NETWORK_RETRY_MAX,
 };
 use whisrs::transcription::retry::is_network_unavailable;
 use whisrs::{Config, RecordingConfig, Response};
@@ -237,6 +237,17 @@ impl ActiveRecording {
             job: Job::Transcribe,
         }
     }
+
+    fn from_header(dir: &Path, header: &store::RecordingHeader) -> Self {
+        Self {
+            id: header.id.clone(),
+            title: header.title.clone(),
+            started_at: header.started_at,
+            dir: dir.to_path_buf(),
+            network_retry: false,
+            job: Job::Transcribe,
+        }
+    }
 }
 
 /// What the daemon is doing with recordings, the source of [`RecordingStatus`].
@@ -283,6 +294,17 @@ impl RecordingView {
     fn is_pending(&self, id: &str) -> bool {
         self.processing.as_ref().is_some_and(|p| p.id == id)
             || self.queued.iter().any(|q| q.id == id)
+            || self.held.iter().any(|h| h == id)
+    }
+
+    /// Whether a hold on `id` must wait: it is held, or queued or being
+    /// processed for a transcription. A summary job does not count: it
+    /// reads a snapshot and holds the recording only to write its result
+    /// ([`summarize_one`]), so a rename or the sweep goes on meanwhile.
+    fn blocks_a_hold(&self, id: &str) -> bool {
+        let transcribing = |r: &ActiveRecording| r.id == id && r.job == Job::Transcribe;
+        self.processing.as_ref().is_some_and(transcribing)
+            || self.queued.iter().any(transcribing)
             || self.held.iter().any(|h| h == id)
     }
 }
@@ -510,11 +532,12 @@ impl RecordingRuntime {
 
     /// Claim recording `id` while its files are rewritten, like
     /// [`Self::reserve`] but without showing it as queued: the tray and
-    /// `status` see nothing. Refuses one that is queued, being processed
-    /// or held. Follow with [`Self::release`].
+    /// `status` see nothing. Refuses one that is held, or queued or being
+    /// processed for a transcription; a summary job does not stop it
+    /// ([`RecordingView::blocks_a_hold`]). Follow with [`Self::release`].
     fn hold(&self, id: &str) -> Result<()> {
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-        if view.is_pending(id) {
+        if view.blocks_a_hold(id) {
             bail!("recording {id} is queued, being transcribed or being rewritten");
         }
         view.held.push(id.to_string());
@@ -1506,8 +1529,8 @@ async fn name(context: &Arc<DaemonContext>, query: &str, options: &RecordingOpti
     whisrs::recording::naming::ensure_transcribed(&meta)?;
     if context.recording.hold(&meta.id).is_err() {
         bail!(
-            "recording {} is queued, being transcribed or being summarized: name its \
-             speakers once that is done",
+            "recording {} is queued or being transcribed: name its speakers once its \
+             transcript is ready",
             meta.id
         );
     }
@@ -1539,36 +1562,43 @@ async fn summarize(context: &Arc<DaemonContext>, query: &str) -> Result<()> {
     let dir = store::resolve(&root, query)?;
     let meta = store::read_meta(&dir)?;
     summary::ensure_summarizable(&meta, &context.config)?;
-    queue_summary(context, &dir, &meta).await
+    queue_summary(
+        context,
+        ActiveRecording::from_meta(&dir, &meta),
+        SummaryRequest::Asked,
+    )
+    .await
 }
 
-/// Queue a summary job for the recording in `dir`. It goes through the
-/// processing queue, so it never runs beside a transcription (and waits
-/// for the transcriptions queued with it, [`next_job`]); a recording that
-/// is queued, being processed or held is refused. Its `summary_pending`
-/// mark is set first, so a summary that a shutdown or a crash interrupts
-/// is queued again at the next start ([`resume_summaries`]).
+/// Queue a summary job for `recording`, wanted by `request`. It goes
+/// through the one processing queue, so it never runs beside a
+/// transcription (waiting summaries run after waiting transcriptions,
+/// [`next_job`]); a recording that is queued, being processed or held is
+/// refused. Its `summary_pending` mark is set first, so a summary that a
+/// shutdown or a crash interrupts is queued again at the next start
+/// ([`resume_summaries`]).
 async fn queue_summary(
     context: &Arc<DaemonContext>,
-    dir: &Path,
-    meta: &RecordingMeta,
+    recording: ActiveRecording,
+    request: SummaryRequest,
 ) -> Result<()> {
     let active = ActiveRecording {
         job: Job::Summarize,
-        ..ActiveRecording::from_meta(dir, meta)
+        ..recording
     };
     context.recording.reserve(&active)?;
-    let mark_dir = dir.to_path_buf();
-    let marked = tokio::task::spawn_blocking(move || summary::mark_pending(&mark_dir))
+    let mark_dir = active.dir.clone();
+    let marked = tokio::task::spawn_blocking(move || summary::mark_pending(&mark_dir, request))
         .await
         .context("summary bookkeeping panicked")
         .and_then(|r| r);
     if let Err(e) = marked {
-        context.recording.unreserve(&meta.id);
+        context.recording.unreserve(&active.id);
         return Err(e);
     }
+    let id = active.id.clone();
     context.recording.dispatch(active)?;
-    info!("recording {} queued for a summary", meta.id);
+    info!("recording {id} queued for a summary");
     Ok(())
 }
 
@@ -1625,8 +1655,11 @@ pub(crate) async fn run_worker(
 }
 
 /// The job the worker runs next: the first transcription waiting, else the
-/// first summary, so a slow summary (a local LLM) never holds up the next
-/// transcript.
+/// first summary. Waiting summaries never hold up a waiting transcript, but
+/// one worker runs one job at a time (a local LLM beside local whisper is
+/// too much memory for a small machine): a summary already running delays
+/// the next transcription until it ends, each LLM call up to
+/// [`SUMMARY_TIMEOUT`].
 fn next_job(pending: &mut VecDeque<QueuedRecording>) -> Option<QueuedRecording> {
     let at = pending
         .iter()
@@ -1648,6 +1681,7 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
     if job == Job::Summarize {
         summarize_one(context, &dir, &id).await;
         context.recording.update(|v| v.processing = None);
+        sweep(context).await;
         return;
     }
 
@@ -1713,60 +1747,125 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
     // the transcript is out and notified first, and a summary that fails,
     // panics or is interrupted never touches the transcript's status.
     if let Some(meta) = summarize_next {
-        if let Err(e) = queue_summary(context, &dir, &meta).await {
+        let recording = ActiveRecording::from_meta(&dir, &meta);
+        if let Err(e) = queue_summary(context, recording, SummaryRequest::Auto).await {
             warn!("recording {id}: the summary was not queued: {e:#}");
         }
     }
     sweep(context).await;
 }
 
-/// Run a summary job ([`summary::summarize_recording`]) and notify how it
-/// went. A panic is caught like one in processing, and the recording stays
-/// as it was, without its pending mark.
+/// How long a summary job waits to write its result while a rename or the
+/// sweep holds the recording.
+const SUMMARY_WRITE_WAIT: Duration = Duration::from_secs(30);
+
+/// Run a summary job and notify how it went. The LLM works from a
+/// snapshot of `recording.json` ([`summary::snapshot`], [`summary::make`])
+/// without holding the recording, so `recording name` and the retention
+/// sweep go on meanwhile; the result is written under a short hold
+/// ([`summary::write_result`]), merged into the recording as it is then. A
+/// recording deleted or transcribed again meanwhile drops the result. A
+/// panic is caught like one in processing.
 async fn summarize_one(context: &Arc<DaemonContext>, dir: &Path, id: &str) {
-    let result = AssertUnwindSafe(summary::summarize_recording(
-        dir,
-        &context.config,
-        SUMMARY_TIMEOUT,
-    ))
-    .catch_unwind()
-    .await
-    .unwrap_or_else(|panic| {
-        Err(anyhow::anyhow!(
-            "the summary crashed: {}",
-            panic_message(&*panic)
-        ))
-    });
-    let why = match result {
-        Ok((meta, Ok(()))) => {
+    let snap_dir = dir.to_path_buf();
+    let snapshot = tokio::task::spawn_blocking(move || summary::snapshot(&snap_dir))
+        .await
+        .context("summary bookkeeping panicked")
+        .and_then(|r| r);
+    let snapshot = match snapshot {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            info!("recording {id} is gone; its summary is dropped");
+            return;
+        }
+        Err(e) => {
+            summary_failed(context, dir, id, &format!("{e:#}")).await;
+            return;
+        }
+    };
+    let made = AssertUnwindSafe(summary::make(&context.config, &snapshot, SUMMARY_TIMEOUT))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|panic| {
+            Err(format!(
+                "{SUMMARY_FAILED}the summary crashed: {}",
+                panic_message(&*panic)
+            ))
+        });
+    let Some(held) = hold_to_write(context, id).await else {
+        warn!(
+            "recording {id} stayed busy for {SUMMARY_WRITE_WAIT:?}; its summary is made again \
+             at the next start"
+        );
+        return;
+    };
+    let write_dir = dir.to_path_buf();
+    let written =
+        tokio::task::spawn_blocking(move || summary::write_result(&write_dir, &snapshot, made))
+            .await
+            .context("summary bookkeeping panicked")
+            .and_then(|r| r);
+    drop(held);
+    match written {
+        Ok(Some((meta, Ok(())))) => {
             let md = store::transcript_path(dir, &meta.id);
             info!("recording {id} summary ready: {}", md.display());
             notify(
                 context,
                 &format!("Recording summary ready: {}", md.display()),
             );
-            return;
         }
-        Ok((_, Err(note))) => note
-            .strip_prefix(SUMMARY_FAILED)
-            .unwrap_or(&note)
-            .to_string(),
-        Err(e) => {
-            error!("recording {id} summary failed: {e:#}");
-            let clear_dir = dir.to_path_buf();
-            match tokio::task::spawn_blocking(move || summary::clear_pending(&clear_dir)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("recording {id}: failed to clear its pending summary: {e:#}"),
-                Err(e) => warn!("recording {id}: summary bookkeeping panicked: {e}"),
-            }
-            format!("{e:#}")
+        Ok(Some((_, Err(note)))) => {
+            let why = note.strip_prefix(SUMMARY_FAILED).unwrap_or(&note);
+            notify(
+                context,
+                &format!(
+                    "Recording summary failed: {}",
+                    truncate_preview(why, NOTIFY_ERROR_MAX)
+                ),
+            );
         }
-    };
+        Ok(None) => info!(
+            "recording {id} was deleted or transcribed again during its summary; the summary \
+             is dropped"
+        ),
+        Err(e) => summary_failed(context, dir, id, &format!("{e:#}")).await,
+    }
+}
+
+/// A [`RecordingRuntime::hold`] on `id` for a summary job's write, waiting
+/// up to [`SUMMARY_WRITE_WAIT`] for a rename or the sweep to let go.
+async fn hold_to_write(context: &Arc<DaemonContext>, id: &str) -> Option<Held> {
+    let deadline = tokio::time::Instant::now() + SUMMARY_WRITE_WAIT;
+    loop {
+        if context.recording.hold(id).is_ok() {
+            return Some(Held {
+                context: Arc::clone(context),
+                id: id.to_string(),
+            });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A summary job that could not run or write: logged, its pending mark
+/// cleared, and notified.
+async fn summary_failed(context: &Arc<DaemonContext>, dir: &Path, id: &str, why: &str) {
+    error!("recording {id} summary failed: {why}");
+    let clear_dir = dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || summary::clear_pending(&clear_dir)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("recording {id}: failed to clear its pending summary: {e:#}"),
+        Err(e) => warn!("recording {id}: summary bookkeeping panicked: {e}"),
+    }
     notify(
         context,
         &format!(
             "Recording summary failed: {}",
-            truncate_preview(&why, NOTIFY_ERROR_MAX)
+            truncate_preview(why, NOTIFY_ERROR_MAX)
         ),
     );
 }
@@ -2255,26 +2354,43 @@ pub(crate) async fn recover_on_startup(context: Arc<DaemonContext>) {
 }
 
 /// At startup: queue again every summary a shutdown or a crash
-/// interrupted, or that was still queued (`summary_pending`), oldest first.
+/// interrupted, or that was still queued (`summary_pending`), oldest
+/// first, from the headers. One the user asked for always; an automatic
+/// one only while `[recording] summary` is still on, else its mark is
+/// cleared.
 async fn resume_summaries(context: &Arc<DaemonContext>) {
     let root = recordings_root(&context.config);
-    let pending: Vec<(PathBuf, RecordingMeta)> = tokio::task::spawn_blocking(move || {
-        store::list(&root)
+    let pending: Vec<(PathBuf, store::RecordingHeader)> = tokio::task::spawn_blocking(move || {
+        store::list_headers(&root)
             .unwrap_or_default()
             .into_iter()
             .rev()
-            .filter(|(_, m)| m.summary_pending && m.status == RecordingState::Done)
+            .filter(|(_, h)| h.summary_pending.is_some() && h.status == RecordingState::Done)
             .collect()
     })
     .await
     .unwrap_or_default();
-    for (dir, meta) in pending {
-        info!("recording {}: resuming its interrupted summary", meta.id);
-        if let Err(e) = queue_summary(context, &dir, &meta).await {
-            warn!(
-                "recording {}: the summary was not queued again: {e:#}",
-                meta.id
+    let summary_on = RecordingConfig::effective(&context.config).summary;
+    for (dir, header) in pending {
+        let id = header.id.clone();
+        let request = header.summary_pending.unwrap_or(SummaryRequest::Asked);
+        if request == SummaryRequest::Auto && !summary_on {
+            info!(
+                "recording {id}: its automatic summary is not made: [recording] summary is \
+                 off now"
             );
+            let clear_dir = dir.clone();
+            if let Ok(Err(e)) =
+                tokio::task::spawn_blocking(move || summary::clear_pending(&clear_dir)).await
+            {
+                warn!("recording {id}: failed to clear its pending summary: {e:#}");
+            }
+            continue;
+        }
+        info!("recording {id}: resuming its interrupted summary");
+        let recording = ActiveRecording::from_header(&dir, &header);
+        if let Err(e) = queue_summary(context, recording, request).await {
+            warn!("recording {id}: the summary was not queued again: {e:#}");
         }
     }
 }
@@ -2379,7 +2495,9 @@ async fn stop_worker(runtime: &RecordingRuntime) {
     if job == Job::Summarize {
         // A summary counts no attempt and leaves the recording done; its
         // pending mark stays, so the next start queues it again.
-        info!("recording {id}: summary interrupted by shutdown; it is made at the next start");
+        info!(
+            "recording {id}: summary interrupted by shutdown; it is queued again at the next start"
+        );
         return;
     }
     if network_retry {
@@ -3105,7 +3223,7 @@ mod tests {
         context.recording.reserve(&active).unwrap();
         refused(
             name_speaker(&context, "me", "Yo").await,
-            "is queued, being transcribed or being summarized",
+            "is queued or being transcribed",
         );
         context.recording.unreserve(&meta.id);
 
@@ -3236,15 +3354,21 @@ mod tests {
         assert_eq!(recording.phase, RecordingPhase::Processing);
         assert!(recording.summarizing, "{recording:?}");
         assert_eq!(recording.queued, std::slice::from_ref(&meta.id));
-        assert!(
+        assert_eq!(
             store::read_meta(&dir).unwrap().summary_pending,
+            Some(SummaryRequest::Asked),
             "marked while queued"
         );
         refused(summarize_last(&context).await, "is already queued");
         assert!(retry(&context, "last", &RecordingOptions::default())
             .await
             .is_err());
-        refused(name_speaker(&context, "me", "Yo").await, "being summarized");
+        // A rename does not wait for a summary.
+        let response = name_speaker(&context, "me", "Yo").await;
+        assert!(
+            matches!(response, Response::Recording { .. }),
+            "{response:?}"
+        );
 
         process_one(&context, queue.try_recv().expect("queued")).await;
         assert!(queue.try_recv().is_err(), "queued once");
@@ -3255,7 +3379,7 @@ mod tests {
         );
         let after = store::read_meta(&dir).unwrap();
         assert_eq!(after.summary.as_deref(), Some(summary::TOO_SHORT));
-        assert!(!after.summary_pending);
+        assert!(after.summary_pending.is_none());
         assert_eq!(after.segments, meta.segments);
         assert_eq!(after.status, RecordingState::Done);
         let md = std::fs::read_to_string(store::transcript_path(&dir, &after.id)).unwrap();
@@ -3291,7 +3415,7 @@ mod tests {
         let meta = store::read_meta(&dir).unwrap();
         assert_eq!(meta.status, RecordingState::Done);
         assert_eq!(meta.summary, None, "not made in the transcription job");
-        assert!(meta.summary_pending);
+        assert_eq!(meta.summary_pending, Some(SummaryRequest::Auto));
         let status = context.recording.status();
         assert!(
             status.summarizing && status.queued == [meta.id.clone()],
@@ -3302,7 +3426,7 @@ mod tests {
         process_one(&context, job).await;
         let meta = store::read_meta(&dir).unwrap();
         assert_eq!(meta.summary.as_deref(), Some(summary::TOO_SHORT));
-        assert!(!meta.summary_pending);
+        assert!(meta.summary_pending.is_none());
         assert_eq!(context.recording.status(), RecordingStatus::default());
 
         // A retry with `summary` on transcribes, then summarizes again.
@@ -3339,7 +3463,7 @@ mod tests {
         process_one(&no_llm, no_llm_queue.try_recv().expect("a summary job")).await;
         let meta = store::read_meta(&dir).unwrap();
         assert_eq!(meta.status, RecordingState::Done);
-        assert!(!meta.summary_pending);
+        assert!(meta.summary_pending.is_none());
         assert!(
             meta.errors
                 .iter()
@@ -3369,27 +3493,226 @@ mod tests {
     }
 
     /// A summary still pending at startup (a shutdown or a crash stopped
-    /// it) is queued again; a done recording without the mark is not.
+    /// it) is queued again, oldest first: one the user asked for always,
+    /// an automatic one only while `summary` is still on (else its mark is
+    /// cleared); a done recording without the mark is not.
     #[tokio::test]
     async fn a_pending_summary_is_queued_again_at_startup() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (context, mut queue) = test_context(tmp.path(), working_backend());
-        let mut ids = Vec::new();
-        for (title, pending) in [("waits", true), ("done", false)] {
-            let (id, dir) = store::create(tmp.path(), Local::now(), Some(title)).unwrap();
-            let mut meta = RecordingMeta::new(id.clone(), Some(title.into()), Local::now());
-            meta.status = RecordingState::Done;
-            meta.summary_pending = pending;
-            store::write_meta(&dir, &meta).unwrap();
-            ids.push(id);
+        for summary_on in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let extra = if summary_on { "summary = true\n" } else { "" };
+            let (context, mut queue) = test_context_with(tmp.path(), working_backend(), extra);
+            let mut dirs = Vec::new();
+            for (minutes, title, pending) in [
+                (3, "asked", Some(SummaryRequest::Asked)),
+                (2, "auto", Some(SummaryRequest::Auto)),
+                (1, "done", None),
+            ] {
+                let started = Local::now() - chrono::Duration::minutes(minutes);
+                let (id, dir) = store::create(tmp.path(), started, Some(title)).unwrap();
+                let mut meta = RecordingMeta::new(id, Some(title.into()), started);
+                meta.status = RecordingState::Done;
+                meta.summary_pending = pending;
+                store::write_meta(&dir, &meta).unwrap();
+                dirs.push(dir);
+            }
+            recover_on_startup(Arc::clone(&context)).await;
+            let mut queued = Vec::new();
+            while let Ok(job) = queue.try_recv() {
+                assert_eq!(job.recording.job, Job::Summarize);
+                queued.push(job.recording.dir);
+            }
+            if summary_on {
+                assert_eq!(queued, [dirs[0].clone(), dirs[1].clone()]);
+            } else {
+                assert_eq!(queued, [dirs[0].clone()]);
+                assert_eq!(
+                    store::read_meta(&dirs[1]).unwrap().summary_pending,
+                    None,
+                    "cleared"
+                );
+            }
         }
-        recover_on_startup(Arc::clone(&context)).await;
-        let job = queue.try_recv().expect("queued again");
-        assert_eq!(
-            (job.recording.id.as_str(), job.recording.job),
-            (ids[0].as_str(), Job::Summarize)
+    }
+
+    /// A hold waits for a transcription, queued or running, but not for a
+    /// summary job, which writes under a hold of its own.
+    #[test]
+    fn a_hold_waits_for_a_transcription_only() {
+        let (runtime, _status, _queue) = RecordingRuntime::new();
+        let summary = |id: &str| ActiveRecording {
+            job: Job::Summarize,
+            ..active(id)
+        };
+        runtime.reserve(&summary("s")).unwrap();
+        runtime.hold("s").unwrap();
+        runtime.release("s");
+        runtime.update(|v| v.processing = Some(summary("r")));
+        runtime.hold("r").unwrap();
+        assert!(runtime.hold("r").is_err(), "held once");
+        runtime.release("r");
+        runtime.reserve(&active("t")).unwrap();
+        assert!(runtime.hold("t").is_err(), "a queued transcription");
+        runtime.update(|v| v.processing = Some(active("p")));
+        assert!(runtime.hold("p").is_err(), "a running transcription");
+        assert!(
+            runtime.reserve(&summary("p")).is_err(),
+            "one job a recording"
         );
-        assert!(queue.try_recv().is_err());
+    }
+
+    /// With `audio_retention_days = 0` and `summary` on, the audio goes as
+    /// soon as the transcript is written, though its summary is queued, and
+    /// the summary keeps that; a summary resumed at startup does not keep
+    /// the startup sweep off its recording either.
+    #[tokio::test]
+    async fn the_audio_is_swept_with_a_summary_queued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_recording(tmp.path());
+        let (context, mut queue) = test_context_with(
+            tmp.path(),
+            working_backend(),
+            "audio_retention_days = 0\nsummary = true\n\
+             [llm]\napi_key = \"k\"\napi_url = \"http://127.0.0.1:1/v1/chat/completions\"\n",
+        );
+        let audio = store::audio_path(&dir, TrackKind::Mic);
+        recover_on_startup(Arc::clone(&context)).await;
+        process_one(&context, queue.try_recv().unwrap()).await;
+        assert!(!audio.exists(), "swept after the transcript");
+        let job = queue.try_recv().expect("the summary job");
+        process_one(&context, job).await;
+        let meta = store::read_meta(&dir).unwrap();
+        assert!(meta.audio_deleted && !audio.exists());
+        assert_eq!(meta.summary.as_deref(), Some(summary::TOO_SHORT));
+
+        // At startup: a done recording with audio and a summary pending.
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = test_context_with(
+            tmp.path(),
+            working_backend(),
+            "audio_retention_days = 0\n[llm]\napi_key = \"k\"\n",
+        );
+        let (id, dir) = store::create(tmp.path(), Local::now(), Some("done")).unwrap();
+        let mut meta = RecordingMeta::new(id, Some("done".into()), Local::now());
+        meta.status = RecordingState::Done;
+        meta.ended_at = Some(Local::now());
+        meta.tracks.push(track_meta(TrackKind::Mic, "test".into()));
+        meta.summary_pending = Some(SummaryRequest::Asked);
+        store::write_meta(&dir, &meta).unwrap();
+        let audio = store::audio_path(&dir, TrackKind::Mic);
+        std::fs::write(&audio, whisrs::audio::wav::encode_wav(&[0; 1600]).unwrap()).unwrap();
+        recover_on_startup(Arc::clone(&context)).await;
+        assert!(queue.try_recv().is_ok(), "the summary is queued again");
+        assert!(
+            !audio.exists(),
+            "and the startup sweep still took the audio"
+        );
+    }
+
+    /// Sixty words: a transcript long enough to be sent to the LLM.
+    const LONG_SPEECH: &str = "one two three four five six seven eight nine ten one two three \
+        four five six seven eight nine ten one two three four five six seven eight nine ten one \
+        two three four five six seven eight nine ten one two three four five six seven eight nine \
+        ten one two three four five six seven eight nine ten";
+
+    /// A chat completion server that takes one request, says it arrived,
+    /// and answers `content` once released.
+    async fn held_llm(
+        content: &'static str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let _ = arrived_tx.send(());
+            let _ = release_rx.await;
+            let body = serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": content}}]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (url, arrived_rx, release_tx)
+    }
+
+    /// `recording name` goes through while the LLM works on a summary,
+    /// and the summary, written afterwards, keeps the new name and is
+    /// marked stale, since it was made with the old one.
+    #[tokio::test]
+    async fn a_name_during_a_running_summary_goes_through_and_makes_it_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_recording(tmp.path());
+        let (url, arrived, release) = held_llm("{\"summary\": \"Tester counted.\"}").await;
+        let backend = Arc::new(FakeBackend {
+            text: LONG_SPEECH,
+            fail: false,
+            calls: AtomicUsize::new(0),
+        });
+        let (context, mut queue) = test_context_with(
+            tmp.path(),
+            backend,
+            &format!("summary = true\n[llm]\napi_key = \"k\"\napi_url = \"{url}\"\n"),
+        );
+        recover_on_startup(Arc::clone(&context)).await;
+        process_one(&context, queue.try_recv().unwrap()).await;
+        let job = queue.try_recv().expect("the summary job");
+        let worker = {
+            let context = Arc::clone(&context);
+            tokio::spawn(async move { process_one(&context, job).await })
+        };
+        arrived.await.expect("the LLM was asked");
+        assert!(context.recording.status().summarizing);
+        let response = name_speaker(&context, "me", "Yo").await;
+        assert!(
+            matches!(response, Response::Recording { .. }),
+            "{response:?}"
+        );
+        assert_eq!(store::read_meta(&dir).unwrap().speakers[0].name, "Yo");
+        release.send(()).unwrap();
+        worker.await.unwrap();
+
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.summary.as_deref(), Some("Tester counted."));
+        assert_eq!(meta.speakers[0].name, "Yo", "the rename stays");
+        assert!(meta.summary_stale, "made with the old name");
+        assert!(meta.summary_pending.is_none());
+        assert_eq!(context.recording.status(), RecordingStatus::default());
     }
 
     /// Bad values from a client other than the CLI are refused before a

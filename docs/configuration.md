@@ -886,11 +886,16 @@ The summary is a job of its own: the transcript is written and notified
 first, then the summary is made, `whisrs recording status` shows
 "Summarizing" meanwhile, and a second notification says when it is ready.
 `whisrs recording summarize <id>` makes one for any transcribed recording,
-whatever `summary` says, without transcribing it again. Summaries wait
-behind any recording being transcribed, so a slow LLM never holds up the
-next transcript. A summary that a shutdown or a crash interrupted is made
-at the next start (`recording.json` marks it `summary_pending` until it
-is done). The summary goes into the Markdown file as a `## Summary`
+whatever `summary` says, without transcribing it again. One job runs at a
+time, so the LLM never runs beside a transcription: waiting summaries run
+after waiting transcriptions, but a summary already running delays the
+next transcription until it ends (each LLM call can take up to 10
+minutes). The summary works from a copy of the recording and writes its
+result at the end, so `whisrs recording name` works while it runs. A
+summary that a shutdown or a crash interrupted is made at the next start
+(`recording.json` marks it `summary_pending` until it is done); an
+automatic one only while `summary` is still on. A new transcript drops a
+summary still pending for the old one. The summary goes into the Markdown file as a `## Summary`
 section before the transcript, and into `recording.json` as `summary`,
 with the model that wrote it (`summary_model`) and when (`summarized_at`).
 
@@ -930,8 +935,11 @@ the API, a reply cut off or malformed), the transcript is untouched,
 too), and a summary the recording already had stays. `whisrs recording
 retry` makes a new summary when `summary = true`. When it is off, the old
 summary stays, marked `summary_stale` in `recording.json` and with a line
-in the transcript saying it is from an earlier transcript, until
-`whisrs recording summarize` makes a new one.
+in the transcript saying it was made before the transcript or the speaker
+names last changed, until `whisrs recording summarize` makes a new one.
+Naming a speaker (`whisrs recording name`, also while the summary is being
+made) marks a summary stale the same way, since it names the speakers by
+their old labels.
 
 A summary sends the whole transcript to the `[llm]` endpoint, which is why
 `summary` is off by default. Point `[llm] api_url` at a local server to
@@ -978,7 +986,8 @@ Its tools:
   `YYYY-MM-DD HH:MM` or an RFC 3339 time; `query` matches the title or id;
   `limit` is 1 to 100, 20 by default.
 - `get_recording` (`id`): one recording's details, speakers, languages,
-  summary (`summary_stale` when it is from an earlier transcript) and
+  summary (`summary_stale` when it was made before the transcript or the
+  speaker names last changed) and
   files, without the transcript.
 - `get_transcript` (`id`, `offset`, `max_chars`, `speaker`, `start_ms`,
   `end_ms`): the transcript as `[HH:MM:SS] Name: text` lines (one

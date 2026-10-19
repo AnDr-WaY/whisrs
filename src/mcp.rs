@@ -79,8 +79,9 @@ const LIST_DESCRIPTION: &str = concat!(
 
 const GET_RECORDING_DESCRIPTION: &str = concat!(
     "One recording's details: title, times, status (and its error when it failed), languages, \
-     speakers (id, name, how it was named), participants, summary (and whether it is from an \
-     earlier transcript), the number of transcript lines, and its files. No transcript: use \
+     speakers (id, name, how it was named), participants, summary (and whether it was made \
+     before the transcript or the speaker names last changed), the number of transcript \
+     lines, and its files. No transcript: use \
      get_transcript. ",
     data_note!()
 );
@@ -204,8 +205,8 @@ pub struct RecordingInfo {
     pub participants: Vec<String>,
     /// The summary, in Markdown.
     pub summary: Option<String>,
-    /// The summary is from an earlier transcript: the recording was
-    /// transcribed again since.
+    /// The summary was made before the transcript or the speaker names
+    /// last changed.
     pub summary_stale: bool,
     pub summarized_at: Option<String>,
     /// Lines get_transcript pages through.

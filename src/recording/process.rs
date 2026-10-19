@@ -319,10 +319,12 @@ async fn process_with_timing(
     meta.error = None;
     meta.network_wait = None;
     // A summary of the transcript this one replaces stays, marked as such
-    // until a new one is made.
+    // until a new one is made; a summary still pending was for that
+    // transcript (the daemon queues a new one when `summary` is on).
     if meta.summary.is_some() {
         meta.summary_stale = true;
     }
+    meta.summary_pending = None;
 
     save(dir, &meta)?;
     // One folder holds both tracks' chunks.
@@ -1493,8 +1495,9 @@ mod tests {
     }
 
     /// Processing never summarizes, whatever `summary` says (the daemon
-    /// queues that as a job of its own), and a summary from the transcript
-    /// this one replaces is kept, marked stale.
+    /// queues that as a job of its own); a summary from the transcript this
+    /// one replaces is kept, marked stale, and a summary still pending for
+    /// it is dropped.
     #[tokio::test]
     async fn processing_ends_at_the_transcript_and_marks_a_summary_stale() {
         // Nothing listens there: a request would fail and be noted.
@@ -1519,6 +1522,7 @@ mod tests {
 
         let mut summarized = store::read_meta(tmp.path()).unwrap();
         summarized.summary = Some("From the first transcript.".into());
+        summarized.summary_pending = Some(crate::recording::SummaryRequest::Asked);
         store::write_meta(tmp.path(), &summarized).unwrap();
         let meta = process_recording(
             tmp.path(),
@@ -1529,10 +1533,14 @@ mod tests {
         .unwrap();
         assert_eq!(meta.summary.as_deref(), Some("From the first transcript."));
         assert!(meta.summary_stale);
+        assert_eq!(
+            meta.summary_pending, None,
+            "the new transcript supersedes it"
+        );
         assert_eq!(store::read_meta(tmp.path()).unwrap(), meta);
         let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
         assert!(
-            md.contains("_This summary is from an earlier transcript."),
+            md.contains("_This summary was made before the transcript"),
             "{md}"
         );
     }

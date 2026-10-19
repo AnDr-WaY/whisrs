@@ -525,15 +525,28 @@ pub struct RecordingMeta {
     /// When `summary` was made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summarized_at: Option<DateTime<Local>>,
-    /// `summary` was made from an earlier transcript: a retry transcribed
-    /// the recording again since. The next summary clears it.
+    /// `summary` was made before the transcript or the speaker names last
+    /// changed: a retry transcribed the recording again, or a speaker was
+    /// named, since. The next summary clears it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub summary_stale: bool,
-    /// A summary is queued or running for this recording. Set when the job
-    /// is queued and cleared when it ends, so a summary that a shutdown or
-    /// a crash interrupted is queued again at the next start.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub summary_pending: bool,
+    /// A summary is queued or running for this recording, and who wanted
+    /// it. Set when the job is queued and cleared when it ends or a new
+    /// transcript is written, so a summary that a shutdown or a crash
+    /// interrupted is queued again at the next start (an automatic one only
+    /// while `[recording] summary` is still on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_pending: Option<SummaryRequest>,
+}
+
+/// Who wanted a summary that is pending ([`RecordingMeta::summary_pending`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SummaryRequest {
+    /// `[recording] summary`, after a transcript.
+    Auto,
+    /// `whisrs recording summarize`.
+    Asked,
 }
 
 /// Whether `text` holds more than whitespace.
@@ -587,7 +600,7 @@ impl RecordingMeta {
             summary_model: None,
             summarized_at: None,
             summary_stale: false,
-            summary_pending: false,
+            summary_pending: None,
         }
     }
 
@@ -744,7 +757,7 @@ mod tests {
         meta.summary_model = Some("gpt-4o-mini".into());
         meta.summarized_at = Some(meta.started_at);
         meta.summary_stale = true;
-        meta.summary_pending = true;
+        meta.summary_pending = Some(SummaryRequest::Asked);
         meta.network_wait = Some(NetworkWait {
             since: meta.started_at,
             attempts: 2,

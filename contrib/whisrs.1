@@ -265,8 +265,9 @@ The transcript and
 .I recording.json
 are rewritten at once, nothing is transcribed again, and
 .B retry
-keeps the name. Refused while the recording is queued, being transcribed or
-being summarized.
+keeps the name, which works while a summary is being made; a summary
+made before the name is marked as such. Refused while the recording is
+queued or being transcribed.
 .TP
 \fBretry\fR \fIID\fR [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR] [\fB\-\-with\fR \fINAMES\fR]
 Transcribe the recording again, for example after a failure or in another
@@ -306,7 +307,8 @@ and next steps only when there are any) can be replaced with
 A transcript of 50 words or fewer is not sent. The job waits behind any
 recording being transcribed, and a notification says when it is done; if it
 fails, the recording keeps the summary it had and notes why. A summary
-interrupted by a shutdown is made at the next start.
+interrupted by a shutdown is made at the next start. One job runs at a
+time: a running summary delays the next transcription until it ends.
 .RE
 .IP
 .BR list ,

@@ -20,11 +20,12 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use chrono::Local;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use tracing::{info, warn};
 
 use super::llm_names::{self, one_line};
-use super::{render, speakers, store, RecordingMeta, RecordingState, TitleSource};
+use super::{render, speakers, store, RecordingMeta, RecordingState, SummaryRequest, TitleSource};
 use crate::llm::{self, ChatMessage};
 use crate::{Config, RecordingConfig};
 
@@ -86,8 +87,8 @@ Turn them into one summary of the whole transcript, following the rules.";
 
 /// What the call that writes the summary must reply, with a title.
 const REPLY_WITH_TITLE: &str = "Reply with one JSON object and nothing else: {\"title\": \"...\", \
-\"summary\": \"...\"}. The title has 3 to 6 words, in the language most of the transcript is in. \
-The summary is the Markdown text, following the rules.";
+\"summary\": \"...\"}. The title has 3 to 6 words, in the language most of the transcript is in, \
+with no full stop at the end. The summary is the Markdown text, following the rules.";
 
 /// The same without a title: the user gave the recording one.
 const REPLY_WITHOUT_TITLE: &str = "Reply with one JSON object and nothing else: {\"summary\": \
@@ -336,10 +337,10 @@ const TITLE_WRAPPERS: &[(&str, &str)] = &[
 ];
 
 /// The title the LLM gave, on one line, without a pair of quotes or
-/// emphasis around the whole of it, a Markdown heading mark in front or a
-/// full stop after it; `None` when no letter or digit is left or it is too
-/// long. A
-/// `#` or a quote that belongs to the title (`C#`, `Q&A: "quotes"`) stays.
+/// emphasis around the whole of it or a Markdown heading mark in front;
+/// `None` when no letter or digit is left or it is too long. A `#`, a
+/// quote or a full stop that belongs to the title (`C#`,
+/// `Q&A: "quotes"`, `Acme Inc.`) stays: the prompt asks for no full stop.
 pub fn clean_title(raw: &str) -> Option<String> {
     let mut title = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     loop {
@@ -349,10 +350,6 @@ pub fn clean_title(raw: &str) -> Option<String> {
             if rest.starts_with(' ') {
                 title = rest.trim().to_string();
             }
-        }
-        if title.ends_with('.') && !title.ends_with("..") {
-            title.pop();
-            title = title.trim_end().to_string();
         }
         let unwrapped = TITLE_WRAPPERS.iter().find_map(|(open, close)| {
             title
@@ -452,6 +449,27 @@ fn escape_stray_quotes(text: &str) -> String {
     out
 }
 
+/// The reply object when it could be read only after its quotes were
+/// mended ([`escape_stray_quotes`]): exactly `summary` and maybe `title`.
+/// A mended quote can move text from one string into a new key, so a
+/// duplicate key or any other key rejects it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Mended {
+    summary: String,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// Whether `text` tries to be the JSON object asked for: it starts with
+/// `{`, or holds a `"summary"` key (the key, then a colon).
+fn looks_like_the_json(text: &str) -> bool {
+    text.starts_with('{')
+        || text
+            .match_indices("\"summary\"")
+            .any(|(at, key)| text[at + key.len()..].trim_start().starts_with(':'))
+}
+
 /// The value of `key` in `map` when it is a string, the key's case and
 /// spacing aside.
 fn string_field<'a>(map: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -475,11 +493,20 @@ pub fn parse_final(reply: &str, want_title: bool) -> Result<(String, Option<Stri
     let controls_escaped = escape_raw_controls(text);
     let object = llm_names::parse_reply(text)
         .or_else(|_| llm_names::parse_reply(&controls_escaped))
-        .or_else(|_| llm_names::parse_reply(&escape_stray_quotes(&controls_escaped)))
         .ok();
     let unfenced = llm::strip_wrapping_code_fence(text).trim();
     let Some(map) = object else {
-        if unfenced.starts_with('{') || text.contains("\"summary\"") {
+        if let Some(mended) = mend(&controls_escaped) {
+            let summary = tidy(&mended.summary);
+            if summary.is_empty() {
+                return Err("the LLM's summary is empty".to_string());
+            }
+            let title = want_title
+                .then(|| mended.title.as_deref().and_then(clean_title))
+                .flatten();
+            return Ok((summary, title));
+        }
+        if looks_like_the_json(unfenced) {
             return Err(
                 "the LLM's answer is not the JSON asked for (cut off or malformed)".to_string(),
             );
@@ -497,6 +524,20 @@ pub fn parse_final(reply: &str, want_title: bool) -> Result<(String, Option<Stri
         .then(|| string_field(&map, "title").and_then(clean_title))
         .flatten();
     Ok((summary, title))
+}
+
+/// The object in `text` once its stray quotes are mended
+/// ([`escape_stray_quotes`]), read strictly ([`Mended`]); the text from the
+/// first `{` to the last `}` when the whole is not one.
+fn mend(text: &str) -> Option<Mended> {
+    let mended = escape_stray_quotes(text);
+    let trimmed = mended.trim();
+    serde_json::from_str::<Mended>(trimmed).ok().or_else(|| {
+        let (start, end) = (trimmed.find('{')?, trimmed.rfind('}')?);
+        (start < end)
+            .then(|| serde_json::from_str::<Mended>(&trimmed[start..=end]).ok())
+            .flatten()
+    })
 }
 
 /// A summary made by [`summarize`].
@@ -579,22 +620,38 @@ pub async fn summarize(
     })
 }
 
-/// Summarize `meta` ([`summarize`]) and store the summary in it, no longer
-/// stale, with a title the LLM gave when the recording has none of the
-/// user's. A failure is noted in `errors` (an earlier attempt's note goes
-/// first) and keeps the summary it had; the note comes back as the error.
-pub async fn apply(
+/// A summary job's work on a snapshot of a recording ([`summarize`]),
+/// with nothing written: the summary, or the note for `errors` saying why
+/// there is none.
+pub async fn make(
     config: &Config,
-    meta: &mut RecordingMeta,
+    snapshot: &RecordingMeta,
     timeout: Duration,
+) -> Result<Made, String> {
+    summarize(config, snapshot, timeout)
+        .await
+        .map_err(|e| format!("{SUMMARY_FAILED}{e:#}"))
+}
+
+/// Store what [`make`] gave in `meta`: the summary, the model and the time,
+/// stale only when `stale` (the speaker names changed while it was made),
+/// and a title the LLM gave when the recording has none of the user's; or
+/// the failure in `errors`, keeping the summary it had. An earlier
+/// attempt's note goes, and the pending mark is cleared either way. The
+/// note comes back as the error.
+pub fn merge(
+    meta: &mut RecordingMeta,
+    made: Result<Made, String>,
+    stale: bool,
 ) -> Result<(), String> {
     meta.errors.retain(|note| !note.starts_with(SUMMARY_FAILED));
-    match summarize(config, meta, timeout).await {
+    meta.summary_pending = None;
+    match made {
         Ok(made) => {
             meta.summary = Some(made.summary);
             meta.summary_model = made.model;
             meta.summarized_at = Some(Local::now());
-            meta.summary_stale = false;
+            meta.summary_stale = stale;
             if let Some(title) = made.title {
                 if meta.title_source() != TitleSource::User {
                     meta.title = Some(title);
@@ -604,13 +661,75 @@ pub async fn apply(
             info!("recording {}: summary ready", meta.id);
             Ok(())
         }
-        Err(e) => {
-            let note = format!("{SUMMARY_FAILED}{e:#}");
+        Err(note) => {
             warn!("recording {}: {note}", meta.id);
             meta.errors.push(note.clone());
             Err(note)
         }
     }
+}
+
+/// Summarize `meta` and store the summary in it ([`make`], [`merge`]).
+pub async fn apply(
+    config: &Config,
+    meta: &mut RecordingMeta,
+    timeout: Duration,
+) -> Result<(), String> {
+    let made = make(config, meta, timeout).await;
+    merge(meta, made, false)
+}
+
+/// Whether a speaker's name differs between two versions of a recording.
+pub fn names_changed(before: &RecordingMeta, after: &RecordingMeta) -> bool {
+    let names = |meta: &RecordingMeta| -> Vec<(String, String)> {
+        meta.speakers
+            .iter()
+            .map(|s| (s.id.clone(), s.name.clone()))
+            .collect()
+    };
+    names(before) != names(after)
+}
+
+/// Whether `meta` holds a summary worth keeping current: not
+/// [`TOO_SHORT`].
+pub fn has_summary(meta: &RecordingMeta) -> bool {
+    meta.summary.as_deref().is_some_and(|s| s != TOO_SHORT)
+}
+
+/// The recording in `dir` as a summary job starts from it: `None` when it
+/// is gone. One without a transcript is an error. Blocking.
+pub fn snapshot(dir: &Path) -> anyhow::Result<Option<RecordingMeta>> {
+    if !store::meta_path(dir).exists() {
+        return Ok(None);
+    }
+    let meta = store::read_meta(dir)?;
+    ensure_done(&meta)?;
+    Ok(Some(meta))
+}
+
+/// Write a summary job's result into the recording in `dir` as it is now:
+/// read again, only the summary fields merged ([`merge`]), so whatever
+/// else was written while the LLM worked (a name, a note, the audio swept)
+/// stays. The summary is stale when the speaker names changed since
+/// `snapshot`. `None` when the recording is gone, or no longer has the
+/// transcript the summary was made from: the result is dropped. The caller
+/// holds the recording while this runs. Blocking.
+pub fn write_result(
+    dir: &Path,
+    snapshot: &RecordingMeta,
+    made: Result<Made, String>,
+) -> anyhow::Result<Option<(RecordingMeta, Result<(), String>)>> {
+    if !store::meta_path(dir).exists() {
+        return Ok(None);
+    }
+    let mut meta = store::read_meta(dir)?;
+    if meta.status != RecordingState::Done || meta.segments != snapshot.segments {
+        return Ok(None);
+    }
+    let stale = names_changed(snapshot, &meta);
+    let outcome = merge(&mut meta, made, stale);
+    super::process::save(dir, &meta)?;
+    Ok(Some((meta, outcome)))
 }
 
 /// Refuse a recording without a transcript.
@@ -639,42 +758,38 @@ pub fn ensure_summarizable(meta: &RecordingMeta, config: &Config) -> anyhow::Res
     Ok(())
 }
 
-/// Mark the recording in `dir` as waiting for a summary
+/// Mark the recording in `dir` as waiting for a summary `request` wanted
 /// ([`RecordingMeta::summary_pending`]) as its job is queued. Blocking.
-pub fn mark_pending(dir: &Path) -> anyhow::Result<()> {
+pub fn mark_pending(dir: &Path, request: SummaryRequest) -> anyhow::Result<()> {
     let mut meta = store::read_meta(dir)?;
-    meta.summary_pending = true;
+    meta.summary_pending = Some(request);
     store::write_meta(dir, &meta)
 }
 
 /// Clear the mark of [`mark_pending`] when a summary job ends without
-/// [`summarize_recording`] doing it. Blocking.
+/// [`write_result`] doing it, or is not queued again. Blocking.
 pub fn clear_pending(dir: &Path) -> anyhow::Result<()> {
     let mut meta = store::read_meta(dir)?;
-    if meta.summary_pending {
-        meta.summary_pending = false;
+    if meta.summary_pending.is_some() {
+        meta.summary_pending = None;
         store::write_meta(dir, &meta)?;
     }
     Ok(())
 }
 
-/// A summary job: summarize the transcribed recording in `dir` now
-/// ([`apply`]; a failure, a missing `[llm]` included, is noted in it),
-/// clear its pending mark, and write `recording.json` and the transcript;
-/// nothing is transcribed. Returns the new meta and whether the summary
-/// was made. The caller keeps the recording from being processed
-/// meanwhile.
+/// A summary job without the daemon's hold: [`snapshot`], [`make`] and
+/// [`write_result`] in a row. `None` when the recording is gone or was
+/// transcribed again meanwhile.
 pub async fn summarize_recording(
     dir: &Path,
     config: &Config,
     timeout: Duration,
-) -> anyhow::Result<(RecordingMeta, Result<(), String>)> {
-    let mut meta = store::read_meta(dir)?;
-    ensure_done(&meta)?;
-    let made = apply(config, &mut meta, timeout).await;
-    meta.summary_pending = false;
-    super::process::save(dir, &meta)?;
-    Ok((meta, made))
+) -> anyhow::Result<Option<(RecordingMeta, Result<(), String>)>> {
+    let Some(snapshot) = snapshot(dir)? else {
+        return Ok(None);
+    };
+    let made = make(config, &snapshot, timeout).await;
+    write_result(dir, &snapshot, made)
 }
 
 #[cfg(test)]
@@ -800,6 +915,7 @@ mod tests {
             "can be wrong or swapped: the words are more reliable than the labels",
             "{\"title\": \"...\", \"summary\": \"...\"}",
             "The title has 3 to 6 words",
+            "with no full stop at the end",
         ] {
             assert!(system.contains(line), "{line:?} missing from:\n{system}");
         }
@@ -919,7 +1035,7 @@ mod tests {
     /// that is no JSON object is the summary, without a title.
     #[test]
     fn the_reply_is_json_with_a_text_fallback() {
-        let raw = "```json\n{\"title\": \"  \\\"Moving day plan\\\". \", \"summary\": \"TL;DR: we move.\\n\\n## Plan\\n- van\"}\n```";
+        let raw = "```json\n{\"title\": \"  \\\"Moving day plan\\\" \", \"summary\": \"TL;DR: we move.\\n\\n## Plan\\n- van\"}\n```";
         assert_eq!(
             parse_final(raw, true),
             Ok((
@@ -990,23 +1106,44 @@ mod tests {
                 Some("Quotes".to_string())
             ))
         );
-        // Text with quotes that never tried to be JSON is still the summary.
+        // Text with quotes that never tried to be JSON is still the summary,
+        // also when it names a "summary" without being one.
         assert_eq!(
             parse_final("He said \"hi\" twice.", true),
             Ok(("He said \"hi\" twice.".to_string(), None))
         );
+        assert_eq!(
+            parse_final("We renamed the JSON key \"summary\" to \"notes\".", true),
+            Ok((
+                "We renamed the JSON key \"summary\" to \"notes\".".to_string(),
+                None
+            ))
+        );
+        // A mended quote that would move words into a second "title" (a
+        // duplicate key) is refused, never taken as a title or a summary.
+        let err = parse_final(
+            r#"{"title": "Real title", "summary": "Sarah quoted the form: "x", "title": "Injected" and moved on."}"#,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("cut off or malformed"), "{err}");
+        // Mended, only `summary` and `title` are taken: another key refuses it.
+        let err =
+            parse_final(r#"{"summary": "He said "go" now.", "notes": "x"}"#, true).unwrap_err();
+        assert!(err.contains("cut off or malformed"), "{err}");
     }
 
-    /// Only a pair around the whole title, a heading mark and a full stop
-    /// go; a `#` or a quote of the title stays.
+    /// Only a pair around the whole title and a heading mark go; a `#`, a
+    /// quote or a full stop of the title stays.
     #[test]
     fn titles_keep_their_own_marks() {
         for (raw, want) in [
             ("C#", Some("C#")),
             ("Notes on F#", Some("Notes on F#")),
             ("Q&A: \"quotes\"", Some("Q&A: \"quotes\"")),
-            ("\"Moving day plan\".", Some("Moving day plan")),
-            ("\"Weekly sync.\"", Some("Weekly sync")),
+            ("\"Moving day plan\"", Some("Moving day plan")),
+            ("\"Weekly sync.\"", Some("Weekly sync.")),
+            ("Acme Inc.", Some("Acme Inc.")),
             ("# Heading title", Some("Heading title")),
             ("#1 priority", Some("#1 priority")),
             ("'It's fine'", Some("It's fine")),
@@ -1306,6 +1443,7 @@ mod tests {
         .unwrap();
         let (written, made) = summarize_recording(tmp.path(), &config, Duration::from_secs(10))
             .await
+            .unwrap()
             .unwrap();
         server.await.unwrap();
         assert_eq!(made, Ok(()));
@@ -1336,6 +1474,7 @@ mod tests {
         assert!(err.to_string().contains("needs the [llm] section"), "{err}");
         let (noted, made) = summarize_recording(tmp.path(), &no_llm, Duration::from_secs(1))
             .await
+            .unwrap()
             .unwrap();
         assert!(made.unwrap_err().contains("no [llm] section"));
         assert_eq!(store::read_meta(tmp.path()).unwrap().errors, noted.errors);
@@ -1353,20 +1492,27 @@ mod tests {
         meta.summary = Some("Old.".into());
         meta.summary_stale = true;
         store::write_meta(tmp.path(), &meta).unwrap();
-        mark_pending(tmp.path()).unwrap();
-        assert!(store::read_meta(tmp.path()).unwrap().summary_pending);
+        mark_pending(tmp.path(), SummaryRequest::Asked).unwrap();
+        assert_eq!(
+            store::read_meta(tmp.path()).unwrap().summary_pending,
+            Some(SummaryRequest::Asked)
+        );
         let config = config_with_llm("http://127.0.0.1:1/v1/chat/completions", "");
         let (written, made) = summarize_recording(tmp.path(), &config, Duration::from_secs(1))
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(made, Ok(()));
         assert_eq!(written.summary.as_deref(), Some(TOO_SHORT));
-        assert!(!written.summary_pending && !written.summary_stale);
+        assert!(written.summary_pending.is_none() && !written.summary_stale);
         assert_eq!(store::read_meta(tmp.path()).unwrap(), written);
 
-        mark_pending(tmp.path()).unwrap();
+        mark_pending(tmp.path(), SummaryRequest::Auto).unwrap();
         clear_pending(tmp.path()).unwrap();
-        assert!(!store::read_meta(tmp.path()).unwrap().summary_pending);
+        assert!(store::read_meta(tmp.path())
+            .unwrap()
+            .summary_pending
+            .is_none());
         let before = std::fs::metadata(tmp.path().join("recording.json"))
             .unwrap()
             .modified()
@@ -1377,5 +1523,92 @@ mod tests {
             .modified()
             .unwrap();
         assert_eq!(before, after, "nothing to clear");
+    }
+
+    /// A summary job writes into the recording as it is when it ends: what
+    /// was written meanwhile (a note, the audio swept, a speaker's new
+    /// name) stays, and a name that changed makes the summary stale.
+    #[test]
+    fn the_result_merges_into_the_recording_as_it_is_now() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut start = meta(None);
+        start.summary_pending = Some(SummaryRequest::Auto);
+        start.speakers[1].name = "Speaker 1".into();
+        store::write_meta(tmp.path(), &start).unwrap();
+        let snapshot = snapshot(tmp.path()).unwrap().unwrap();
+        let made = || {
+            Ok(Made {
+                summary: "Made.".into(),
+                title: Some("New title".into()),
+                model: Some("m".into()),
+            })
+        };
+
+        // Meanwhile: a note, the sweep, and nothing about names.
+        let mut now = store::read_meta(tmp.path()).unwrap();
+        now.errors.push("system audio missing".into());
+        now.audio_deleted = true;
+        store::write_meta(tmp.path(), &now).unwrap();
+        let (written, outcome) = write_result(tmp.path(), &snapshot, made())
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(written.summary.as_deref(), Some("Made."));
+        assert_eq!(written.title.as_deref(), Some("New title"));
+        assert_eq!(written.errors, ["system audio missing"]);
+        assert!(written.audio_deleted);
+        assert!(!written.summary_stale && written.summary_pending.is_none());
+        assert_eq!(store::read_meta(tmp.path()).unwrap(), written);
+
+        // A rename meanwhile: kept, and the summary is stale.
+        let mut renamed = store::read_meta(tmp.path()).unwrap();
+        renamed.speakers[1].name = "Sarah".into();
+        renamed
+            .speaker_names
+            .insert("S1".into(), crate::recording::SpeakerName::plain("Sarah"));
+        store::write_meta(tmp.path(), &renamed).unwrap();
+        let (written, _) = write_result(tmp.path(), &snapshot, made())
+            .unwrap()
+            .unwrap();
+        assert_eq!(written.speakers[1].name, "Sarah");
+        assert_eq!(written.speaker_names["S1"].name, "Sarah");
+        assert!(written.summary_stale);
+        let md = std::fs::read_to_string(store::transcript_path(tmp.path(), "m")).unwrap();
+        assert!(md.contains("Sarah:") || md.contains("Sarah"), "{md}");
+        assert!(
+            md.contains("_This summary was made before the transcript"),
+            "{md}"
+        );
+    }
+
+    /// A recording deleted, or transcribed again, while the LLM worked
+    /// drops the result: nothing is written or created.
+    #[test]
+    fn a_result_for_a_recording_that_changed_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("rec");
+        std::fs::create_dir(&dir).unwrap();
+        store::write_meta(&dir, &meta(None)).unwrap();
+        let snapshot = snapshot(&dir).unwrap().unwrap();
+        let made = Ok(Made {
+            summary: "Made.".into(),
+            title: None,
+            model: None,
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(write_result(&dir, &snapshot, made.clone()).unwrap(), None);
+        assert!(!dir.exists(), "not created again");
+        assert_eq!(snapshot_of_gone(&dir), None);
+
+        std::fs::create_dir(&dir).unwrap();
+        let mut again = meta(None);
+        again.segments.truncate(1);
+        store::write_meta(&dir, &again).unwrap();
+        assert_eq!(write_result(&dir, &snapshot, made).unwrap(), None);
+        assert_eq!(store::read_meta(&dir).unwrap(), again, "left alone");
+    }
+
+    fn snapshot_of_gone(dir: &Path) -> Option<RecordingMeta> {
+        snapshot(dir).unwrap()
     }
 }

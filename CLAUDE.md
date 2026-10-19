@@ -276,12 +276,17 @@ must be file-capable, a backend that can transcribe a recorded file: groq, opena
 asr-sidecar or local-whisper (`deepgram-streaming` maps to `deepgram`; realtime backends are
 refused). Every processing job goes through one queue in `daemon/recording.rs` (`reserve` +
 `dispatch`; a `Job` is `Transcribe` or `Summarize`, and the worker runs waiting transcriptions
-before waiting summaries, `next_job`); short rewrites that are no job (`recording name`, the
-retention sweep) `hold`/`release` the recording instead. `process_recording` ends at the
-transcript; with `[recording] summary` the worker then queues a `Summarize` job
-(`queue_summary`, which sets `summary_pending` so `resume_summaries` re-queues it at startup).
-A summary never re-transcribes: it re-renders `<id>.md` from `recording.json` (`process::save`),
-as `recording name` does. A retry over an existing summary marks it `summary_stale`.
+before waiting summaries, `next_job`; one worker, so a running summary delays the next
+transcription); short rewrites that are no job (`recording name`, the retention sweep)
+`hold`/`release` the recording instead, and a hold waits only for a transcription
+(`blocks_a_hold`). `process_recording` ends at the transcript (and clears `summary_pending`);
+with `[recording] summary` the worker then queues a `Summarize` job (`queue_summary`, which
+sets `summary_pending: "auto" | "asked"` so `resume_summaries` re-queues it at startup, an
+auto one only while `summary` is on). A summary job reads a snapshot, calls the LLM unheld,
+then holds the recording just to merge its fields into `recording.json` as it is then
+(`summary::write_result`, stale if a name changed meanwhile) and re-render `<id>.md`
+(`process::save`); it never re-transcribes. A retry or a rename over a summary marks it
+`summary_stale`.
 
 Environment variable overrides:
 - `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key` (also used by the `deepgram` TTS backend)

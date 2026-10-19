@@ -736,7 +736,12 @@ pub fn rename_speaker(
     }
     let claims = kept_claims(&meta.speakers);
     let user = super::process::user_name(&RecordingConfig::effective(config));
+    let before = meta.clone();
     name_speakers(&mut meta, &user, &claims);
+    // The summary names speakers by the labels it was made with.
+    if super::summary::has_summary(&meta) && super::summary::names_changed(&before, &meta) {
+        meta.summary_stale = true;
+    }
     super::process::save(dir, &meta)?;
     Ok((id, meta))
 }
@@ -1645,6 +1650,29 @@ mod tests {
             .iter()
             .map(|s| (s.id.clone(), format!("{} ({})", s.name, s.source)))
             .collect()
+    }
+
+    /// A name that changes makes a real summary stale, since it names the
+    /// speakers by their old labels; a name that changes nothing, and a
+    /// summary that only says the transcript was too short, stay as they
+    /// are.
+    #[test]
+    fn a_new_name_makes_the_summary_stale() {
+        let (_tmp, dir) = transcribed(&["Sarah", "Omar", "Dana"]);
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.summary = Some(super::super::summary::TOO_SHORT.into());
+        store::write_meta(&dir, &meta).unwrap();
+        let (_, renamed) = rename_speaker(&dir, &config(), "S2", "Omar").unwrap();
+        assert!(!renamed.summary_stale, "too short is no summary");
+
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.summary = Some("Speaker 1 agreed.".into());
+        store::write_meta(&dir, &meta).unwrap();
+        let (_, same) = rename_speaker(&dir, &config(), "S2", "Omar").unwrap();
+        assert!(!same.summary_stale, "the same name changes nothing");
+        let (_, renamed) = rename_speaker(&dir, &config(), "S1", "Sarah").unwrap();
+        assert!(renamed.summary_stale);
+        assert!(store::read_meta(&dir).unwrap().summary_stale);
     }
 
     /// Naming a speaker rewrites the stored names and the transcript at

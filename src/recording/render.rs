@@ -276,8 +276,8 @@ pub fn render_markdown(meta: &RecordingMeta) -> String {
         out.push_str("## Summary\n\n");
         if meta.summary_stale {
             out.push_str(&format!(
-                "_This summary is from an earlier transcript. `whisrs recording summarize {}` \
-                 makes a new one._\n\n",
+                "_This summary was made before the transcript or the speaker names last \
+                 changed. `whisrs recording summarize {}` makes a new one._\n\n",
                 meta.id
             ));
         }
@@ -579,15 +579,15 @@ mod tests {
         m.summary_stale = true;
         assert!(
             render_markdown(&m).contains(
-                "## Summary\n\n_This summary is from an earlier transcript. \
-                 `whisrs recording summarize 2026-10-02_1405_standup` makes a new one._\n\n\
-                 Old.\n\n## Transcript"
+                "## Summary\n\n_This summary was made before the transcript or the speaker \
+                 names last changed. `whisrs recording summarize 2026-10-02_1405_standup` makes \
+                 a new one._\n\nOld.\n\n## Transcript"
             ),
             "{}",
             render_markdown(&m)
         );
         m.summary_stale = false;
-        assert!(!render_markdown(&m).contains("earlier transcript"));
+        assert!(!render_markdown(&m).contains("last changed"));
     }
 
     /// One voice for two hours stays many lines, each with its own time and
