@@ -239,6 +239,29 @@ pub fn audio_path(dir: &Path, kind: TrackKind) -> PathBuf {
         .join(format!("{}.wav", kind.file_stem()))
 }
 
+/// Bytes available to an unprivileged user on the filesystem holding
+/// `path`, or its nearest existing ancestor (the recordings root may not
+/// exist yet).
+pub fn free_space(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let existing = path
+        .ancestors()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| Path::new("/"));
+    let c_path = std::ffi::CString::new(existing.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated string and `stat` a valid
+    // out-pointer for the duration of the call.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Both fields are 64-bit on Linux but 32-bit on some 32-bit targets.
+    #[allow(clippy::useless_conversion)]
+    let (blocks, size) = (u64::from(stat.f_bavail), u64::from(stat.f_frsize));
+    Ok(blocks.saturating_mul(size))
+}
+
 /// Recordings left mid-capture or mid-processing (e.g. by a crash).
 pub fn interrupted(root: &Path) -> Vec<PathBuf> {
     match list(root) {
@@ -603,6 +626,15 @@ mod tests {
             assert!(dir.join("audio").exists(), "{}", dir.display());
             assert!(!read_meta(dir).unwrap().audio_deleted);
         }
+    }
+
+    #[test]
+    fn free_space_reads_the_filesystem() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(free_space(tmp.path()).unwrap() > 0);
+        // A root that does not exist yet is measured at its parent.
+        let missing = tmp.path().join("not/yet/created");
+        assert!(free_space(&missing).unwrap() > 0);
     }
 
     #[test]

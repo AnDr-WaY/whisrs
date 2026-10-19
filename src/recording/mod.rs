@@ -200,6 +200,8 @@ pub enum EndReason {
     MaxDuration,
     Shutdown,
     Recovered,
+    /// Stopped because the disk was almost full.
+    DiskFull,
 }
 
 /// One recorded audio track.
@@ -394,6 +396,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&EndReason::MaxDuration).unwrap(),
             r#""max_duration""#
+        );
+        assert_eq!(
+            serde_json::to_string(&EndReason::DiskFull).unwrap(),
+            r#""disk_full""#
         );
         assert_eq!(
             serde_json::to_string(&RecordingState::Done).unwrap(),

@@ -682,6 +682,13 @@ value keeps it forever. The transcript and `recording.json` are never deleted. A
 recording whose transcription failed always keeps its audio, so you can fix the
 cause (a missing API key, a network error) and run `whisrs recording retry`.
 
+**Disk space.** A recording takes about 1.9 MB a minute per track, and
+transcribing it writes an echo-cancelled copy of your track next to them. A
+recording needs 100 MB free in `dir` to start (about 10 minutes plus room to
+transcribe them). While it runs, the free space is checked every minute: one
+notification warns when less than 30 minutes fit, and with less than 2
+minutes left the recording stops, as at the time limit, and is transcribed.
+
 `max_duration_minutes` (default 180, at most 2160) stops a recording that was
 left running. A recording interrupted by a crash or reboot is recovered from its
 audio the next time the daemon starts. If its transcription is interrupted three

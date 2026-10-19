@@ -20,12 +20,12 @@ use chrono::{DateTime, Local};
 use futures_util::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use whisrs::audio::capture::AudioCaptureHandle;
 use whisrs::audio::device::default_monitor_source;
 use whisrs::recording::process::process_recording;
-use whisrs::recording::recorder::{spawn_track_writer, TrackStats};
+use whisrs::recording::recorder::{is_disk_full, spawn_track_writer, TrackStats};
 use whisrs::recording::wav_repair::repair_wav;
 use whisrs::recording::{
     store, EndReason, NetworkWait, RecordingAction, RecordingMeta, RecordingOptions,
@@ -75,6 +75,28 @@ const MAX_ATTEMPTS: u32 = 3;
 
 /// Longest error text put in a notification.
 const NOTIFY_ERROR_MAX: usize = 200;
+
+/// What one minute of recording takes on disk: two 16 kHz mono 16-bit tracks
+/// (1.92 MB a minute each) plus the echo-cancelled copy of the mic that
+/// processing writes into `.cache/`. Chunk results there are a few kB.
+const DISK_BYTES_PER_MINUTE: u64 = 3 * 32_000 * 60;
+
+/// Free space a recording needs to start: about 10 minutes of it
+/// ([`DISK_BYTES_PER_MINUTE`]) plus headroom to process them.
+const DISK_MIN_TO_START: u64 = 100_000_000;
+
+/// How often a recording in progress checks the free space.
+const DISK_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// Below this many minutes of room a recording warns, once.
+const DISK_WARN_MINUTES: u64 = 30;
+
+/// Below this many minutes of room a recording stops, as at its time limit,
+/// so its tracks are finalized and transcribed before a write fails.
+const DISK_STOP_MINUTES: u64 = 2;
+
+/// How the free space is read: [`store::free_space`], or a stand-in in tests.
+pub(crate) type FreeSpaceFn = fn(&Path) -> std::io::Result<u64>;
 
 /// How often [`run_network_retries`] looks for a recording waiting for the
 /// network whose next attempt is due ([`NETWORK_RETRY_EVERY`] after its last).
@@ -244,7 +266,8 @@ fn track_label(kind: TrackKind) -> &'static str {
 }
 
 /// Wrap a track's writer so that its ending before `stopping` is set is
-/// noticed: logged, flagged for the meta, and notified once.
+/// noticed: logged, flagged for the meta, and notified once. A write that
+/// hit a full disk says so.
 fn watch_writer(track: &mut TrackCapture, id: &str, stopping: &Arc<AtomicBool>, notify: bool) {
     let placeholder = tokio::spawn(async { Ok(TrackStats::default()) });
     let writer = std::mem::replace(&mut track.writer, placeholder);
@@ -270,10 +293,14 @@ fn watch_writer(track: &mut TrackCapture, id: &str, stopping: &Arc<AtomicBool>, 
                 ),
             }
             if notify {
-                send_notification(
-                    "whisrs",
-                    &format!("Recording: {} stopped delivering audio", track_label(kind)),
-                );
+                let body = match &result {
+                    Err(e) if is_disk_full(e) => format!(
+                        "Recording: the disk is full, the {} is no longer being saved",
+                        track_label(kind)
+                    ),
+                    _ => format!("Recording: {} stopped delivering audio", track_label(kind)),
+                };
+                send_notification("whisrs", &body);
             }
         }
         result
@@ -287,8 +314,9 @@ pub(crate) struct RecordingSession {
     /// Taken just before the captures start; track offsets are relative to it.
     started: Instant,
     tracks: Vec<TrackCapture>,
-    /// The max-duration timer, aborted when the recording stops another way.
-    timer: Option<JoinHandle<()>>,
+    /// The watch ([`spawn_watch`]: time limit and free space), aborted when
+    /// the recording stops another way.
+    watch: Option<JoinHandle<()>>,
     /// Set before the captures are stopped, so a writer ending after it is
     /// a normal end and one ending before it is a device that died.
     stopping: Arc<AtomicBool>,
@@ -311,6 +339,8 @@ pub(crate) struct RecordingRuntime {
     /// The folder of a start in progress, so a shutdown that cannot wait for
     /// the start can still tell whether it recorded anything.
     starting: std::sync::Mutex<Option<PathBuf>>,
+    /// Reads the free space of the recordings folder.
+    free_space: FreeSpaceFn,
 }
 
 impl RecordingRuntime {
@@ -331,6 +361,7 @@ impl RecordingRuntime {
             shutting_down: AtomicBool::new(false),
             worker: std::sync::Mutex::new(None),
             starting: std::sync::Mutex::new(None),
+            free_space: store::free_space,
         };
         (runtime, status_rx, queue_rx)
     }
@@ -676,6 +707,7 @@ async fn start(
     let title = title
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
+    check_space_to_start(context.recording.free_space, &root).await?;
     let started_at = Local::now();
     let (id, dir) = store::create(&root, started_at, title.as_deref())?;
     let _starting = StartingGuard::new(&context.recording, &dir);
@@ -730,28 +762,13 @@ async fn start(
         return Err(e);
     }
 
-    let minutes = recording_cfg.max_duration_minutes.max(1);
-    let timer = {
-        let ctx = Arc::clone(context);
-        let id = id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(u64::from(minutes) * 60)).await;
-            info!("recording {id} reached the {minutes} minute limit, stopping");
-            if let Err(e) = stop(&ctx, Some(&id), EndReason::MaxDuration).await {
-                let message = format!("{e:#}");
-                warn!("failed to stop recording {id} at its time limit: {message}");
-                if !error_already_notified(&message) {
-                    notify(
-                        &ctx,
-                        &format!(
-                            "Recording: failed to stop at the time limit: {}",
-                            truncate_preview(&message, NOTIFY_ERROR_MAX)
-                        ),
-                    );
-                }
-            }
-        })
-    };
+    let watch = spawn_watch(
+        context,
+        id.clone(),
+        dir.clone(),
+        recording_cfg.max_duration_minutes.max(1),
+        DISK_CHECK_EVERY,
+    );
 
     let active = ActiveRecording::from_meta(&dir, &meta);
     info!(
@@ -765,7 +782,7 @@ async fn start(
         meta,
         started,
         tracks,
-        timer: Some(timer),
+        watch: Some(watch),
         stopping,
     });
     // Shown before the session lock is released, so a stop that takes this
@@ -786,6 +803,141 @@ async fn start(
         );
     }
     Ok(())
+}
+
+/// Refuse a start when the recordings folder has less than
+/// [`DISK_MIN_TO_START`] free. A free space that cannot be read does not
+/// stop a recording: the checks while it runs read it again.
+async fn check_space_to_start(free_space: FreeSpaceFn, root: &Path) -> Result<()> {
+    let at = root.to_path_buf();
+    match tokio::task::spawn_blocking(move || free_space(&at)).await {
+        Ok(Ok(free)) if free < DISK_MIN_TO_START => bail!(
+            "not enough free disk space to record: {} MB free in {}, and a recording \
+             needs {} MB (about 10 minutes plus room to transcribe them)",
+            free / 1_000_000,
+            root.display(),
+            DISK_MIN_TO_START / 1_000_000
+        ),
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            warn!("could not read the free space in {}: {e}", root.display());
+            Ok(())
+        }
+        Err(e) => {
+            warn!("free space check panicked: {e}");
+            Ok(())
+        }
+    }
+}
+
+/// What the free space allows a recording in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskRoom {
+    Enough,
+    /// Less than [`DISK_WARN_MINUTES`] fit: warn once.
+    Low(u64),
+    /// Less than [`DISK_STOP_MINUTES`] fit: stop now.
+    Full(u64),
+}
+
+/// How many more minutes of recording fit in `free` bytes after `recorded`
+/// of it: the echo-cancelled copy of what is already recorded (one track,
+/// written by processing) is held back first.
+fn minutes_that_fit(free: u64, recorded: Duration) -> u64 {
+    let mic_so_far = recorded.as_secs().saturating_mul(32_000);
+    free.saturating_sub(mic_so_far) / DISK_BYTES_PER_MINUTE
+}
+
+fn disk_room(free: u64, recorded: Duration) -> DiskRoom {
+    match minutes_that_fit(free, recorded) {
+        left if left < DISK_STOP_MINUTES => DiskRoom::Full(left),
+        left if left < DISK_WARN_MINUTES => DiskRoom::Low(left),
+        _ => DiskRoom::Enough,
+    }
+}
+
+/// Watch a recording in progress: stop it at its `minutes` limit, and every
+/// `check_every` read the free space in `dir`, warning once when it runs
+/// low and stopping it the way the time limit does when it is almost full.
+fn spawn_watch(
+    context: &Arc<DaemonContext>,
+    id: String,
+    dir: PathBuf,
+    minutes: u32,
+    check_every: Duration,
+) -> JoinHandle<()> {
+    let ctx = Arc::clone(context);
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let limit = started + Duration::from_secs(u64::from(minutes) * 60);
+        let mut warned = false;
+        loop {
+            let next_check = tokio::time::Instant::now() + check_every;
+            if next_check >= limit {
+                tokio::time::sleep_until(limit).await;
+                info!("recording {id} reached the {minutes} minute limit, stopping");
+                stop_from_watch(&ctx, &id, EndReason::MaxDuration).await;
+                return;
+            }
+            tokio::time::sleep_until(next_check).await;
+            let free_space = ctx.recording.free_space;
+            let at = dir.clone();
+            let free = match tokio::task::spawn_blocking(move || free_space(&at)).await {
+                Ok(Ok(free)) => free,
+                Ok(Err(e)) => {
+                    debug!("could not read the free space for recording {id}: {e}");
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            match disk_room(free, started.elapsed()) {
+                DiskRoom::Enough => {}
+                DiskRoom::Low(left) => {
+                    if !warned {
+                        warned = true;
+                        warn!("recording {id}: the disk is filling up, about {left} minutes left");
+                        notify(
+                            &ctx,
+                            &format!(
+                                "Recording: the disk is filling up, room for about {left} \
+                                 more minutes. It stops by itself before the disk is full."
+                            ),
+                        );
+                    }
+                }
+                DiskRoom::Full(_) => {
+                    warn!(
+                        "recording {id}: only {} MB free on the disk, stopping",
+                        free / 1_000_000
+                    );
+                    stop_from_watch(&ctx, &id, EndReason::DiskFull).await;
+                    return;
+                }
+            }
+        }
+    })
+}
+
+/// Stop recording `id` from its watch, notifying a failure the stop did not
+/// notify itself.
+async fn stop_from_watch(context: &Arc<DaemonContext>, id: &str, reason: EndReason) {
+    if let Err(e) = stop(context, Some(id), reason).await {
+        let message = format!("{e:#}");
+        warn!("failed to stop recording {id} ({reason:?}): {message}");
+        if !error_already_notified(&message) {
+            let when = match reason {
+                EndReason::DiskFull => "with the disk almost full",
+                _ => "at the time limit",
+            };
+            notify(
+                context,
+                &format!(
+                    "Recording: failed to stop {when}: {}",
+                    truncate_preview(&message, NOTIFY_ERROR_MAX)
+                ),
+            );
+        }
+    }
 }
 
 /// Result of finalizing one track.
@@ -924,8 +1076,8 @@ fn repair_unfinished(dir: &Path, meta: &mut RecordingMeta, outcomes: &[TrackOutc
     }
 }
 
-/// Stop the recording. `expected_id` (from the max-duration timer) makes
-/// the stop a no-op when a different recording is in progress by now.
+/// Stop the recording. `expected_id` (from the recording's watch) makes the
+/// stop a no-op when a different recording is in progress by now.
 async fn stop(
     context: &Arc<DaemonContext>,
     expected_id: Option<&str>,
@@ -945,14 +1097,14 @@ async fn stop(
         mut meta,
         started,
         tracks,
-        timer,
+        watch,
         stopping,
     } = session;
-    // The timer is the caller on a max-duration stop: aborting it there
-    // would cancel this very stop at its next await.
-    if let Some(timer) = timer {
-        if reason != EndReason::MaxDuration {
-            timer.abort();
+    // The watch is the caller on a time-limit or disk-full stop: aborting it
+    // there would cancel this very stop at its next await.
+    if let Some(watch) = watch {
+        if !matches!(reason, EndReason::MaxDuration | EndReason::DiskFull) {
+            watch.abort();
         }
     }
 
@@ -1007,6 +1159,10 @@ async fn stop(
                 RecordingConfig::effective(&context.config).max_duration_minutes
             ),
         ),
+        EndReason::DiskFull => notify(
+            context,
+            "Recording stopped: the disk is almost full. Transcribing...",
+        ),
         _ => notify(
             context,
             "Recording stopped (mic + system audio). Transcribing...",
@@ -1023,8 +1179,8 @@ async fn cancel(context: &Arc<DaemonContext>) -> Result<()> {
     let Some(session) = session else {
         return stop_waiting(context).await;
     };
-    if let Some(timer) = &session.timer {
-        timer.abort();
+    if let Some(watch) = &session.watch {
+        watch.abort();
     }
     drop(finish_tracks(session.tracks, &session.stopping, STOP_TIMEOUT, STOP_GRACE).await);
     remove_recording_dir(&session.dir).await;
@@ -1743,11 +1899,11 @@ pub(crate) async fn shutdown(context: &DaemonContext) {
         mut meta,
         started,
         tracks,
-        timer,
+        watch,
         stopping,
     } = session;
-    if let Some(timer) = timer {
-        timer.abort();
+    if let Some(watch) = watch {
+        watch.abort();
     }
     let outcomes = finish_tracks(tracks, &stopping, SHUTDOWN_TIMEOUT, SHUTDOWN_GRACE).await;
     apply_outcomes(&mut meta, started, &outcomes);
@@ -2098,12 +2254,22 @@ mod tests {
         backend: Arc<dyn TranscriptionBackend>,
         extra: &str,
     ) -> (Arc<DaemonContext>, mpsc::UnboundedReceiver<QueuedRecording>) {
+        build_context(root, backend, extra, store::free_space)
+    }
+
+    fn build_context(
+        root: &Path,
+        backend: Arc<dyn TranscriptionBackend>,
+        extra: &str,
+        free_space: FreeSpaceFn,
+    ) -> (Arc<DaemonContext>, mpsc::UnboundedReceiver<QueuedRecording>) {
         let config: Config = toml::from_str(&format!(
             "[general]\nbackend = \"groq\"\n[recording]\nuser_name = \"Tester\"\ndir = \"{}\"\n{extra}",
             root.display()
         ))
         .unwrap();
-        let (recording, _status_rx, queue_rx) = RecordingRuntime::new();
+        let (mut recording, _status_rx, queue_rx) = RecordingRuntime::new();
+        recording.free_space = free_space;
         let context = DaemonContext {
             config,
             window_tracker: Arc::new(whisrs::window::NoopTracker),
@@ -2480,7 +2646,7 @@ mod tests {
             meta: meta.clone(),
             started,
             tracks: vec![TrackCapture::new(TrackKind::Mic, None, writer)],
-            timer: None,
+            watch: None,
             stopping,
         });
         context
@@ -2732,7 +2898,7 @@ mod tests {
             meta: meta.clone(),
             started: Instant::now(),
             tracks: Vec::new(),
-            timer: None,
+            watch: None,
             stopping: Arc::new(AtomicBool::new(false)),
         });
 
@@ -3212,6 +3378,136 @@ mod tests {
             "{message}"
         );
         assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+    }
+
+    #[test]
+    fn disk_room_thresholds() {
+        const MB: u64 = 1_000_000;
+        // 5.76 MB a minute: 1 GB is about three hours.
+        assert_eq!(minutes_that_fit(1000 * MB, Duration::ZERO), 173);
+        assert_eq!(disk_room(1000 * MB, Duration::ZERO), DiskRoom::Enough);
+        assert_eq!(disk_room(150 * MB, Duration::ZERO), DiskRoom::Low(26));
+        assert_eq!(disk_room(12 * MB, Duration::ZERO), DiskRoom::Low(2));
+        assert_eq!(disk_room(11 * MB, Duration::ZERO), DiskRoom::Full(1));
+        assert_eq!(disk_room(0, Duration::ZERO), DiskRoom::Full(0));
+        // An hour in, the echo-cancelled copy of that hour (115.2 MB) is
+        // held back for processing: 200 MB is 14 minutes, not 34.
+        let hour = Duration::from_secs(3600);
+        assert_eq!(minutes_that_fit(200 * MB, Duration::ZERO), 34);
+        assert_eq!(disk_room(200 * MB, hour), DiskRoom::Low(14));
+        assert_eq!(disk_room(120 * MB, hour), DiskRoom::Full(0));
+        // The start needs about 10 minutes plus headroom.
+        assert_eq!(minutes_that_fit(DISK_MIN_TO_START, Duration::ZERO), 17);
+    }
+
+    fn fifty_mb_free(_: &Path) -> std::io::Result<u64> {
+        Ok(50_000_000)
+    }
+
+    fn five_mb_free(_: &Path) -> std::io::Result<u64> {
+        Ok(5_000_000)
+    }
+
+    fn unreadable_free_space(_: &Path) -> std::io::Result<u64> {
+        Err(std::io::Error::other("statvfs failed"))
+    }
+
+    /// A start on a nearly full disk is refused before it creates a folder
+    /// or opens a device; one whose free space cannot be read goes ahead.
+    #[tokio::test]
+    async fn a_start_without_disk_space_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("recordings");
+        let (context, _queue) = build_context(&root, working_backend(), "", fifty_mb_free);
+        let err = start(
+            &context,
+            Some("standup".into()),
+            &RecordingOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "not enough free disk space to record: 50 MB free in {}, and a recording \
+                 needs 100 MB (about 10 minutes plus room to transcribe them)",
+                root.display()
+            )
+        );
+        assert!(!root.exists(), "no folder was created");
+        assert!(!context.recording.is_active());
+
+        assert!(check_space_to_start(unreadable_free_space, &root)
+            .await
+            .is_ok());
+        assert!(check_space_to_start(store::free_space, tmp.path())
+            .await
+            .is_ok());
+    }
+
+    /// With the disk almost full the watch stops the recording the way the
+    /// time limit does: tracks finalized, `end_reason: disk_full`, queued.
+    #[tokio::test]
+    async fn a_full_disk_stops_the_recording_like_the_time_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = build_context(tmp.path(), working_backend(), "", five_mb_free);
+        let (mut session, tx) = fed_session(tmp.path(), "standup");
+        let id = session.meta.id.clone();
+        let dir = session.dir.clone();
+        tx.send(vec![1000i16; 3200]).unwrap();
+        session.watch = Some(spawn_watch(
+            &context,
+            id.clone(),
+            dir.clone(),
+            180,
+            Duration::from_millis(10),
+        ));
+        show_recording(&context, session).await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while context.recording.session.lock().await.is_some() {
+            assert!(Instant::now() < deadline, "the watch never stopped it");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The capture closes as a device would at a stop.
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store::read_meta(&dir).unwrap().status != RecordingState::Processing {
+            assert!(Instant::now() < deadline, "never finalized");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.end_reason, Some(EndReason::DiskFull));
+        assert_eq!(meta.tracks[0].samples, 3200);
+        let item = tokio::time::timeout(Duration::from_secs(5), queue.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.recording.id, id);
+        assert!(!context.recording.is_active());
+    }
+
+    /// Plenty of room: the watch keeps checking and leaves the recording be.
+    #[tokio::test]
+    async fn the_watch_leaves_a_recording_with_room_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) =
+            build_context(tmp.path(), working_backend(), "", store::free_space);
+        let (mut session, _tx) = fed_session(tmp.path(), "standup");
+        session.watch = Some(spawn_watch(
+            &context,
+            session.meta.id.clone(),
+            session.dir.clone(),
+            180,
+            Duration::from_millis(5),
+        ));
+        show_recording(&context, session).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(context.recording.session.lock().await.is_some());
+        assert!(context.recording.is_active());
+        assert!(queue.try_recv().is_err());
+        let session = context.recording.session.lock().await.take().unwrap();
+        session.watch.unwrap().abort();
     }
 
     /// What [`FlakyNetwork`] does with a request.
@@ -3718,7 +4014,7 @@ mod tests {
             meta,
             started: Instant::now(),
             tracks: vec![TrackCapture::new(TrackKind::Mic, None, writer)],
-            timer: None,
+            watch: None,
             stopping: Arc::new(AtomicBool::new(false)),
         };
         (session, tx)

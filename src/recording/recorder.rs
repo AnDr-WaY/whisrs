@@ -28,6 +28,22 @@ pub struct TrackStats {
     pub first_chunk_at: Option<Instant>,
 }
 
+/// Whether a track writer failed because the disk is full (or the user's
+/// quota is): `ENOSPC` or `EDQUOT`, as the plain I/O error or inside
+/// hound's, which does not expose it as a `source`.
+pub fn is_disk_full(err: &anyhow::Error) -> bool {
+    let full = |io: &std::io::Error| {
+        matches!(io.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT))
+            || io.kind() == std::io::ErrorKind::StorageFull
+    };
+    err.chain().any(|cause| {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return full(io);
+        }
+        matches!(cause.downcast_ref::<hound::Error>(), Some(hound::Error::IoError(io)) if full(io))
+    })
+}
+
 /// The format of every recording track: 16 kHz mono 16-bit PCM.
 fn track_spec() -> hound::WavSpec {
     hound::WavSpec {
@@ -210,6 +226,23 @@ mod tests {
 
         drop(tx);
         assert_eq!(task.await.unwrap().unwrap().samples, 16_000);
+    }
+
+    #[test]
+    fn a_full_disk_is_recognized() {
+        let enospc = || std::io::Error::from_raw_os_error(libc::ENOSPC);
+        let write =
+            anyhow::Error::from(hound::Error::IoError(enospc())).context("failed to write mic.wav");
+        assert!(is_disk_full(&write));
+        let finalize = anyhow::Error::from(enospc()).context("failed to finalize mic.wav");
+        assert!(is_disk_full(&finalize));
+        let quota = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EDQUOT));
+        assert!(is_disk_full(&quota));
+        let other = anyhow::Error::from(hound::Error::IoError(std::io::Error::from_raw_os_error(
+            libc::EIO,
+        )));
+        assert!(!is_disk_full(&other));
+        assert!(!is_disk_full(&anyhow::anyhow!("no space left")));
     }
 
     #[tokio::test]
