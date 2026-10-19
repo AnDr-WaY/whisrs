@@ -732,6 +732,20 @@ recording has no system audio; 0, the default, lets the sidecar decide. A
 recording keeps the number it started with, and a retry given the option
 replaces it.
 
+Two ready sidecars are in
+[`contrib/diarization-sidecars/`](../contrib/diarization-sidecars/),
+measured on a laptop with 15-minute meetings. `nemotron`, the recommended
+one, runs NVIDIA's Nemotron 3 Diarization in `nemo-speech serve`, a single
+download with no Python: it takes under a minute for 15 minutes of audio on
+the CPU (17 seconds on an Intel GPU), found the right number of main voices
+in every recording, and almost never mixes two people up, but leaves more
+quiet or short speech without a voice. It ignores `num_speakers`.
+`sherpa-onnx` is a small Python server started with `uv`: it took about 3
+minutes for the same audio and gave the most speech the right voice.
+Deepgram's own speaker separation (`diarization = "backend"`) needs no
+sidecar and comes free with its transcription, but scored clearly worse than
+both on the same meetings.
+
 whisrs waits for the sidecar's answer for twice the length of the speech it
 sent, and at least 10 minutes. A sidecar that cannot be reached is tried
 again like a transcript chunk (5, 15, 30 and 60 seconds apart). The
