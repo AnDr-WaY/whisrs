@@ -3356,6 +3356,33 @@ mod tests {
         &rest[..rest.find("\n}").expect("the fn ends")]
     }
 
+    /// Dictation and voice-command toasts never say "recording", the
+    /// recording feature's word, so the two cannot be mistaken for each
+    /// other. The audio gate's skip toast is built in one place and pinned
+    /// by its own test (`gate_skip_message_per_origin`).
+    #[test]
+    fn dictation_toasts_never_say_recording() {
+        for (file, source) in [
+            ("dictation.rs", include_str!("dictation.rs")),
+            ("command_mode.rs", include_str!("command_mode.rs")),
+            ("pipeline.rs", include_str!("pipeline.rs")),
+        ] {
+            let code = production_code(source);
+            let calls: Vec<&str> = code
+                .split("send_notification(")
+                .skip(1)
+                .map(|call| &call[..call.find(");").unwrap_or(call.len())])
+                .collect();
+            assert!(!calls.is_empty(), "{file}: no toasts found");
+            for call in calls {
+                assert!(
+                    !call.to_lowercase().contains("recording"),
+                    "{file}: a toast says recording: {call}"
+                );
+            }
+        }
+    }
+
     /// Each start handler calls `refuse_while_recording` before anything in
     /// [`DEVICE_CALLS`]. This pins command mode and llm-command, whose
     /// handlers no test may run with a broken refusal; toggle is pinned too.

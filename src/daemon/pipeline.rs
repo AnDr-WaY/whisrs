@@ -611,14 +611,15 @@ pub(crate) enum BatchOrigin<'a> {
 }
 
 impl BatchOrigin<'_> {
-    /// Toast text when the audio gate rejects the recording (`label` is the
-    /// gate's reason, e.g. "too short" or "silent").
+    /// Toast text when the audio gate rejects the audio (`label` is the
+    /// gate's reason, e.g. "too short" or "silent"). It never says
+    /// "recording": that is the recording feature's word.
     fn gate_skip_message(&self, label: &str) -> String {
         match self {
             BatchOrigin::Dictation | BatchOrigin::LlmCommand { .. } => {
-                format!("Skipped: recording was {label}")
+                format!("Skipped: the audio was {label}")
             }
-            BatchOrigin::CommandMode => format!("Command mode: recording was {label}"),
+            BatchOrigin::CommandMode => format!("Command mode: the audio was {label}"),
         }
     }
 
@@ -1674,14 +1675,14 @@ mod tests {
     #[test]
     fn gate_skip_message_per_origin() {
         let cases = [
-            (BatchOrigin::Dictation, "Skipped: recording was silent"),
+            (BatchOrigin::Dictation, "Skipped: the audio was silent"),
             (
                 BatchOrigin::CommandMode,
-                "Command mode: recording was silent",
+                "Command mode: the audio was silent",
             ),
             (
                 BatchOrigin::LlmCommand { name: "proofread" },
-                "Skipped: recording was silent",
+                "Skipped: the audio was silent",
             ),
         ];
         for (origin, expected) in cases {

@@ -162,7 +162,7 @@ fn recording_line(recording: &RecordingStatus) -> Option<String> {
 fn state_word(state: State) -> &'static str {
     match state {
         State::Idle => "idle",
-        State::Recording => "recording",
+        State::Recording => "dictating",
         State::Transcribing => "transcribing",
         State::Synthesizing => "synthesizing",
         State::Speaking => "speaking",
@@ -233,8 +233,8 @@ impl ksni::Tray for WhisrsTray {
 
     fn tool_tip(&self) -> ToolTip {
         let description = match self.state.current {
-            State::Idle => "Idle — ready to record",
-            State::Recording => "Recording...",
+            State::Idle => "Idle, ready to dictate",
+            State::Recording => "Dictating...",
             State::Transcribing => "Transcribing...",
             State::Synthesizing => "Synthesizing…",
             State::Speaking => "Reading aloud…",
@@ -671,6 +671,34 @@ mod tests {
             pixmaps(&transcribing.icon_pixmap()),
             pixmaps(&icons::get(IconSet::Transcribing))
         );
+    }
+
+    /// Dictation's words in the title, the menu's status line and the
+    /// tooltip never say "record", the recording feature's word, nor use an
+    /// em dash.
+    #[test]
+    fn dictation_states_never_say_record() {
+        let (cmd_tx, _rx) = mpsc::channel(1);
+        for state in [
+            State::Idle,
+            State::Recording,
+            State::Transcribing,
+            State::Synthesizing,
+            State::Speaking,
+        ] {
+            let tray = tray_with(cmd_tx.clone(), state, RecordingStatus::default());
+            for text in [
+                tray.title(),
+                tray.tool_tip().description,
+                state_word(state).to_string(),
+            ] {
+                assert!(!text.to_lowercase().contains("record"), "{state:?}: {text}");
+                assert!(!text.contains('\u{2014}'), "{state:?}: {text}");
+            }
+        }
+        let dictating = tray_with(cmd_tx, State::Recording, RecordingStatus::default());
+        assert_eq!(dictating.tool_tip().description, "Dictating...");
+        assert_eq!(dictating.title(), "whisrs: dictating");
     }
 
     /// No two icon sets share a pixmap at any size, so a recording never looks

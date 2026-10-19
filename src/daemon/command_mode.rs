@@ -774,7 +774,7 @@ async fn llm_command_start(
     if context.notify_state() {
         send_notification(
             "whisrs",
-            &format!("Recording for '{}'... (press again to stop)", entry.name),
+            &format!("Listening for '{}'... (press again to stop)", entry.name),
         );
     }
 

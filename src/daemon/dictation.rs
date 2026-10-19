@@ -157,7 +157,7 @@ pub(crate) async fn handle_toggle(
                         feedback::play_start(context.config.general.audio_feedback_volume);
                     }
                     if context.notify_state() {
-                        send_notification("whisrs", "Recording...");
+                        send_notification("whisrs", "Dictating...");
                     }
                     Response::Ok { state: new_state }
                 }
