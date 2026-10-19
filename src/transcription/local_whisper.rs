@@ -822,6 +822,7 @@ mod tests {
             model: "base.en".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let err = backend.transcribe(&[1, 2, 3], &config).await.unwrap_err();
         let msg = err.to_string();

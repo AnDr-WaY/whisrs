@@ -414,7 +414,7 @@ max_duration_minutes = 180    # recording stops by itself after this long (1 to 
 audio_retention_days = 7      # 0 = delete audio once transcribed, negative = keep forever
 # dir = "~/Recordings"        # default: ~/.local/share/whisrs/recordings
 # diarization = "auto"        # tell apart the voices on the system audio (see "Speakers"
-#                             #   below): "auto", "backend" or "off"
+#                             #   below): "auto" (Deepgram does it), "backend" or "off"
 # shared_mic = false          # several people share your mic: tell its voices apart too
 
 # Built-in global hotkeys (optional, works without WM keybinds)
@@ -595,12 +595,17 @@ transcript. Speech the voices could not be matched to stays under the others
 label.
 
 `diarization = "backend"` takes the speakers the transcription backend labels:
-an `asr-sidecar` that returns `segments[].speaker`. `"auto"` (the default)
-does the same for the backends that tell voices apart by default, and keeps
-one speaker per track for the others. `"off"` always keeps one speaker per
-track. A backend labels voices per request, so a track sent as several
-chunks (over 10 minutes of speech for `asr-sidecar`) has its voices told
-apart per chunk: the same person in two chunks becomes two speakers.
+Deepgram (`diarize_model=latest`, sent only with the recording's own
+requests, never with dictation) or an `asr-sidecar` that returns
+`segments[].speaker`. `"auto"` (the default) does this with Deepgram and
+keeps one speaker per track with every other backend. `"off"` always keeps
+one speaker per track. Deepgram includes speaker separation in its
+pre-recorded price, but not with its Whisper models: with one of those as
+`[deepgram] model`, each track stays one speaker. A backend labels voices
+per request, so a track sent as several chunks has its voices told apart per
+chunk, and the same person in two chunks becomes two speakers. With Deepgram
+a chunk holds an hour of speech: over an hour of speech on one track,
+speakers are separated per hour. For `asr-sidecar` a chunk is 10 minutes.
 
 In an in-person meeting where several people share your mic, set
 `shared_mic = true`, or pass `--shared-mic` to `start`, `toggle` or `retry`

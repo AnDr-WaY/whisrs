@@ -285,6 +285,7 @@ mod tests {
             model: "   ".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         });
 
         assert_eq!(request.model, "Whisper-Tiny");
@@ -342,6 +343,7 @@ mod tests {
             model: "Whisper-Tiny".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         }
     }
 

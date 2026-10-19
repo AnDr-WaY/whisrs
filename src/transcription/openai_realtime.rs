@@ -168,6 +168,7 @@ mod tests {
             model: model.to_string(),
             prompt: Some("Hyprland, whisrs".to_string()),
             keyterms: Vec::new(),
+            diarize: false,
         }
     }
 

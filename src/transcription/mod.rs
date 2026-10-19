@@ -65,7 +65,7 @@ pub mod openai_rest;
 pub mod phrase_split;
 pub mod retry;
 #[cfg(test)]
-mod test_server;
+pub(crate) mod test_server;
 pub mod verbose_json;
 
 use async_trait::async_trait;
@@ -318,6 +318,12 @@ pub struct TranscriptionConfig {
     /// keyterms either. Backends with no equivalent parameter ignore these —
     /// they receive the same terms folded into `prompt`.
     pub keyterms: Vec<String>,
+    /// Ask the backend to tell the voices apart. Only a recording track
+    /// whose voices are separated by the backend sets it, and only Deepgram
+    /// REST acts on it (`diarize_model`, in
+    /// [`TranscriptionBackend::transcribe_segments`]); dictation never
+    /// does.
+    pub diarize: bool,
 }
 
 /// Trait for transcription backends.
@@ -513,6 +519,7 @@ mod tests {
             model: "m".into(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         }
     }
 

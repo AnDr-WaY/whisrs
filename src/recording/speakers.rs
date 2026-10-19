@@ -16,6 +16,7 @@ use tracing::warn;
 
 use super::speech::join_words;
 use super::{Segment, Speaker, TrackKind, Word};
+use crate::transcription::deepgram::{supports_diarization, DIARIZATION_LABEL};
 use crate::transcription::factory::canonical_backend_name;
 use crate::{Config, DiarizationMode, RecordingConfig};
 
@@ -54,8 +55,10 @@ pub enum Method {
     /// They are not: one speaker per track.
     Off,
     /// The transcription backend labels each word or segment with a voice.
-    /// `label` is what `recording.json` records as `diarization`.
-    Backend { label: String },
+    /// `label` is what `recording.json` records as `diarization`; `request`
+    /// is whether the request has to ask for it
+    /// ([`crate::transcription::TranscriptionConfig::diarize`]).
+    Backend { label: String, request: bool },
 }
 
 impl Method {
@@ -63,7 +66,7 @@ impl Method {
     pub fn label(&self) -> &str {
         match self {
             Method::Off => "off",
-            Method::Backend { label } => label,
+            Method::Backend { label, .. } => label,
         }
     }
 }
@@ -82,14 +85,30 @@ impl SpeakerPlan {
     pub fn separates(&self, kind: TrackKind) -> bool {
         self.method != Method::Off && (kind == TrackKind::System || self.shared_mic)
     }
+
+    /// Whether the transcription request of track `kind` asks the backend
+    /// for speakers.
+    pub fn requests_speakers(&self, kind: TrackKind) -> bool {
+        self.separates(kind) && matches!(self.method, Method::Backend { request: true, .. })
+    }
 }
 
-/// What backend `name` records as `diarization` when it labels speakers
-/// itself, or `None` when it does not: an `asr-sidecar` may return
-/// `segments[].speaker`.
-pub fn backend_speakers(name: &str, _config: &Config) -> Option<String> {
+/// How backend `name` labels speakers itself, or `None` when it does not:
+/// Deepgram when asked ([`DIARIZATION_LABEL`]: `diarize_model=latest`, on
+/// every model but its Whisper ones), and an `asr-sidecar`, which may
+/// return `segments[].speaker`.
+pub fn backend_speakers(name: &str, config: &Config) -> Option<Method> {
     match canonical_backend_name(name) {
-        "asr-sidecar" => Some("asr-sidecar".to_string()),
+        "deepgram" | "deepgram-streaming" if supports_diarization(&config.deepgram_model()) => {
+            Some(Method::Backend {
+                label: DIARIZATION_LABEL.to_string(),
+                request: true,
+            })
+        }
+        "asr-sidecar" => Some(Method::Backend {
+            label: "asr-sidecar".to_string(),
+            request: false,
+        }),
         _ => None,
     }
 }
@@ -97,14 +116,20 @@ pub fn backend_speakers(name: &str, _config: &Config) -> Option<String> {
 /// How a recording transcribed with backend `backend` finds its speakers,
 /// from `[recording] diarization`: `backend` when the backend labels
 /// speakers ([`backend_speakers`]), `off` when it cannot or when asked to.
-/// `auto` is `off` for every backend that does not separate voices by
-/// default.
+/// `auto` is Deepgram's speakers on Deepgram, and `off` on every other
+/// backend.
 pub fn plan(config: &Config, backend: &str, shared_mic: bool) -> SpeakerPlan {
     let recording = RecordingConfig::effective(config);
     let method = match recording.diarization {
-        DiarizationMode::Off | DiarizationMode::Auto => Method::Off,
+        DiarizationMode::Off => Method::Off,
+        DiarizationMode::Auto => match canonical_backend_name(backend) {
+            "deepgram" | "deepgram-streaming" => {
+                backend_speakers(backend, config).unwrap_or(Method::Off)
+            }
+            _ => Method::Off,
+        },
         DiarizationMode::Backend => match backend_speakers(backend, config) {
-            Some(label) => Method::Backend { label },
+            Some(method) => method,
             None => {
                 warn!(
                     "[recording] diarization = \"backend\", but the {backend} backend does not \
@@ -533,6 +558,55 @@ mod tests {
             .unwrap()
             .iter()
             .all(|w| w.speaker.is_none()));
+    }
+
+    fn config(text: &str) -> Config {
+        toml::from_str(text).unwrap()
+    }
+
+    /// `auto` asks Deepgram for speakers (except with a Whisper model,
+    /// which it cannot diarize) and keeps every other backend at one
+    /// speaker per track; `off` always does; `backend` uses what the
+    /// backend can do.
+    #[test]
+    fn plans_by_backend_and_mode() {
+        let deepgram = Method::Backend {
+            label: "deepgram:latest".into(),
+            request: true,
+        };
+        let sidecar = Method::Backend {
+            label: "asr-sidecar".into(),
+            request: false,
+        };
+        let cases = [
+            ("", "deepgram", deepgram.clone()),
+            ("", "deepgram-streaming", deepgram.clone()),
+            ("", "groq", Method::Off),
+            ("", "asr-sidecar", Method::Off),
+            ("diarization = \"off\"", "deepgram", Method::Off),
+            ("diarization = \"backend\"", "deepgram", deepgram.clone()),
+            ("diarization = \"backend\"", "asr-sidecar", sidecar),
+            ("diarization = \"backend\"", "openai", Method::Off),
+        ];
+        for (line, backend, want) in cases {
+            let cfg = config(&format!("[recording]\n{line}\n"));
+            assert_eq!(
+                plan(&cfg, backend, false).method,
+                want,
+                "{line:?} {backend}"
+            );
+        }
+        let whisper = config("[deepgram]\napi_key = \"k\"\nmodel = \"whisper-large\"\n");
+        assert_eq!(plan(&whisper, "deepgram", false).method, Method::Off);
+
+        // Only separated tracks ask for speakers: the mic when it is shared.
+        let cfg = config("");
+        let alone = plan(&cfg, "deepgram", false);
+        assert!(alone.requests_speakers(TrackKind::System));
+        assert!(!alone.requests_speakers(TrackKind::Mic));
+        assert!(plan(&cfg, "deepgram", true).requests_speakers(TrackKind::Mic));
+        let backend = config("[recording]\ndiarization = \"backend\"\n");
+        assert!(!plan(&backend, "asr-sidecar", true).requests_speakers(TrackKind::System));
     }
 
     fn ctx(separate_mic: bool, separate_system: bool) -> Context<'static> {

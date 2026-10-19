@@ -95,18 +95,22 @@ pub async fn process_recording(
                 .context("backend construction panicked")?
         }
     };
-    // Both are set by `fill_languages`; the fallback is never taken.
+    // Both are set by `fill_stored_settings`; the fallback is never taken.
     let language = |kind| {
         meta.language(kind)
             .unwrap_or(&config.general.language)
             .to_string()
     };
-    let mic_request = TrackRequest::new(&name, config, &language(TrackKind::Mic), dir);
-    let system_request = TrackRequest::new(&name, config, &language(TrackKind::System), dir);
-    // Only the language differs between the two requests, so the model and
-    // the prompt are the mic's.
-    let model = recording_model_label(&name, config, &mic_request.tcfg);
     let plan = speakers::plan(config, &name, meta.shared_mic.unwrap_or(false));
+    let request = |kind| {
+        let speakers = plan.requests_speakers(kind);
+        TrackRequest::new(&name, config, &language(kind), speakers, dir)
+    };
+    let mic_request = request(TrackKind::Mic);
+    let system_request = request(TrackKind::System);
+    // Only the language and whether speakers are asked for differ between
+    // the two requests, so the model and the prompt are the mic's.
+    let model = recording_model_label(&name, config, &mic_request.tcfg);
     info!(
         "processing recording {} with {name} (model {model}, mic in {}, system audio in {}, \
          speakers {})",
@@ -303,17 +307,18 @@ fn finish_track(
 }
 
 /// One track's request and the cache of its finished chunks. The two
-/// tracks' requests differ only in their language, which the fingerprint
-/// covers: a change to one track's language leaves the other track's
-/// cached chunks valid.
+/// tracks' requests differ only in their language and whether they ask for
+/// speakers, which the fingerprint covers: a change to one track's leaves
+/// the other track's cached chunks valid.
 struct TrackRequest {
     tcfg: TranscriptionConfig,
     cache: ChunkCache,
 }
 
 impl TrackRequest {
-    fn new(name: &str, config: &Config, language: &str, dir: &Path) -> Self {
-        let tcfg = recording_transcription_config(name, config, language);
+    fn new(name: &str, config: &Config, language: &str, diarize: bool, dir: &Path) -> Self {
+        let mut tcfg = recording_transcription_config(name, config, language);
+        tcfg.diarize = diarize;
         let cache = ChunkCache {
             dir: dir.join(CACHE_DIR),
             fingerprint: cache_fingerprint(name, config, &tcfg),
@@ -755,8 +760,13 @@ fn fnv1a64(data: &[u8]) -> u64 {
 /// local whisper, the URL for the sidecar) and every request field. Hashed
 /// rather than stored, so the prompt or a URL with a token in it is not
 /// copied into the cache.
+///
+/// A request for speakers adds the diarization model, so a chunk cached
+/// without speakers is not reused once they are asked for (or the other
+/// way round). It is left out of a request without them, so chunks cached
+/// before speakers were separated keep matching.
 fn cache_fingerprint(name: &str, config: &Config, tcfg: &TranscriptionConfig) -> String {
-    let key = serde_json::json!({
+    let mut key = serde_json::json!({
         // 2: chunks are condensed speech, keyed by their pieces, so entries
         // from the earlier range chunking never match.
         "chunking": 2,
@@ -767,6 +777,9 @@ fn cache_fingerprint(name: &str, config: &Config, tcfg: &TranscriptionConfig) ->
         "prompt": tcfg.prompt,
         "keyterms": tcfg.keyterms,
     });
+    if tcfg.diarize {
+        key["diarize_model"] = serde_json::json!(crate::transcription::deepgram::DIARIZE_MODEL);
+    }
     format!("{:016x}", fnv1a64(key.to_string().as_bytes()))
 }
 
@@ -2473,6 +2486,157 @@ mod tests {
         assert_eq!(speaker_lines(&meta), [("M1", "one"), ("M2", "two")]);
     }
 
+    /// A local stand-in for Deepgram: answers each request in turn and
+    /// hands back what was asked.
+    async fn fake_deepgram(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (
+        Arc<dyn TranscriptionBackend>,
+        tokio::task::JoinHandle<Vec<crate::transcription::test_server::Request>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/listen", listener.local_addr().unwrap());
+        let server = tokio::spawn(crate::transcription::test_server::serve_responses(
+            listener, responses,
+        ));
+        let backend =
+            crate::transcription::deepgram::DeepgramRestBackend::with_url("k".into(), url);
+        (Arc::new(backend), server)
+    }
+
+    /// Deepgram's diarized answer for the system chunk of [`deepgram_call`]:
+    /// two voices, the first speaking twice.
+    const DEEPGRAM_SYSTEM: &str = r#"{"results": {"channels": [], "utterances": [
+        {"start": 0.3, "end": 1.0, "transcript": "Hello there.", "speaker": 0,
+         "words": [{"word": "hello", "punctuated_word": "Hello", "start": 0.3, "end": 0.6,
+                    "speaker": 0, "speaker_confidence": 0.9},
+                   {"word": "there", "punctuated_word": "there.", "start": 0.6, "end": 1.0,
+                    "speaker": 0, "speaker_confidence": 0.9}]},
+        {"start": 1.1, "end": 1.8, "transcript": "How are you?", "speaker": 1,
+         "words": [{"word": "how", "punctuated_word": "How", "start": 1.1, "end": 1.3,
+                    "speaker": 1, "speaker_confidence": 0.8},
+                   {"word": "are", "start": 1.3, "end": 1.5, "speaker": 1},
+                   {"word": "you", "punctuated_word": "you?", "start": 1.5, "end": 1.8,
+                    "speaker": 1, "speaker_confidence": 0.8}]},
+        {"start": 1.9, "end": 2.4, "transcript": "Fine, thanks.", "speaker": 0,
+         "words": [{"word": "fine", "punctuated_word": "Fine,", "start": 1.9, "end": 2.1,
+                    "speaker": 0},
+                   {"word": "thanks", "punctuated_word": "thanks.", "start": 2.1, "end": 2.4,
+                    "speaker": 0}]}]}}"#;
+
+    /// Deepgram's answer for the mic chunk: the user, no speakers asked.
+    const DEEPGRAM_MIC: &str = r#"{"results": {"channels": [], "utterances": [
+        {"start": 0.3, "end": 1.2, "transcript": "Hi all.",
+         "words": [{"word": "hi", "punctuated_word": "Hi", "start": 0.3, "end": 0.6},
+                   {"word": "all", "punctuated_word": "all.", "start": 0.6, "end": 1.2}]}]}}"#;
+
+    /// A call: the user at 1 s, the system track's 2 s of speech at 4 s
+    /// (sent condensed from 3.7 s, padding included).
+    fn deepgram_call() -> (tempfile::TempDir, RecordingMeta) {
+        recording(&[
+            (TrackKind::Mic, 0, Some(track(10.0, &[(1.0, 1.0, 3000)]))),
+            (TrackKind::System, 0, Some(track(10.0, &[(4.0, 2.0, 6000)]))),
+        ])
+    }
+
+    fn deepgram_config(extra: &str) -> Config {
+        toml::from_str(&format!(
+            "[general]\nbackend = \"deepgram\"\n[deepgram]\napi_key = \"k\"\n\
+             [recording]\nuser_name = \"Tester\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    /// With Deepgram, `auto` asks for speakers on the system track only:
+    /// the request carries `diarize_model=latest`, and the voices it labels
+    /// become speakers on the recording timeline. The mic's request asks
+    /// for none.
+    #[tokio::test]
+    async fn deepgram_separates_the_voices_on_the_system_track() {
+        let (tmp, _) = deepgram_call();
+        let (backend, server) =
+            fake_deepgram(vec![(200, DEEPGRAM_MIC), (200, DEEPGRAM_SYSTEM)]).await;
+        let meta = process_recording(tmp.path(), &deepgram_config(""), Some(backend))
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+        let line = |i: usize| requests[i].head.lines().next().unwrap().to_string();
+        assert!(!line(0).contains("diarize"), "mic: {}", line(0));
+        assert!(
+            line(1).contains("&diarize_model=latest"),
+            "system: {}",
+            line(1)
+        );
+        assert!(!line(1).contains("diarize=true"), "system: {}", line(1));
+
+        let lines: Vec<(u64, &str, &str)> = meta
+            .segments
+            .iter()
+            .map(|s| (s.start_ms, s.speaker.as_str(), s.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (1000, "me", "Hi all."),
+                (4000, "S1", "Hello there."),
+                (4800, "S2", "How are you?"),
+                (5600, "S1", "Fine, thanks."),
+            ]
+        );
+        assert_eq!(
+            speaker_names(&meta),
+            [("me", "Tester"), ("S1", "Speaker 1"), ("S2", "Speaker 2")]
+        );
+        assert_eq!(meta.diarization.as_deref(), Some("deepgram:latest"));
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(
+            md.contains("**[00:00:04] Speaker 1:** Hello there.\n"),
+            "{md}"
+        );
+        assert!(
+            md.contains("**[00:00:04] Speaker 2:** How are you?\n"),
+            "{md}"
+        );
+    }
+
+    /// `off` sends no speaker request at all, and a shared mic asks for
+    /// them on the mic too.
+    #[tokio::test]
+    async fn deepgram_requests_follow_the_plan() {
+        let (tmp, _) = deepgram_call();
+        let (backend, server) =
+            fake_deepgram(vec![(200, DEEPGRAM_MIC), (200, DEEPGRAM_SYSTEM)]).await;
+        let meta = process_recording(
+            tmp.path(),
+            &deepgram_config("diarization = \"off\"\n"),
+            Some(backend),
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+        assert!(requests.iter().all(|r| !r.head.contains("diarize")));
+        assert_eq!(
+            speaker_names(&meta),
+            [("me", "Tester"), ("others", "Others")]
+        );
+        assert_eq!(meta.diarization.as_deref(), Some("off"));
+
+        let (tmp, _) = deepgram_call();
+        let (backend, server) =
+            fake_deepgram(vec![(200, DEEPGRAM_MIC), (200, DEEPGRAM_SYSTEM)]).await;
+        process_recording(
+            tmp.path(),
+            &deepgram_config("shared_mic = true\n"),
+            Some(backend),
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+        assert!(requests
+            .iter()
+            .all(|r| r.head.contains("&diarize_model=latest")));
+    }
+
     fn fingerprint_of(toml_text: &str) -> String {
         let config: Config = toml::from_str(toml_text).unwrap();
         let name = recording_backend_name(&config).unwrap();
@@ -2520,6 +2684,14 @@ mod tests {
             let segmented = format!("{base}segmentation = \"{mode}\"\n");
             assert_eq!(fp, fingerprint_of(&segmented), "segmentation = {mode}");
         }
+
+        // Asking for speakers is part of the request: a chunk cached
+        // without them is not reused once they are asked for.
+        let config: Config = toml::from_str(base).unwrap();
+        let name = recording_backend_name(&config).unwrap();
+        let mut tcfg = recording_transcription_config(&name, &config, "en");
+        tcfg.diarize = true;
+        assert_ne!(fp, cache_fingerprint(&name, &config, &tcfg));
 
         // The sidecar URL is part of its identity.
         let sidecar = "[general]\nbackend = \"asr-sidecar\"\n\

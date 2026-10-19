@@ -314,6 +314,7 @@ mod tests {
             model: "test-asr-model".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         }
     }
 
@@ -446,6 +447,7 @@ mod tests {
             model: "test-asr-model".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -459,6 +461,7 @@ mod tests {
             model: "test-asr-model".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let err = backend.transcribe(&[1, 2, 3], &config).await.unwrap_err();
         assert!(err.to_string().contains("sidecar URL"));

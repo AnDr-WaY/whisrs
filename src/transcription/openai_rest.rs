@@ -251,6 +251,7 @@ mod tests {
             model: "gpt-4o-mini-transcribe".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -264,6 +265,7 @@ mod tests {
             model: "gpt-4o-mini-transcribe".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let huge = vec![0u8; MAX_FILE_SIZE + 1];
         let err = backend.transcribe(&huge, &config).await.unwrap_err();
@@ -305,6 +307,7 @@ mod tests {
             model: "whisper-1".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let err = backend.transcribe_segments(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -324,6 +327,7 @@ mod tests {
             model: model.to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         }
     }
 

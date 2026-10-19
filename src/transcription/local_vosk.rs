@@ -69,6 +69,7 @@ mod tests {
             model: "small-en-us".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("not yet implemented"));

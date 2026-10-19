@@ -442,6 +442,7 @@ pub fn recording_transcription_config(
         model,
         prompt,
         keyterms: config.general.vocabulary.clone(),
+        diarize: false,
     }
 }
 
@@ -779,6 +780,7 @@ mod tests {
             model: "gpt-live-transcribe".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
 
         let backend = openai_realtime_backend(&config);
@@ -950,6 +952,7 @@ mod tests {
             model: String::new(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
         for case in &cases {

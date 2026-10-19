@@ -403,6 +403,7 @@ mod tests {
             model: "whisper-large-v3-turbo".to_string(),
             prompt: Some("Hyprland, whisrs".to_string()),
             keyterms: Vec::new(),
+            diarize: false,
         };
 
         assert!(GroqBackend::new(String::new()).sends_prompt(&request));
@@ -479,6 +480,7 @@ mod tests {
             model: "whisper-large-v3-turbo".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -492,6 +494,7 @@ mod tests {
             model: "whisper-large-v3-turbo".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let huge = vec![0u8; MAX_FILE_SIZE + 1];
         let err = backend.transcribe(&huge, &config).await.unwrap_err();
@@ -505,6 +508,7 @@ mod tests {
             model: "whisper-large-v3-turbo".to_string(),
             prompt: Some("whisrs".to_string()),
             keyterms: Vec::new(),
+            diarize: false,
         };
         // reqwest's Form is opaque; building must at least succeed for both
         // the dictation and recording shapes.
@@ -526,6 +530,7 @@ mod tests {
             model: "whisper-large-v3-turbo".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let secs = backend.max_segment_chunk_secs(&config).unwrap() as usize;
         // 16 kHz mono i16 plus a 44-byte header.
@@ -547,6 +552,7 @@ mod tests {
             model: "whisper-large-v3-turbo".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let wav = encode_wav(&[300i16; 16_000]).unwrap();
 
@@ -588,6 +594,7 @@ mod tests {
             model: "whisper-large-v3-turbo".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         (encode_wav(&[300i16; 16_000]).unwrap(), config)
     }

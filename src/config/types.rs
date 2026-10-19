@@ -121,11 +121,11 @@ pub struct RecordingConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiarizationMode {
-    /// `backend` when the recording backend can label speakers, else `off`.
+    /// `backend` on Deepgram, else `off`.
     #[default]
     Auto,
-    /// The transcription backend labels speakers (an `asr-sidecar` that
-    /// returns `segments[].speaker`).
+    /// The transcription backend labels speakers: Deepgram, or an
+    /// `asr-sidecar` that returns `segments[].speaker`.
     Backend,
     /// One speaker per track, as before speakers were separated.
     Off,
@@ -6667,6 +6667,7 @@ mod tests {
                 model: case.model.to_string(),
                 prompt: config.general.prompt.clone(),
                 keyterms: Vec::new(),
+                diarize: false,
             };
             assert!(
                 request

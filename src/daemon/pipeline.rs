@@ -1245,6 +1245,7 @@ pub(crate) fn build_transcription_config(config: &Config, language: &str) -> Tra
         model: get_model_for_backend(config),
         prompt: transcription_prompt(config.general.prompt.as_deref(), &config.general.vocabulary),
         keyterms: config.general.vocabulary.clone(),
+        diarize: false,
     }
 }
 
@@ -1268,6 +1269,7 @@ fn batch_transcription_config(
             model: get_model_for_backend(config),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         }
     }
 }
