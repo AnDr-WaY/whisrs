@@ -156,12 +156,18 @@ async fn main() -> Result<()> {
                 // aside so a dictation hotkey pressed meanwhile is not held
                 // behind it. Recordings never touch the dictation state, so
                 // there is nothing to broadcast after it.
-                if let Command::Recording { action, title, id } = cmd {
+                if let Command::Recording {
+                    action,
+                    title,
+                    id,
+                    options,
+                } = cmd
+                {
                     let ctx = Arc::clone(&dispatch_ctx);
                     tokio::spawn(async move {
                         let notify = ctx.notify_error();
                         if let Response::Error { message } =
-                            handle_recording(ctx, action, title, id).await
+                            handle_recording(ctx, action, title, id, options).await
                         {
                             // A stop that saved but could not queue the
                             // recording has notified already.
@@ -350,9 +356,12 @@ async fn handle_command(
             handle_set_llm_instruction(daemon_state, context, name).await
         }
         Command::Speak => handle_speak(daemon_state, context).await,
-        Command::Recording { action, title, id } => {
-            handle_recording(context, action, title, id).await
-        }
+        Command::Recording {
+            action,
+            title,
+            id,
+            options,
+        } => handle_recording(context, action, title, id, options).await,
     }
 }
 

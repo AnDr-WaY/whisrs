@@ -5,7 +5,7 @@
 //! transcript as speaker turns. Plain text is what `whisrs recording copy`
 //! puts on the clipboard.
 
-use super::RecordingMeta;
+use super::{RecordingMeta, TrackKind};
 
 /// Consecutive segments from one speaker, merged.
 struct Turn<'a> {
@@ -103,6 +103,27 @@ fn duration_ms(meta: &RecordingMeta) -> u64 {
         .unwrap_or(0)
 }
 
+/// The front matter's languages, flat for note tools: `language` when every
+/// recorded track was transcribed in the same one, else `mic_language` and
+/// `system_language`. Empty when no track has a stored language.
+fn language_lines(meta: &RecordingMeta) -> String {
+    let languages: Vec<(TrackKind, &str)> = meta
+        .tracks
+        .iter()
+        .filter_map(|t| meta.language(t.kind).map(|l| (t.kind, l)))
+        .collect();
+    match languages.as_slice() {
+        [] => String::new(),
+        [(_, first), rest @ ..] if rest.iter().all(|(_, l)| l == first) => {
+            format!("language: {}\n", yaml_str(first))
+        }
+        all => all
+            .iter()
+            .map(|(kind, l)| format!("{}_language: {}\n", kind.file_stem(), yaml_str(l)))
+            .collect(),
+    }
+}
+
 /// Render the recording as Markdown with YAML front matter.
 pub fn render_markdown(meta: &RecordingMeta) -> String {
     let mut out = String::from("---\n");
@@ -132,6 +153,10 @@ pub fn render_markdown(meta: &RecordingMeta) -> String {
     if let Some(backend) = &meta.backend {
         out.push_str(&format!("backend: {}\n", yaml_str(backend)));
     }
+    if let Some(model) = &meta.model {
+        out.push_str(&format!("model: {}\n", yaml_str(model)));
+    }
+    out.push_str(&language_lines(meta));
     out.push_str("---\n\n## Transcript\n\n");
 
     let turns = turns(meta);
@@ -204,6 +229,19 @@ mod tests {
         );
         meta.ended_at = Some(started + chrono::Duration::seconds(3725));
         meta.backend = Some("groq".into());
+        meta.model = Some("whisper-large-v3-turbo".into());
+        meta.tracks = [TrackKind::Mic, TrackKind::System]
+            .into_iter()
+            .map(|kind| crate::recording::TrackMeta {
+                kind,
+                file: format!("audio/{}.wav", kind.file_stem()),
+                device: "default".into(),
+                offset_ms: 0,
+                samples: 0,
+            })
+            .collect();
+        meta.mic_language = Some("de".into());
+        meta.system_language = Some("de".into());
         meta.speakers = vec![
             Speaker {
                 id: "me".into(),
@@ -237,6 +275,8 @@ mod tests {
             tags: [recording]\n\
             whisrs_id: \"2026-10-02_1405_standup\"\n\
             backend: \"groq\"\n\
+            model: \"whisper-large-v3-turbo\"\n\
+            language: \"de\"\n\
             ---\n\n## Transcript\n\n\
             **[00:00:01] Yosif:** Hi all. Quick update.\n\n\
             **[00:01:05] Others:** Sounds good.\n\n\
@@ -267,11 +307,62 @@ mod tests {
         m.title = None;
         m.segments.clear();
         m.backend = None;
+        m.model = None;
+        m.mic_language = None;
+        m.system_language = None;
         let md = render_markdown(&m);
         assert!(md.contains("title: \"Recording 2026-10-02 14:05\"\n"));
         assert!(md.contains("_No speech was transcribed._"));
         assert!(!md.contains("backend:"));
+        assert!(!md.contains("model:"));
+        assert!(!md.contains("language:"));
         assert_eq!(render_text(&m), "");
+    }
+
+    /// The front matter between `backend` and its end, where the model and
+    /// the languages go.
+    fn model_and_languages(meta: &RecordingMeta) -> String {
+        let md = render_markdown(meta);
+        let start = md.find("backend:").unwrap();
+        let end = md.find("---\n\n##").unwrap();
+        md[start..end]
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// One `language` when the recorded tracks agree, one per track when
+    /// they do not; a track that was not recorded does not count.
+    #[test]
+    fn front_matter_names_the_model_and_languages() {
+        let mut m = meta();
+        assert_eq!(
+            model_and_languages(&m),
+            "model: \"whisper-large-v3-turbo\"\nlanguage: \"de\""
+        );
+        m.system_language = Some("auto".into());
+        assert_eq!(
+            model_and_languages(&m),
+            "model: \"whisper-large-v3-turbo\"\nmic_language: \"de\"\n\
+             system_language: \"auto\""
+        );
+        // Mic only (`system_device = "none"`): its language is the language.
+        m.tracks.retain(|t| t.kind == TrackKind::Mic);
+        assert_eq!(
+            model_and_languages(&m),
+            "model: \"whisper-large-v3-turbo\"\nlanguage: \"de\""
+        );
+    }
+
+    #[test]
+    fn the_system_track_takes_the_others_label() {
+        let mut m = meta();
+        m.speakers[1].name = "Video".into();
+        let md = render_markdown(&m);
+        assert!(md.contains("  - \"Video\"\n"), "{md}");
+        assert!(md.contains("**[00:01:05] Video:** Sounds good."), "{md}");
+        assert!(render_text(&m).contains("[00:01:05] Video: Sounds good.\n"));
     }
 
     #[test]

@@ -579,6 +579,24 @@ fn edit_recording(config: &mut Config) -> Result<()> {
         &recording.user_name,
     )?;
 
+    // Languages. `whisrs recording start -l` and friends override these for
+    // one recording.
+    recording.language = prompt_optional_language(
+        &format!(
+            "Language of both tracks (e.g. de, auto), defaults to [general] language ({})",
+            config.general.language
+        ),
+        &recording.language,
+    )?;
+    recording.mic_language = prompt_optional_language(
+        "Language of your microphone, defaults to the one above",
+        &recording.mic_language,
+    )?;
+    recording.system_language = prompt_optional_language(
+        "Language of the system audio, defaults to the one above",
+        &recording.system_language,
+    )?;
+
     // Devices.
     let devices = list_input_devices();
     let (monitors, mics): (Vec<_>, Vec<_>) = devices.into_iter().partition(|d| d.is_monitor());
@@ -800,6 +818,28 @@ fn prompt_optional_string(label: &str, current: &Option<String>) -> Result<Optio
     } else {
         Some(input)
     })
+}
+
+/// [`prompt_optional_string`] for a language: re-asked until it passes the
+/// rule `-l` follows, and stored normalized.
+fn prompt_optional_language(label: &str, current: &Option<String>) -> Result<Option<String>> {
+    let input: String = Input::new()
+        .with_prompt(format!("{label} (blank to unset)"))
+        .with_initial_text(current.clone().unwrap_or_default())
+        .allow_empty(true)
+        .validate_with(|input: &String| parse_optional_language(input).map(|_| ()))
+        .interact_text()
+        .with_context(|| format!("failed to read {label}"))?;
+    Ok(parse_optional_language(&input).unwrap_or(None))
+}
+
+/// A language typed into the editor: blank is unset, anything else must
+/// pass [`crate::validate_language_override`] and is stored as it returns it.
+fn parse_optional_language(input: &str) -> std::result::Result<Option<String>, String> {
+    if input.trim().is_empty() {
+        return Ok(None);
+    }
+    crate::validate_language_override(input).map(Some)
 }
 
 fn edit_media_hooks(config: &mut Config) -> Result<()> {
@@ -1442,8 +1482,8 @@ mod tests {
             .collect();
         assert_eq!(
             chains.len(),
-            19,
-            "the scan found {} `Input` chains, not 19. Fewer means a \
+            20,
+            "the scan found {} `Input` chains, not 20. Fewer means a \
              constructor spelling the needle misses, which makes this test \
              vacuous; more means a prompt was added — audit its chain against \
              the rules below, then bump this number",
@@ -1480,6 +1520,16 @@ mod tests {
             .keys()
             .cloned()
             .collect()
+    }
+
+    /// A language typed into the recording editor: blank unsets it, a valid
+    /// one is stored normalized, anything else is re-asked.
+    #[test]
+    fn recording_editor_languages_follow_the_l_rule() {
+        assert_eq!(parse_optional_language("  "), Ok(None));
+        assert_eq!(parse_optional_language("DE"), Ok(Some("de".into())));
+        assert_eq!(parse_optional_language("auto"), Ok(Some("auto".into())));
+        assert!(parse_optional_language("german").is_err());
     }
 
     /// Walking through the recording editor without changing anything must not

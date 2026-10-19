@@ -28,8 +28,8 @@ use whisrs::recording::process::process_recording;
 use whisrs::recording::recorder::{spawn_track_writer, TrackStats};
 use whisrs::recording::wav_repair::repair_wav;
 use whisrs::recording::{
-    store, EndReason, RecordingAction, RecordingMeta, RecordingPhase, RecordingState,
-    RecordingStatus, TrackKind, TrackMeta,
+    store, EndReason, RecordingAction, RecordingMeta, RecordingOptions, RecordingPhase,
+    RecordingState, RecordingStatus, TrackKind, TrackMeta, DEFAULT_OTHERS_LABEL,
 };
 use whisrs::{Config, RecordingConfig, Response};
 
@@ -496,21 +496,32 @@ pub(crate) async fn handle_recording(
     action: RecordingAction,
     title: Option<String>,
     id: Option<String>,
+    options: RecordingOptions,
 ) -> Response {
+    // Checked here and not only by the CLI, since any client can write to
+    // the socket: a bad value is refused before a device opens or a
+    // recording on disk is touched.
+    let options = match options.validated() {
+        Ok(options) => options,
+        Err(message) => {
+            warn!("recording {action:?} refused: {message}");
+            return error_response(message);
+        }
+    };
     let result = match action {
-        RecordingAction::Start => start(&context, title).await,
+        RecordingAction::Start => start(&context, title, &options).await,
         RecordingAction::Stop => stop(&context, None, EndReason::Stopped).await,
         RecordingAction::Toggle => {
             let recording = context.recording.session.lock().await.is_some();
             if recording {
                 stop(&context, None, EndReason::Stopped).await
             } else {
-                start(&context, title).await
+                start(&context, title, &options).await
             }
         }
         RecordingAction::Cancel => cancel(&context).await,
         RecordingAction::Status => Ok(()),
-        RecordingAction::Retry => retry(&context, id.as_deref().unwrap_or("last")).await,
+        RecordingAction::Retry => retry(&context, id.as_deref().unwrap_or("last"), &options).await,
         RecordingAction::Copy => copy(&context, id.as_deref().unwrap_or("last")).await,
     };
     match result {
@@ -574,7 +585,41 @@ fn open_tracks(
     }
 }
 
-async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()> {
+/// The meta of a recording that is starting: each track's language from
+/// `options` ([`RecordingOptions::language_for`]), else from the config
+/// ([`RecordingConfig::language_for`]), and the label of the system track.
+fn new_meta(
+    id: String,
+    title: Option<String>,
+    started_at: DateTime<Local>,
+    options: &RecordingOptions,
+    config: &Config,
+) -> RecordingMeta {
+    let recording = RecordingConfig::effective(config);
+    let language = |kind| {
+        options.language_for(kind).map_or_else(
+            || recording.language_for(kind, &config.general.language),
+            str::to_string,
+        )
+    };
+    let mut meta = RecordingMeta::new(id, title, started_at);
+    meta.mic_language = Some(language(TrackKind::Mic));
+    meta.system_language = Some(language(TrackKind::System));
+    meta.others_label = Some(
+        options
+            .others
+            .clone()
+            .unwrap_or_else(|| DEFAULT_OTHERS_LABEL.to_string()),
+    );
+    meta
+}
+
+/// Start a recording. `options` are already validated.
+async fn start(
+    context: &Arc<DaemonContext>,
+    title: Option<String>,
+    options: &RecordingOptions,
+) -> Result<()> {
     let mut slot = context.recording.session.lock().await;
     if context.recording.shutting_down.load(Ordering::Acquire) {
         bail!("the daemon is shutting down");
@@ -600,7 +645,7 @@ async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()
 
     // Written before any audio exists: a crash or SIGTERM while the devices
     // open leaves a recording recovery can find, never an orphan audio folder.
-    let mut meta = RecordingMeta::new(id.clone(), title, started_at);
+    let mut meta = new_meta(id.clone(), title, started_at, options, &context.config);
     meta.tracks = vec![track_meta(TrackKind::Mic, mic.clone())];
     if let Some(Ok(name)) = &system {
         meta.tracks
@@ -666,7 +711,12 @@ async fn start(context: &Arc<DaemonContext>, title: Option<String>) -> Result<()
     };
 
     let active = ActiveRecording::from_meta(&dir, &meta);
-    info!("recording {id} writing to {}", dir.display());
+    info!(
+        "recording {id} writing to {} (mic in {}, system audio in {})",
+        dir.display(),
+        meta.mic_language.as_deref().unwrap_or_default(),
+        meta.system_language.as_deref().unwrap_or_default()
+    );
     *slot = Some(RecordingSession {
         dir,
         meta,
@@ -960,7 +1010,13 @@ fn has_audio(dir: &Path, meta: &RecordingMeta) -> bool {
     !meta.audio_deleted && meta.tracks.iter().any(|t| dir.join(&t.file).exists())
 }
 
-async fn retry(context: &Arc<DaemonContext>, query: &str) -> Result<()> {
+/// Queue a recording for transcription again. The languages `options` give
+/// replace the stored ones (and are saved); the rest keep theirs.
+async fn retry(
+    context: &Arc<DaemonContext>,
+    query: &str,
+    options: &RecordingOptions,
+) -> Result<()> {
     let root = recordings_root(&context.config);
     let dir = store::resolve(&root, query)?;
     let meta = store::read_meta(&dir)?;
@@ -988,16 +1044,32 @@ async fn retry(context: &Arc<DaemonContext>, query: &str) -> Result<()> {
     // still have stale headers), then mark it `processing`. A manual retry
     // is a fresh start for the crash-loop guard.
     let repair_dir = dir.clone();
-    let prepared = tokio::task::spawn_blocking(move || recover_dir(&repair_dir, true))
-        .await
-        .context("recording repair panicked")
-        .and_then(|r| r);
-    if let Err(e) = prepared {
-        context.recording.unreserve(&meta.id);
-        return Err(e);
-    }
+    let retry_options = options.clone();
+    let prepared =
+        tokio::task::spawn_blocking(move || recover_dir(&repair_dir, Some(&retry_options)))
+            .await
+            .context("recording repair panicked")
+            .and_then(|r| r);
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            context.recording.unreserve(&meta.id);
+            return Err(e);
+        }
+    };
     context.recording.dispatch(active)?;
-    info!("recording {} queued for transcription again", meta.id);
+    info!(
+        "recording {} queued for transcription again (mic in {}, system audio in {})",
+        meta.id,
+        prepared
+            .mic_language
+            .as_deref()
+            .unwrap_or("the configured language"),
+        prepared
+            .system_language
+            .as_deref()
+            .unwrap_or("the configured language")
+    );
     Ok(())
 }
 
@@ -1167,11 +1239,13 @@ fn recover_meta(
 }
 
 /// Repair an interrupted recording's WAVs and update its meta. Blocking.
-/// `reset_attempts` (a manual retry) zeroes the crash-loop count first.
-fn recover_dir(dir: &Path, reset_attempts: bool) -> Result<RecordingMeta> {
+/// `retry` (a manual retry) zeroes the crash-loop count first and replaces
+/// the languages it gives ([`RecordingMeta::apply_languages`]).
+fn recover_dir(dir: &Path, retry: Option<&RecordingOptions>) -> Result<RecordingMeta> {
     let mut meta = store::read_meta(dir)?;
-    if reset_attempts {
+    if let Some(options) = retry {
         meta.attempts = 0;
+        meta.apply_languages(options);
     }
     let mut repaired = Vec::new();
     let mut newest: Option<std::time::SystemTime> = None;
@@ -1285,7 +1359,7 @@ fn recover_interrupted(dir: &Path) -> Result<Option<RecordingMeta>> {
     ) {
         return Ok(None);
     }
-    recover_dir(dir, false).map(Some)
+    recover_dir(dir, None).map(Some)
 }
 
 /// At startup: requeue every recording a crash, reboot or shutdown left
@@ -1758,12 +1832,16 @@ mod tests {
             .is_some_and(|e| e.contains("fake backend is down")));
 
         // Retry requeues it, and a second retry while queued is refused.
-        retry(&context, "last").await.unwrap();
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
         assert_eq!(
             store::read_meta(&dir).unwrap().status,
             RecordingState::Processing
         );
-        assert!(retry(&context, "last").await.is_err());
+        assert!(retry(&context, "last", &RecordingOptions::default())
+            .await
+            .is_err());
         assert!(queue.try_recv().is_ok());
     }
 
@@ -1776,18 +1854,229 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let (context, _queue) = test_context(tmp.path(), backend);
-        let resp = handle_recording(Arc::clone(&context), RecordingAction::Stop, None, None).await;
+        let none = RecordingOptions::default;
+        let resp = handle_recording(
+            Arc::clone(&context),
+            RecordingAction::Stop,
+            None,
+            None,
+            none(),
+        )
+        .await;
         assert!(
             matches!(resp, Response::Error { ref message } if message.contains("no recording"))
         );
-        let resp =
-            handle_recording(Arc::clone(&context), RecordingAction::Cancel, None, None).await;
+        let resp = handle_recording(
+            Arc::clone(&context),
+            RecordingAction::Cancel,
+            None,
+            None,
+            none(),
+        )
+        .await;
         assert!(matches!(resp, Response::Error { .. }));
-        let resp = handle_recording(context, RecordingAction::Status, None, None).await;
+        let resp = handle_recording(context, RecordingAction::Status, None, None, none()).await;
         assert!(matches!(
             resp,
             Response::Recording { recording } if recording.phase == RecordingPhase::Idle
         ));
+    }
+
+    /// The options of a `recording` command as a client sends them.
+    fn options_from_ipc(json: &str) -> RecordingOptions {
+        match serde_json::from_str::<whisrs::Command>(json).unwrap() {
+            whisrs::Command::Recording { options, .. } => options,
+            other => panic!("not a recording command: {other:?}"),
+        }
+    }
+
+    /// What a start stores: each track's language from the command (its own,
+    /// else `language`), else from `[recording]`, and the others label.
+    #[test]
+    fn options_from_ipc_land_in_recording_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, _queue) = test_context_with(
+            tmp.path(),
+            working_backend(),
+            "language = \"fr\"\nmic_language = \"it\"\n",
+        );
+        let stored = |json: &str| {
+            let options = options_from_ipc(json).validated().unwrap();
+            let (id, dir) = store::create(tmp.path(), Local::now(), None).unwrap();
+            let meta = new_meta(id, None, Local::now(), &options, &context.config);
+            store::write_meta(&dir, &meta).unwrap();
+            store::read_meta(&dir).unwrap()
+        };
+
+        let meta = stored(
+            r#"{"cmd":"recording","action":"start","mic_language":"DE",
+                "system_language":"auto","others":" Video "}"#,
+        );
+        assert_eq!(meta.mic_language.as_deref(), Some("de"));
+        assert_eq!(meta.system_language.as_deref(), Some("auto"));
+        assert_eq!(meta.others_label.as_deref(), Some("Video"));
+
+        let meta = stored(r#"{"cmd":"recording","action":"toggle","language":"es"}"#);
+        assert_eq!(meta.mic_language.as_deref(), Some("es"));
+        assert_eq!(meta.system_language.as_deref(), Some("es"));
+
+        // The tray and the hotkey send none: the config's, and "Others".
+        let meta = stored(r#"{"cmd":"recording","action":"toggle"}"#);
+        assert_eq!(meta.mic_language.as_deref(), Some("it"));
+        assert_eq!(meta.system_language.as_deref(), Some("fr"));
+        assert_eq!(meta.others_label.as_deref(), Some("Others"));
+    }
+
+    /// Bad values from a client other than the CLI are refused before a
+    /// start goes anywhere near a device. The daemon is marked shutting
+    /// down, the first check in `start`, so a check that let a bad value
+    /// through fails here on that error instead of opening the host's mic.
+    #[tokio::test]
+    async fn invalid_ipc_options_are_refused_before_any_device_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = test_context(tmp.path(), working_backend());
+        context
+            .recording
+            .shutting_down
+            .store(true, Ordering::Release);
+        let dir = crashed_recording(tmp.path());
+        let before = store::read_meta(&dir).unwrap();
+
+        for (action, json) in [
+            ("start", r#""language":"english""#),
+            ("toggle", r#""mic_language":"""#),
+            ("start", r#""system_language":"12""#),
+            ("start", r#""others":"   ""#),
+            ("toggle", r#""others":"a\nb""#),
+            ("retry", r#""language":"german""#),
+        ] {
+            let cmd = format!(r#"{{"cmd":"recording","action":"{action}",{json}}}"#);
+            let whisrs::Command::Recording {
+                action,
+                title,
+                id,
+                options,
+            } = serde_json::from_str::<whisrs::Command>(&cmd).unwrap()
+            else {
+                panic!("not a recording command");
+            };
+            let response = handle_recording(Arc::clone(&context), action, title, id, options).await;
+            let Response::Error { message } = &response else {
+                panic!("{cmd} was accepted: {response:?}");
+            };
+            assert!(
+                message.starts_with("invalid language") || message.contains("others label"),
+                "{cmd}: {message}"
+            );
+        }
+        // Nothing was created, queued or rewritten.
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+        assert_eq!(store::read_meta(&dir).unwrap(), before);
+        assert!(queue.try_recv().is_err());
+
+        // Valid options get past the check, to the shutdown refusal.
+        let options = options_from_ipc(
+            r#"{"cmd":"recording","action":"start","language":"de","others":"Video"}"#,
+        );
+        let response = handle_recording(context, RecordingAction::Start, None, None, options).await;
+        assert!(
+            matches!(&response, Response::Error { message } if message.contains("shutting down")),
+            "{response:?}"
+        );
+    }
+
+    /// A backend that records the language of every request.
+    #[derive(Default)]
+    struct LanguageBackend {
+        languages: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for LanguageBackend {
+        async fn transcribe(&self, _audio: &[u8], _config: &TranscriptionConfig) -> Result<String> {
+            unreachable!("recordings ask for segments")
+        }
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            config: &TranscriptionConfig,
+        ) -> Result<Transcript> {
+            self.languages.lock().unwrap().push(config.language.clone());
+            Ok(Transcript {
+                segments: Vec::new(),
+            })
+        }
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A retry's languages replace the stored ones and are saved; a retry
+    /// without them keeps what is stored, whatever the config says by now.
+    #[tokio::test]
+    async fn retry_languages_are_saved_and_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_recording(tmp.path());
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.status = RecordingState::Failed;
+        meta.mic_language = Some("en".into());
+        meta.system_language = Some("en".into());
+        store::write_meta(&dir, &meta).unwrap();
+        let backend = Arc::new(LanguageBackend::default());
+        let (context, mut queue) =
+            test_context_with(tmp.path(), backend.clone(), "language = \"fr\"\n");
+
+        let options = options_from_ipc(
+            r#"{"cmd":"recording","action":"retry","id":"last","mic_language":"de"}"#,
+        );
+        let response = handle_recording(
+            Arc::clone(&context),
+            RecordingAction::Retry,
+            None,
+            Some("last".into()),
+            options,
+        )
+        .await;
+        assert!(
+            matches!(response, Response::Recording { .. }),
+            "{response:?}"
+        );
+        let saved = store::read_meta(&dir).unwrap();
+        assert_eq!(saved.mic_language.as_deref(), Some("de"));
+        assert_eq!(saved.system_language.as_deref(), Some("en"), "kept");
+        process_one(&context, queue.try_recv().unwrap()).await;
+        assert_eq!(*backend.languages.lock().unwrap(), ["de"]);
+        let done = store::read_meta(&dir).unwrap();
+        assert_eq!(done.status, RecordingState::Done);
+        assert_eq!(done.model.as_deref(), Some("whisper-large-v3-turbo"));
+
+        // `-l` covers both tracks; no options keep the stored ones.
+        retry(
+            &context,
+            "last",
+            &RecordingOptions {
+                language: Some("it".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let saved = store::read_meta(&dir).unwrap();
+        assert_eq!(saved.mic_language.as_deref(), Some("it"));
+        assert_eq!(saved.system_language.as_deref(), Some("it"));
+        process_one(&context, queue.try_recv().unwrap()).await;
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            store::read_meta(&dir).unwrap().mic_language.as_deref(),
+            Some("it")
+        );
+        process_one(&context, queue.try_recv().unwrap()).await;
+        assert_eq!(*backend.languages.lock().unwrap(), ["de", "it", "it"]);
     }
 
     fn working_backend() -> Arc<FakeBackend> {
@@ -1809,7 +2098,9 @@ mod tests {
         assert!(queue.try_recv().is_err());
         assert_eq!(context.recording.status(), RecordingStatus::default());
         // A start after shutdown began is refused.
-        let err = start(&context, None).await.unwrap_err();
+        let err = start(&context, None, &RecordingOptions::default())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("shutting down"), "{err:#}");
     }
 
@@ -1888,7 +2179,9 @@ mod tests {
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
 
         // A manual retry resets the count and processes it.
-        retry(&context, "last").await.unwrap();
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
         assert_eq!(store::read_meta(&dir).unwrap().attempts, 0);
         process_one(&context, queue.try_recv().unwrap()).await;
         let meta = store::read_meta(&dir).unwrap();
@@ -2042,7 +2335,9 @@ mod tests {
         meta.attempts = 2;
         store::write_meta(&dir, &meta).unwrap();
 
-        let err = retry(&context, "last").await.unwrap_err();
+        let err = retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("already queued"), "{err:#}");
         assert_eq!(store::read_meta(&dir).unwrap(), meta);
         assert!(queue.try_recv().is_err());
@@ -2059,7 +2354,9 @@ mod tests {
         store::write_meta(&dir, &meta).unwrap();
         let (context, mut queue) = test_context(tmp.path(), working_backend());
 
-        retry(&context, "last").await.unwrap();
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
         let meta = store::read_meta(&dir).unwrap();
         assert_eq!(meta.status, RecordingState::Processing);
         assert_eq!(meta.attempts, 0);
@@ -2137,7 +2434,9 @@ mod tests {
         assert!(!worker.is_finished(), "the worker survives the panic");
 
         // And it still takes work: a retry is processed (and panics) again.
-        retry(&context, "last").await.unwrap();
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while store::read_meta(&dir).unwrap().status != RecordingState::Failed {
             assert!(Instant::now() < deadline, "the retry was never processed");
@@ -2196,7 +2495,9 @@ mod tests {
         // A recording recovery holds refuses a retry.
         context.recording.unreserve(&before.id);
         recover_on_startup(Arc::clone(&context)).await;
-        let err = retry(&context, "last").await.unwrap_err();
+        let err = retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("already queued"), "{err:#}");
         assert!(queue.try_recv().is_ok());
         assert!(queue.try_recv().is_err());

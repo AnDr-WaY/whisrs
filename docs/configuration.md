@@ -402,6 +402,10 @@ response_format = "wav"     # audio format requested from the API
 #                             #   openai-realtime and openai-compatible-realtime are rejected.
 # user_name = "Ada"           # your label in transcripts; default: your full name
 #                             #   from the system account, else $USER
+# language = "de"             # language of both tracks; default: [general] language.
+#                             #   An ISO 639 code, optionally with a region, or "auto"
+# mic_language = "de"         # language of your mic track; default: language
+# system_language = "auto"    # language of the system audio track; default: language
 # mic_device = "alsa_input.usb-..."  # a source name from whisrs config or pactl list short sources
 #                             #   default: [audio] device
 # system_device = "default"   # "default" = monitor of the default output,
@@ -571,8 +575,29 @@ none is in progress and stop the one that is.
 **Two tracks.** Your microphone and the system audio (what your speakers or
 headphones play) are recorded as separate files and transcribed separately.
 Your track is labeled with `user_name`, and everything from the system track is
-labeled "Others". There is no per-person speaker detection on the system
-track.
+labeled "Others" (`--others NAME` on `start` or `toggle` names it otherwise).
+There is no per-person speaker detection on the system track.
+
+**Languages.** Each track is transcribed in its own language. `language`
+defaults to `[general] language`, and `mic_language` and `system_language`
+default to `language`, so dictation and recordings can use different
+languages. One recording can override them with `-l` (both tracks),
+`--mic-language` and `--system-language`, which win over `-l` for their
+track. For language practice against a video, where you repeat lines in
+German and the teacher mixes German and English:
+
+```
+whisrs recording start -t "Lesson 50" --mic-language de --system-language auto --others Video
+```
+
+and for a meeting in another language, `whisrs recording start -l de`. The
+languages a recording starts with are saved in its `recording.json` and stay
+with it: a later config change does not reach it. To redo a recording in
+another language, run `whisrs recording retry <id> -l <language>` (or
+`--mic-language`/`--system-language` to change one track); a language you
+give replaces the saved one, and a track you leave out keeps its own. The
+transcript's front matter shows `language` (or `mic_language` and
+`system_language` when they differ) and the `model` it was made with.
 
 **Headphones are recommended.** With speakers, the system audio leaks into
 your microphone. whisrs filters that echo out of your track before transcribing
@@ -608,7 +633,8 @@ With `openai`, recordings use `[openai] model`, except that the realtime-only
 models (`gpt-live-transcribe`, `gpt-realtime-whisper`) become `gpt-transcribe`,
 since OpenAI's file endpoint refuses them. So an `openai-realtime` dictation
 setup can keep its model and still set `[recording] backend = "openai"`.
-`[openai] languages` does not apply to recordings; they use `[general] language`.
+`[openai] languages` does not apply to recordings; they use their own languages
+(see "Languages" above).
 Recordings send `[general] vocabulary` as the hint, but not `[general] prompt`,
 which is an instruction for dictation. A `local-whisper` recording takes
 neither: it decodes without any prompt, so no decoded text is carried

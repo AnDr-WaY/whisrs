@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::llm::LlmCommandConfig;
-use crate::recording::RecordingAction;
+use crate::recording::{RecordingAction, RecordingOptions};
 use crate::{Command, HotkeyConfig};
 pub use parse::{parse_hotkey, HotkeyBinding};
 
@@ -142,6 +142,7 @@ fn build_actions(config: &HotkeyConfig, llm_commands: &[LlmCommandConfig]) -> Ve
                 action: RecordingAction::Toggle,
                 title: None,
                 id: None,
+                options: RecordingOptions::default(),
             },
         ),
     ];
@@ -602,6 +603,7 @@ mod tests {
                 action: RecordingAction::Toggle,
                 title: None,
                 id: None,
+                options: RecordingOptions::default(),
             },
         ] {
             assert_eq!(

@@ -142,6 +142,15 @@ into a Markdown transcript whose speaker labels are your name
 .RB ( [recording]
 .BR user_name )
 and \(lqOthers\(rq.
+Each track is transcribed in its own language:
+.B [recording] mic_language
+and
+.BR system_language ,
+which default to
+.B [recording] language
+and then to
+.BR "[general] language" .
+A recording keeps the languages it started with.
 While a recording is in progress,
 .BR "whisrs toggle" ,
 .B whisrs command
@@ -159,16 +168,31 @@ is taken, it may be a full id, a unique id prefix, or
 for the newest recording. Requires an action:
 .RS
 .TP
-\fBstart\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR]
+\fBstart\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR] [\fB\-l\fR, \fB\-\-language\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR]
 Start a recording. The optional title goes into the transcript and the
 folder name.
+.B \-l
+sets the language of both tracks for this recording (an ISO 639 code such as
+.BR de ,
+optionally with a region, or
+.BR auto ),
+and
+.B \-\-mic\-language
+and
+.B \-\-system\-language
+set one track's, over
+.BR \-l .
+.B \-\-others
+names the system track in the transcript instead of \(lqOthers\(rq.
 .TP
 .B stop
 Stop the recording and queue it for transcription.
 .TP
-\fBtoggle\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR]
+\fBtoggle\fR [\fB\-t\fR \fITITLE\fR] [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR]
 Start a recording when none is in progress, otherwise stop the one that is.
-Meant for a compositor hotkey.
+Meant for a compositor hotkey. The options are those of
+.B start
+and apply when this starts a recording.
 .TP
 .B cancel
 Stop the recording and delete it.
@@ -198,12 +222,16 @@ Print the recording's folder.
 \fBcopy\fR \fIID\fR
 Copy the transcript to the clipboard.
 .TP
-\fBretry\fR \fIID\fR
-Transcribe the recording again, for example after a failure. A recording whose
+\fBretry\fR \fIID\fR [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR]
+Transcribe the recording again, for example after a failure or in another
+language. A language given here replaces the one the recording saved (as for
+.BR start ,
+.B \-l
+covers both tracks); a track left out keeps its own. A recording whose
 transcription was interrupted three times (by a crash each time) is marked
 failed instead of being resumed at startup; retry resets that count and
 queues it again. Chunks already transcribed with the same backend and
-settings are reused.
+settings, language included, are reused.
 .RE
 .IP
 .BR list ,

@@ -57,11 +57,12 @@ const ECHO_CANCELLED_MASK: &str = "mic-echo-cancelled.mask";
 /// Transcribe a stopped recording and write its transcript.
 ///
 /// Marks the recording `processing`, transcribes every recorded track with the
-/// recording backend ([`recording_backend_name`]), and on success writes
-/// `recording.json` with status `done` plus `<id>.md`, returning the new meta.
-/// `dictation_backend` is reused when the recording backend is the dictation
-/// one, so a loaded whisper model is not loaded twice. On error the meta is
-/// left as `processing`; the caller marks it failed.
+/// recording backend ([`recording_backend_name`]), each in the language the
+/// recording stored for it, and on success writes `recording.json` with
+/// status `done`, the backend and the model, plus `<id>.md`, returning the
+/// new meta. `dictation_backend` is reused when the recording backend is the
+/// dictation one, so a loaded whisper model is not loaded twice. On error the
+/// meta is left as `processing`; the caller marks it failed.
 pub async fn process_recording(
     dir: &Path,
     config: &Config,
@@ -70,6 +71,7 @@ pub async fn process_recording(
     let mut meta = store::read_meta(dir)?;
     meta.status = RecordingState::Processing;
     meta.error = None;
+    fill_languages(&mut meta, config);
     store::write_meta(dir, &meta)?;
 
     let name = recording_backend_name(config)?;
@@ -89,11 +91,20 @@ pub async fn process_recording(
                 .context("backend construction panicked")?
         }
     };
-    let tcfg = recording_transcription_config(&name, config);
+    // Both are set by `fill_languages`; the fallback is never taken.
+    let language = |kind| {
+        meta.language(kind)
+            .unwrap_or(&config.general.language)
+            .to_string()
+    };
+    let mic_request = TrackRequest::new(&name, config, &language(TrackKind::Mic), dir);
+    let system_request = TrackRequest::new(&name, config, &language(TrackKind::System), dir);
+    // Only the language differs between the two requests, so the model and
+    // the prompt are the mic's.
+    let model = recording_model_label(&name, config, &mic_request.tcfg);
     info!(
-        "processing recording {} with {name} (model {})",
-        meta.id,
-        recording_model_label(&name, config, &tcfg)
+        "processing recording {} with {name} (model {model}, mic in {}, system audio in {})",
+        meta.id, mic_request.tcfg.language, system_request.tcfg.language
     );
 
     let filler = if config.general.remove_filler_words {
@@ -108,18 +119,14 @@ pub async fn process_recording(
         .context("invalid [replacements] key in configuration")?;
     let filters = SegmentFilters {
         prompt: backend
-            .sends_prompt(&tcfg)
-            .then(|| tcfg.prompt.clone())
+            .sends_prompt(&mic_request.tcfg)
+            .then(|| mic_request.tcfg.prompt.clone())
             .flatten(),
         filler,
         replacer,
     };
 
-    let cache = ChunkCache {
-        dir: dir.join(CACHE_DIR),
-        fingerprint: cache_fingerprint(&name, config, &tcfg),
-    };
-    let echo_cache = cache.echo_cancelled();
+    let echo_cache = mic_request.cache.echo_cancelled();
     let cancelled_mic = echo_cancelled_mic(dir, &meta).await;
     let mut mic = Vec::new();
     let mut system = Vec::new();
@@ -135,6 +142,10 @@ pub async fn process_recording(
             continue;
         }
         readable_tracks += 1;
+        let request = match track.kind {
+            TrackKind::Mic => &mic_request,
+            TrackKind::System => &system_request,
+        };
         // Same length as the raw mic, so the track offset still holds.
         let (path, track_cache, near_end) = match (&cancelled_mic, track.kind) {
             (Some(cancelled), TrackKind::Mic) => (
@@ -142,7 +153,7 @@ pub async fn process_recording(
                 &echo_cache,
                 Some(cancelled.near_end.as_slice()),
             ),
-            _ => (path, &cache, None),
+            _ => (path, &request.cache, None),
         };
         let job = TrackJob {
             path: &path,
@@ -150,15 +161,17 @@ pub async fn process_recording(
             offset_ms: track.offset_ms,
             near_end,
         };
-        let segments = transcribe_track(backend.as_ref(), &tcfg, &filters, track_cache, &job)
-            .await
-            .with_context(|| {
-                format!("failed to transcribe the {} track", track.kind.file_stem())
-            })?;
+        let segments =
+            transcribe_track(backend.as_ref(), &request.tcfg, &filters, track_cache, &job)
+                .await
+                .with_context(|| {
+                    format!("failed to transcribe the {} track", track.kind.file_stem())
+                })?;
         info!(
-            "recording {}: {} track gave {} segment(s)",
+            "recording {}: {} track ({}) gave {} segment(s)",
             meta.id,
             track.kind.file_stem(),
+            request.tcfg.language,
             segments.len()
         );
         match track.kind {
@@ -183,6 +196,7 @@ pub async fn process_recording(
     meta.speakers = speakers_for(&meta, config);
     meta.segments = merge_channels(mic, system);
     meta.backend = Some(name);
+    meta.model = Some(model);
     meta.status = RecordingState::Done;
     meta.error = None;
 
@@ -191,8 +205,42 @@ pub async fn process_recording(
         render_markdown(&meta).as_bytes(),
     )?;
     store::write_meta(dir, &meta)?;
-    cache.clear();
+    // One folder holds both tracks' chunks.
+    mic_request.cache.clear();
     Ok(meta)
+}
+
+/// Give a track with no stored language (a recording made before languages
+/// were stored) the one the config gives it ([`RecordingConfig::language_for`]),
+/// so `recording.json` says what the transcript was made in and a later
+/// retry keeps it.
+fn fill_languages(meta: &mut RecordingMeta, config: &Config) {
+    let recording = RecordingConfig::effective(config);
+    let general = &config.general.language;
+    meta.mic_language
+        .get_or_insert_with(|| recording.language_for(TrackKind::Mic, general));
+    meta.system_language
+        .get_or_insert_with(|| recording.language_for(TrackKind::System, general));
+}
+
+/// One track's request and the cache of its finished chunks. The two
+/// tracks' requests differ only in their language, which the fingerprint
+/// covers: a change to one track's language leaves the other track's
+/// cached chunks valid.
+struct TrackRequest {
+    tcfg: TranscriptionConfig,
+    cache: ChunkCache,
+}
+
+impl TrackRequest {
+    fn new(name: &str, config: &Config, language: &str, dir: &Path) -> Self {
+        let tcfg = recording_transcription_config(name, config, language);
+        let cache = ChunkCache {
+            dir: dir.join(CACHE_DIR),
+            fingerprint: cache_fingerprint(name, config, &tcfg),
+        };
+        Self { tcfg, cache }
+    }
 }
 
 /// The echo-cancelled mic and where the user speaks in it.
@@ -649,11 +697,12 @@ struct CachedChunk {
     segments: Vec<Segment>,
 }
 
-/// Cache of finished chunks for one recording and backend. Entries hold the
-/// backend's segments before filtering, relative to the chunk, so a config
-/// change to the filters still applies on reuse. An entry is reused only
-/// when its fingerprint matches exactly: another backend, model file,
-/// language or vocabulary ignores it (recordings send no other prompt).
+/// Cache of finished chunks for one track of a recording and its request.
+/// Entries hold the backend's segments before filtering, relative to the
+/// chunk, so a config change to the filters still applies on reuse. An entry
+/// is reused only when its fingerprint matches exactly: another backend,
+/// model file, language or vocabulary ignores it (recordings send no other
+/// prompt).
 struct ChunkCache {
     dir: PathBuf,
     fingerprint: String,
@@ -761,7 +810,8 @@ fn speaker_id(kind: TrackKind) -> &'static str {
     }
 }
 
-/// One speaker per recorded channel.
+/// One speaker per recorded channel; the system one is named by the
+/// recording's others label.
 fn speakers_for(meta: &RecordingMeta, config: &Config) -> Vec<Speaker> {
     let has = |kind| meta.tracks.iter().any(|t| t.kind == kind);
     let mut speakers = Vec::new();
@@ -775,7 +825,7 @@ fn speakers_for(meta: &RecordingMeta, config: &Config) -> Vec<Speaker> {
     if has(TrackKind::System) {
         speakers.push(Speaker {
             id: speaker_id(TrackKind::System).into(),
-            name: "Others".into(),
+            name: meta.others_label().into(),
             source: "channel".into(),
         });
     }
@@ -872,6 +922,8 @@ mod tests {
         calls: AtomicUsize,
         /// Samples in each request that got through.
         sent: std::sync::Mutex<Vec<usize>>,
+        /// The language of each request that got through.
+        languages: std::sync::Mutex<Vec<String>>,
         /// Calls with this index or later fail (a dead network).
         fail_from: Option<usize>,
         /// The first this many calls answer HTTP 429.
@@ -894,6 +946,7 @@ mod tests {
                 chunk_secs,
                 calls: AtomicUsize::new(0),
                 sent: Default::default(),
+                languages: Default::default(),
                 fail_from,
                 rate_limited,
             })
@@ -915,7 +968,7 @@ mod tests {
         async fn transcribe_segments(
             &self,
             audio: &[u8],
-            _config: &TranscriptionConfig,
+            config: &TranscriptionConfig,
         ) -> anyhow::Result<Transcript> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             if call < self.rate_limited {
@@ -931,6 +984,7 @@ mod tests {
             }
             let samples = crate::transcription::decode_wav_samples(audio)?;
             self.sent.lock().unwrap().push(samples.len());
+            self.languages.lock().unwrap().push(config.language.clone());
             let frame = RATE / 10;
             let mut segments = Vec::new();
             let mut run: Option<(usize, i16)> = None;
@@ -2012,7 +2066,7 @@ mod tests {
     fn fingerprint_of(toml_text: &str) -> String {
         let config: Config = toml::from_str(toml_text).unwrap();
         let name = recording_backend_name(&config).unwrap();
-        let tcfg = recording_transcription_config(&name, &config);
+        let tcfg = recording_transcription_config(&name, &config, &config.general.language);
         cache_fingerprint(&name, &config, &tcfg)
     }
 
@@ -2070,12 +2124,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_language_change_retranscribes_cached_chunks() {
+    /// A recording whose first attempt failed after one chunk, which is
+    /// cached under English, and the backend texts for its two chunks.
+    async fn english_chunk_cached() -> (tempfile::TempDir, [(i16, &'static str); 2]) {
         let texts = [(3000, "first"), (4000, "second")];
         let samples = track(17.0, &[(2.0, 1.0, 3000), (12.0, 1.0, 4000)]);
         let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(samples))]);
-        // The second chunk fails: the first is cached under English.
         let failing = FakeBackend::with_failures(&texts, Some(3), Some(1), 0);
         process_recording(
             tmp.path(),
@@ -2085,19 +2139,155 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(fs::read_dir(tmp.path().join(CACHE_DIR)).unwrap().count(), 1);
+        let meta = store::read_meta(tmp.path()).unwrap();
+        assert_eq!(meta.mic_language.as_deref(), Some("en"), "stored");
+        (tmp, texts)
+    }
 
+    /// A retry that changes the language (`retry -l` rewrites the stored
+    /// one) sends every chunk again.
+    #[tokio::test]
+    async fn a_language_change_retranscribes_cached_chunks() {
+        let (tmp, texts) = english_chunk_cached().await;
+        let mut meta = store::read_meta(tmp.path()).unwrap();
+        meta.mic_language = Some("de".into());
+        store::write_meta(tmp.path(), &meta).unwrap();
+        let working = FakeBackend::new(&texts, Some(3));
+        run(tmp.path(), working.clone()).await;
+        // Both chunks sent again: nothing English is reused.
+        assert_eq!(*working.languages.lock().unwrap(), ["de", "de"]);
+    }
+
+    /// A recording keeps the language it started with: a config change
+    /// after that does not reach it.
+    #[tokio::test]
+    async fn a_config_change_does_not_reach_a_started_recording() {
+        let (tmp, texts) = english_chunk_cached().await;
         let mut german = config();
         german.general.language = "de".into();
+        german.recording.as_mut().unwrap().language = Some("de".into());
         let working = FakeBackend::new(&texts, Some(3));
-        process_recording(
+        let meta = process_recording(
             tmp.path(),
             &german,
             Some(working.clone() as Arc<dyn TranscriptionBackend>),
         )
         .await
         .unwrap();
-        // Both chunks sent again: nothing English is reused.
-        assert_eq!(working.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            *working.languages.lock().unwrap(),
+            ["en"],
+            "the cached chunk reused, the other sent in English"
+        );
+        assert_eq!(meta.mic_language.as_deref(), Some("en"));
+    }
+
+    /// Each track is sent in its own language, and changing one track's
+    /// language sends only that track again: the other's cached chunks are
+    /// reused. The transcript names both languages, the model and the
+    /// others label.
+    #[tokio::test]
+    async fn each_track_is_sent_in_its_own_language() {
+        let texts = [(3000, "hallo"), (6000, "first"), (7000, "second")];
+        let (tmp, _) = recording(&[
+            (TrackKind::Mic, 0, Some(track(17.0, &[(6.0, 1.0, 3000)]))),
+            (
+                TrackKind::System,
+                0,
+                Some(track(17.0, &[(1.0, 1.0, 6000), (12.0, 1.0, 7000)])),
+            ),
+        ]);
+        let mut meta = store::read_meta(tmp.path()).unwrap();
+        meta.mic_language = Some("de".into());
+        meta.system_language = Some("en".into());
+        meta.others_label = Some("Video".into());
+        store::write_meta(tmp.path(), &meta).unwrap();
+
+        // One chunk for the mic, two for the system track; the last fails.
+        let failing = FakeBackend::with_failures(&texts, Some(3), Some(2), 0);
+        process_recording(
+            tmp.path(),
+            &config(),
+            Some(failing.clone() as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(*failing.languages.lock().unwrap(), ["de", "en"]);
+
+        // A retry with the system track in another language.
+        let mut meta = store::read_meta(tmp.path()).unwrap();
+        meta.system_language = Some("auto".into());
+        store::write_meta(tmp.path(), &meta).unwrap();
+        let working = FakeBackend::new(&texts, Some(3));
+        let meta = run(tmp.path(), working.clone()).await;
+        assert_eq!(
+            *working.languages.lock().unwrap(),
+            ["auto", "auto"],
+            "both system chunks sent again, the cached German mic chunk reused"
+        );
+
+        assert_eq!(meta.mic_language.as_deref(), Some("de"));
+        assert_eq!(meta.system_language.as_deref(), Some("auto"));
+        assert_eq!(meta.model.as_deref(), Some("whisper-large-v3-turbo"));
+        let lines: Vec<_> = meta
+            .segments
+            .iter()
+            .map(|s| (s.speaker.as_str(), s.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [("others", "first"), ("me", "hallo"), ("others", "second")]
+        );
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        for line in [
+            "backend: \"groq\"\n",
+            "model: \"whisper-large-v3-turbo\"\n",
+            "mic_language: \"de\"\n",
+            "system_language: \"auto\"\n",
+            "  - \"Video\"\n",
+            "**[00:00:01] Video:** first",
+            "**[00:00:06] Tester:** hallo",
+        ] {
+            assert!(md.contains(line), "{line:?} missing from:\n{md}");
+        }
+        assert!(!md.contains("Others"), "{md}");
+    }
+
+    /// A `recording.json` from before languages, the others label and the
+    /// model were stored loads and processes: both tracks take the config's
+    /// language, which is then stored, and the system track is "Others".
+    #[tokio::test]
+    async fn an_old_recording_json_still_processes() {
+        let (tmp, _) = recording(&[
+            (TrackKind::Mic, 0, Some(track(8.0, &[(1.0, 1.0, 3000)]))),
+            (TrackKind::System, 0, Some(track(8.0, &[(5.0, 1.0, 6000)]))),
+        ]);
+        let path = tmp.path().join("recording.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        for key in ["mic_language", "system_language", "others_label", "model"] {
+            assert!(fields.remove(key).is_some(), "{key} is written today");
+        }
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        let mut cfg = config();
+        cfg.recording.as_mut().unwrap().language = Some("de".into());
+        let backend = FakeBackend::new(&[(3000, "ich"), (6000, "them")], None);
+        let meta = process_recording(
+            tmp.path(),
+            &cfg,
+            Some(backend.clone() as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*backend.languages.lock().unwrap(), ["de", "de"]);
+        assert_eq!(meta.mic_language.as_deref(), Some("de"));
+        assert_eq!(meta.system_language.as_deref(), Some("de"));
+        assert_eq!(meta.speakers[1].name, "Others");
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(md.contains("\nlanguage: \"de\"\n"), "{md}");
+        assert!(md.contains("**[00:00:05] Others:** them"), "{md}");
     }
 
     /// A phrase backend (no timestamps) that is always rate limited.

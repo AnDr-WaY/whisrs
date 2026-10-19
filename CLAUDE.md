@@ -218,8 +218,12 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
-{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy", "title": "...", "id": "..."}
-                                     // title (start/toggle) and id (retry/copy, default "last") are optional
+{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy", "title": "...", "id": "...",
+ "language": "de", "mic_language": "de", "system_language": "auto", "others": "Video"}
+                                     // all but action optional: title (start/toggle), id (retry/copy,
+                                     // default "last"), the languages (start/toggle/retry; a track's own
+                                     // wins over "language"), others = system track label (start/toggle).
+                                     // Validated by the daemon (RecordingOptions::validated)
 ```
 
 Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": "..."}`,

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::history;
-use crate::recording::{RecordingAction, RecordingStatus};
+use crate::recording::{RecordingAction, RecordingOptions, RecordingStatus};
 
 // ---------------------------------------------------------------------------
 // IPC protocol
@@ -54,13 +54,18 @@ pub enum Command {
     Speak,
     /// The recording feature: record mic + system audio, then transcribe.
     /// `title` names a new recording (`start`/`toggle`); `id` selects an
-    /// existing one (`retry`/`copy`).
+    /// existing one (`retry`/`copy`). `options` (flat on the wire:
+    /// `language`, `mic_language`, `system_language`, `others`) set the
+    /// languages of a new recording or a retry and the label of the system
+    /// track; a request without them gets the config defaults.
     Recording {
         action: RecordingAction,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        #[serde(flatten)]
+        options: RecordingOptions,
     },
 }
 
@@ -496,13 +501,15 @@ mod tests {
             action: RecordingAction::Start,
             title: Some("x".to_string()),
             id: None,
+            options: RecordingOptions::default(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, r#"{"cmd":"recording","action":"start","title":"x"}"#);
         let parsed: Command = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            Command::Recording { action: RecordingAction::Start, title: Some(t), id: None } if t == "x"
+            Command::Recording { action: RecordingAction::Start, title: Some(t), id: None, options }
+                if t == "x" && options == RecordingOptions::default()
         ));
     }
 
@@ -515,16 +522,68 @@ mod tests {
             Command::Recording {
                 action: RecordingAction::Toggle,
                 title: None,
-                id: None
-            }
+                id: None,
+                options,
+            } if options == RecordingOptions::default()
         ));
         let cmd = Command::Recording {
             action: RecordingAction::Retry,
             title: None,
             id: Some("last".to_string()),
+            options: RecordingOptions::default(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, r#"{"cmd":"recording","action":"retry","id":"last"}"#);
+    }
+
+    /// The options travel flat beside `action`, and each one is optional.
+    #[test]
+    fn recording_command_with_options_roundtrip() {
+        let options = RecordingOptions {
+            language: Some("de".to_string()),
+            mic_language: None,
+            system_language: Some("auto".to_string()),
+            others: Some("Video".to_string()),
+        };
+        let cmd = Command::Recording {
+            action: RecordingAction::Start,
+            title: Some("Lesson 50".to_string()),
+            id: None,
+            options: options.clone(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"recording","action":"start","title":"Lesson 50","language":"de","system_language":"auto","others":"Video"}"#
+        );
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(&parsed, Command::Recording { options: o, .. } if *o == options),
+            "{parsed:?}"
+        );
+
+        let retry: Command = serde_json::from_str(
+            r#"{"cmd":"recording","action":"retry","id":"last","mic_language":"en"}"#,
+        )
+        .unwrap();
+        let Command::Recording {
+            action,
+            id,
+            options,
+            ..
+        } = retry
+        else {
+            panic!("not a recording command");
+        };
+        assert_eq!(action, RecordingAction::Retry);
+        assert_eq!(id.as_deref(), Some("last"));
+        assert_eq!(
+            options,
+            RecordingOptions {
+                mic_language: Some("en".to_string()),
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

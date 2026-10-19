@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use super::NotifyFn;
-use crate::recording::{RecordingAction, RecordingPhase, RecordingStatus};
+use crate::recording::{RecordingAction, RecordingOptions, RecordingPhase, RecordingStatus};
 use crate::service::{RestartOutcome, ServiceManager};
 use crate::{Command, State};
 use icons::IconSet;
@@ -340,6 +340,7 @@ fn recording_command(action: RecordingAction) -> Command {
         action,
         title: None,
         id: None,
+        options: RecordingOptions::default(),
     }
 }
 
@@ -610,7 +611,11 @@ mod tests {
         for expected in [RecordingAction::Toggle, RecordingAction::Cancel] {
             let cmd = cmd_rx.try_recv().expect("a recording command is queued");
             assert!(
-                matches!(cmd, Command::Recording { action, title: None, id: None } if action == expected),
+                matches!(
+                    &cmd,
+                    Command::Recording { action, title: None, id: None, options }
+                        if *action == expected && *options == RecordingOptions::default()
+                ),
                 "expected recording {expected:?}, got {cmd:?}"
             );
         }

@@ -409,18 +409,24 @@ pub fn recording_backend_name(config: &Config) -> anyhow::Result<String> {
     }
 }
 
-/// The request config for a recording on backend `name`: `[general]` language
-/// and vocabulary, with that backend's model. Same shape as the dictation
-/// batch config, which uses `[general] backend`'s model and also sends
-/// `[general] prompt`. A recording does not: the prompt is an instruction for
-/// dictation ("Transcribe in the language spoken", a style), and the
-/// vocabulary still goes as the hint, keyterms or hotwords as before.
+/// The request config for one track of a recording on backend `name`:
+/// `language` (the track's own, never `[general] language` by default: the
+/// two tracks of a recording may differ), `[general]` vocabulary, and that
+/// backend's model. Same shape as the dictation batch config, which uses
+/// `[general] backend`'s model and also sends `[general] prompt`. A recording
+/// does not: the prompt is an instruction for dictation ("Transcribe in the
+/// language spoken", a style), and the vocabulary still goes as the hint,
+/// keyterms or hotwords as before.
 ///
 /// Local whisper gets no prompt at all: its recording windows decode with
 /// `n_max_text_ctx` 0, so no pass is conditioned on earlier text, and in
 /// this whisper.cpp that leaves the initial prompt unused too. Sending none
 /// keeps the prompt-echo filter and the chunk cache honest about it.
-pub fn recording_transcription_config(name: &str, config: &Config) -> TranscriptionConfig {
+pub fn recording_transcription_config(
+    name: &str,
+    config: &Config,
+    language: &str,
+) -> TranscriptionConfig {
     let model = model_for_backend(name, config);
     let canonical = canonical_backend_name(name);
     let model = match canonical {
@@ -432,7 +438,7 @@ pub fn recording_transcription_config(name: &str, config: &Config) -> Transcript
         _ => transcription_prompt(None, &config.general.vocabulary),
     };
     TranscriptionConfig {
-        language: config.general.language.clone(),
+        language: language.to_string(),
         model,
         prompt,
         keyterms: config.general.vocabulary.clone(),
@@ -1031,7 +1037,7 @@ mod tests {
             let name = recording_backend_name(&config).unwrap();
             assert_eq!(name, "openai");
             assert_eq!(
-                recording_transcription_config(&name, &config).model,
+                recording_transcription_config(&name, &config, "en").model,
                 sent,
                 "[openai] model = {configured}"
             );
@@ -1050,7 +1056,7 @@ mod tests {
              [local-whisper]\nmodel_path = \"/m/ggml-large-v3-turbo-q5_0.bin\"\n",
         )
         .unwrap();
-        let request = recording_transcription_config("local-whisper", &config);
+        let request = recording_transcription_config("local-whisper", &config, "en");
         assert_eq!(
             recording_model_label("local-whisper", &config, &request),
             "ggml-large-v3-turbo-q5_0.bin"
@@ -1060,7 +1066,7 @@ mod tests {
             toml::from_str("[general]\nbackend = \"local-whisper\"\nvocabulary = [\"whisrs\"]\n")
                 .unwrap();
         assert_eq!(
-            recording_transcription_config("local", &with_vocabulary).prompt,
+            recording_transcription_config("local", &with_vocabulary, "en").prompt,
             None
         );
         assert_eq!(
@@ -1070,7 +1076,7 @@ mod tests {
         // What the request carries (and the cache keys on) is unchanged.
         assert_eq!(request.model, "base.en");
         let groq: Config = toml::from_str("[general]\nbackend = \"groq\"\n").unwrap();
-        let request = recording_transcription_config("groq", &groq);
+        let request = recording_transcription_config("groq", &groq, "en");
         assert_eq!(
             recording_model_label("groq", &groq, &request),
             request.model
@@ -1087,9 +1093,10 @@ mod tests {
         )
         .unwrap();
         let name = recording_backend_name(&config).unwrap();
-        let request = recording_transcription_config(&name, &config);
+        let request = recording_transcription_config(&name, &config, "fr");
         assert_eq!(request.model, "whisper-1");
-        assert_eq!(request.language, "de");
+        // The track's language, not `[general] language`.
+        assert_eq!(request.language, "fr");
         // The vocabulary, without the dictation prompt.
         assert_eq!(request.prompt.as_deref(), Some("whisrs"));
         assert_eq!(request.keyterms, ["whisrs"]);
@@ -1098,7 +1105,7 @@ mod tests {
             "[general]\nbackend = \"groq\"\nprompt = \"Transcribe in the language spoken.\"\n",
         )
         .unwrap();
-        let request = recording_transcription_config("groq", &no_vocabulary);
+        let request = recording_transcription_config("groq", &no_vocabulary, "en");
         assert_eq!(request.prompt, None, "nothing to send");
     }
 }

@@ -1,12 +1,13 @@
 use std::process;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use whisrs::history::HistoryEntry;
 use whisrs::recording::{
-    store, RecordingAction, RecordingMeta, RecordingPhase, RecordingState, RecordingStatus,
+    store, RecordingAction, RecordingMeta, RecordingOptions, RecordingPhase, RecordingState,
+    RecordingStatus,
 };
 use whisrs::{
     encode_message, read_message, service::ServiceManager, socket_path, Command, Response,
@@ -99,6 +100,32 @@ enum SubCmd {
     Recording(RecordingCmd),
 }
 
+/// The transcription languages of a recording (`start`, `toggle`, `retry`).
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+struct LanguageArgs {
+    /// Language of both tracks: an ISO 639-1 code (e.g. `de`), optionally
+    /// with a region (`en-US`), or `auto`
+    #[arg(short, long, value_parser = whisrs::validate_language_override)]
+    language: Option<String>,
+    /// Language of your microphone track, over --language
+    #[arg(long, value_name = "LANGUAGE", value_parser = whisrs::validate_language_override)]
+    mic_language: Option<String>,
+    /// Language of the system audio track, over --language
+    #[arg(long, value_name = "LANGUAGE", value_parser = whisrs::validate_language_override)]
+    system_language: Option<String>,
+}
+
+impl LanguageArgs {
+    fn into_options(self, others: Option<String>) -> RecordingOptions {
+        RecordingOptions {
+            language: self.language,
+            mic_language: self.mic_language,
+            system_language: self.system_language,
+            others,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum RecordingCmd {
     /// Start a recording (mic + system audio)
@@ -106,6 +133,11 @@ enum RecordingCmd {
         /// Recording title, used in the transcript and the folder name
         #[arg(short, long)]
         title: Option<String>,
+        #[command(flatten)]
+        languages: LanguageArgs,
+        /// Name of the system audio track in the transcript (default: Others)
+        #[arg(long, value_name = "NAME", value_parser = whisrs::recording::validate_others_label)]
+        others: Option<String>,
     },
     /// Stop the recording and queue it for transcription
     Stop,
@@ -114,6 +146,13 @@ enum RecordingCmd {
         /// Recording title when this starts a recording
         #[arg(short, long)]
         title: Option<String>,
+        // The languages apply when this starts a recording.
+        #[command(flatten)]
+        languages: LanguageArgs,
+        /// Name of the system audio track when this starts a recording
+        /// (default: Others)
+        #[arg(long, value_name = "NAME", value_parser = whisrs::recording::validate_others_label)]
+        others: Option<String>,
     },
     /// Stop the recording and delete it
     Cancel,
@@ -143,10 +182,13 @@ enum RecordingCmd {
         /// Recording id, a unique id prefix, or `last`
         id: String,
     },
-    /// Transcribe a recording again (e.g. after a failure)
+    /// Transcribe a recording again (e.g. after a failure, or in another
+    /// language: a language given here replaces the stored one)
     Retry {
         /// Recording id, a unique id prefix, or `last`
         id: String,
+        #[command(flatten)]
+        languages: LanguageArgs,
     },
 }
 
@@ -399,14 +441,38 @@ async fn request(cmd: Command) -> anyhow::Result<Response> {
 /// with the daemon stopped.
 async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
     let use_color = is_tty();
-    let (action, title, id) = match cmd {
-        RecordingCmd::Start { title } => (RecordingAction::Start, title, None),
-        RecordingCmd::Stop => (RecordingAction::Stop, None, None),
-        RecordingCmd::Toggle { title } => (RecordingAction::Toggle, title, None),
-        RecordingCmd::Cancel => (RecordingAction::Cancel, None, None),
-        RecordingCmd::Status => (RecordingAction::Status, None, None),
-        RecordingCmd::Copy { id } => (RecordingAction::Copy, None, Some(id)),
-        RecordingCmd::Retry { id } => (RecordingAction::Retry, None, Some(id)),
+    let none = RecordingOptions::default;
+    let (action, title, id, options) = match cmd {
+        RecordingCmd::Start {
+            title,
+            languages,
+            others,
+        } => (
+            RecordingAction::Start,
+            title,
+            None,
+            languages.into_options(others),
+        ),
+        RecordingCmd::Stop => (RecordingAction::Stop, None, None, none()),
+        RecordingCmd::Toggle {
+            title,
+            languages,
+            others,
+        } => (
+            RecordingAction::Toggle,
+            title,
+            None,
+            languages.into_options(others),
+        ),
+        RecordingCmd::Cancel => (RecordingAction::Cancel, None, None, none()),
+        RecordingCmd::Status => (RecordingAction::Status, None, None, none()),
+        RecordingCmd::Copy { id } => (RecordingAction::Copy, None, Some(id), none()),
+        RecordingCmd::Retry { id, languages } => (
+            RecordingAction::Retry,
+            None,
+            Some(id),
+            languages.into_options(None),
+        ),
         RecordingCmd::List { json } => return recording_list(json),
         RecordingCmd::Show { id, format } => return recording_show(&id, format),
         RecordingCmd::Path { id } => {
@@ -416,7 +482,13 @@ async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
         }
     };
 
-    let response = request(Command::Recording { action, title, id }).await?;
+    let response = request(Command::Recording {
+        action,
+        title,
+        id,
+        options,
+    })
+    .await?;
     match response {
         Response::Recording { recording } => {
             match action {
@@ -686,11 +758,14 @@ mod tests {
     fn recording_start_parses_title() {
         assert!(matches!(
             parse_recording(&["start"]),
-            RecordingCmd::Start { title: None }
+            RecordingCmd::Start { title: None, languages, others: None }
+                if languages == LanguageArgs::default()
         ));
         for flag in ["-t", "--title"] {
             match parse_recording(&["start", flag, "Weekly sync"]) {
-                RecordingCmd::Start { title } => assert_eq!(title.as_deref(), Some("Weekly sync")),
+                RecordingCmd::Start { title, .. } => {
+                    assert_eq!(title.as_deref(), Some("Weekly sync"))
+                }
                 _ => panic!("expected start"),
             }
         }
@@ -700,11 +775,92 @@ mod tests {
     fn recording_toggle_parses_title() {
         assert!(matches!(
             parse_recording(&["toggle"]),
-            RecordingCmd::Toggle { title: None }
+            RecordingCmd::Toggle { title: None, languages, others: None }
+                if languages == LanguageArgs::default()
         ));
         match parse_recording(&["toggle", "-t", "Weekly sync"]) {
-            RecordingCmd::Toggle { title } => assert_eq!(title.as_deref(), Some("Weekly sync")),
+            RecordingCmd::Toggle { title, .. } => {
+                assert_eq!(title.as_deref(), Some("Weekly sync"))
+            }
             _ => panic!("expected toggle"),
+        }
+    }
+
+    /// The language practice example from the docs, on `start` and `toggle`.
+    #[test]
+    fn recording_start_and_toggle_parse_languages_and_others() {
+        let want = RecordingOptions {
+            language: None,
+            mic_language: Some("de".into()),
+            system_language: Some("auto".into()),
+            others: Some("Video".into()),
+        };
+        for action in ["start", "toggle"] {
+            let cmd = parse_recording(&[
+                action,
+                "-t",
+                "Lesson 50",
+                "--mic-language",
+                "DE",
+                "--system-language",
+                "auto",
+                "--others",
+                " Video ",
+            ]);
+            let options = match cmd {
+                RecordingCmd::Start {
+                    languages, others, ..
+                }
+                | RecordingCmd::Toggle {
+                    languages, others, ..
+                } => languages.into_options(others),
+                _ => panic!("expected {action}"),
+            };
+            assert_eq!(options, want, "{action}: normalized as the daemon would");
+        }
+        for flag in ["-l", "--language"] {
+            match parse_recording(&["start", flag, "de"]) {
+                RecordingCmd::Start { languages, .. } => {
+                    assert_eq!(languages.language.as_deref(), Some("de"))
+                }
+                _ => panic!("expected start"),
+            }
+        }
+        for bad in [
+            &["start", "-l", "english"][..],
+            &["toggle", "--mic-language", "1"],
+            &["start", "--system-language", ""],
+            &["start", "--others", "  "],
+        ] {
+            let mut argv = vec!["whisrs", "recording"];
+            argv.extend_from_slice(bad);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// `retry` takes the three languages, and no title or others label.
+    #[test]
+    fn recording_retry_parses_languages() {
+        match parse_recording(&["retry", "last", "-l", "de", "--system-language", "auto"]) {
+            RecordingCmd::Retry { id, languages } => {
+                assert_eq!(id, "last");
+                assert_eq!(
+                    languages.into_options(None),
+                    RecordingOptions {
+                        language: Some("de".into()),
+                        system_language: Some("auto".into()),
+                        ..Default::default()
+                    }
+                );
+            }
+            _ => panic!("expected retry"),
+        }
+        for extra in ["--others", "--title"] {
+            let argv = ["whisrs", "recording", "retry", "last", extra, "x"];
+            assert!(Cli::try_parse_from(argv).is_err(), "retry takes no {extra}");
         }
     }
 
@@ -734,7 +890,10 @@ mod tests {
             _ => panic!("expected copy"),
         }
         match parse_recording(&["retry", "last"]) {
-            RecordingCmd::Retry { id } => assert_eq!(id, "last"),
+            RecordingCmd::Retry { id, languages } => {
+                assert_eq!(id, "last");
+                assert_eq!(languages, LanguageArgs::default());
+            }
             _ => panic!("expected retry"),
         }
         for action in ["show", "path", "copy", "retry"] {

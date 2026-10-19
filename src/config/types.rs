@@ -6,7 +6,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::hotkey;
+use crate::ipc::validate_language_override;
 use crate::llm;
+use crate::recording::TrackKind;
 use crate::transcription::deepgram;
 use crate::transcription::openai_realtime_protocol::{
     openai_model_supports_languages, openai_model_supports_prompt, OpenAiRealtimeProfile,
@@ -82,6 +84,15 @@ pub struct RecordingConfig {
     /// Name used for the "me" speaker. `None` uses the passwd full name, else `$USER`.
     #[serde(default)]
     pub user_name: Option<String>,
+    /// Language of both tracks. `None` uses `[general] language`.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Language of the mic track. `None` uses `language`.
+    #[serde(default)]
+    pub mic_language: Option<String>,
+    /// Language of the system track. `None` uses `language`.
+    #[serde(default)]
+    pub system_language: Option<String>,
     /// Microphone device. `None` uses `[audio] device`.
     #[serde(default)]
     pub mic_device: Option<String>,
@@ -112,6 +123,9 @@ impl Default for RecordingConfig {
         Self {
             backend: None,
             user_name: None,
+            language: None,
+            mic_language: None,
+            system_language: None,
             mic_device: None,
             system_device: None,
             max_duration_minutes: default_recording_max_duration_minutes(),
@@ -125,6 +139,25 @@ impl RecordingConfig {
     /// The effective recording config: `[recording]` if present, else defaults.
     pub fn effective(config: &Config) -> RecordingConfig {
         config.recording.clone().unwrap_or_default()
+    }
+
+    /// The language track `kind` of a recording is transcribed in when the
+    /// recording does not set one (`-l`, `--mic-language`,
+    /// `--system-language`): `mic_language` or `system_language`, else
+    /// `language`, else `general_language` (`[general] language`). A value
+    /// from this section is normalized like `-l`; blank counts as unset.
+    pub fn language_for(&self, kind: TrackKind, general_language: &str) -> String {
+        let own = match kind {
+            TrackKind::Mic => self.mic_language.as_deref(),
+            TrackKind::System => self.system_language.as_deref(),
+        };
+        [own, self.language.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(|l| validate_language_override(l).unwrap_or_else(|_| l.to_string()))
+            .unwrap_or_else(|| general_language.to_string())
     }
 }
 
@@ -2154,6 +2187,32 @@ impl Config {
                  {MAX_RECORDING_DURATION_MINUTES} (36 hours, the most a WAV track can hold).",
                 recording.max_duration_minutes
             )));
+        }
+
+        // The rule `-l` follows; `auto` is valid.
+        for (key, value, fallback) in [
+            ("language", &recording.language, "[general] language"),
+            (
+                "mic_language",
+                &recording.mic_language,
+                "[recording] language",
+            ),
+            (
+                "system_language",
+                &recording.system_language,
+                "[recording] language",
+            ),
+        ] {
+            let Some(value) = value.as_deref() else {
+                continue;
+            };
+            if validate_language_override(value).is_err() {
+                return Err(WhisrsError::Config(format!(
+                    "[recording] {key} = \"{value}\" is not a language. Use an ISO 639 code \
+                     like \"de\", optionally with a region (\"en-US\"), or \"auto\"; or remove \
+                     the key to use {fallback}."
+                )));
+            }
         }
 
         match recording.backend.as_deref().map(str::trim) {
@@ -5102,6 +5161,77 @@ mod tests {
             let mut config = validatable_config("groq");
             config.recording = recording_config(|m| m.max_duration_minutes = minutes);
             config.validate().expect("in-range duration");
+        }
+    }
+
+    /// `[general] language` -> `[recording] language` -> the track's own key,
+    /// each a default for the next.
+    #[test]
+    fn recording_languages_default_in_a_chain() {
+        let both = |recording: &RecordingConfig| {
+            (
+                recording.language_for(TrackKind::Mic, "en"),
+                recording.language_for(TrackKind::System, "en"),
+            )
+        };
+        let mut recording = RecordingConfig::default();
+        assert_eq!(both(&recording), ("en".into(), "en".into()));
+        recording.language = Some("de".into());
+        assert_eq!(both(&recording), ("de".into(), "de".into()));
+        recording.system_language = Some("auto".into());
+        assert_eq!(both(&recording), ("de".into(), "auto".into()));
+        recording.mic_language = Some("fr".into());
+        assert_eq!(both(&recording), ("fr".into(), "auto".into()));
+        // Normalized like `-l`; a blank key counts as unset.
+        recording.mic_language = Some(" PT_br ".into());
+        recording.language = Some("  ".into());
+        recording.system_language = None;
+        assert_eq!(both(&recording), ("pt-BR".into(), "en".into()));
+
+        // Parsed from config.toml.
+        let config: Config = toml::from_str(
+            "[general]\nlanguage = \"en\"\n[recording]\nlanguage = \"de\"\n\
+             system_language = \"auto\"\n",
+        )
+        .unwrap();
+        let recording = RecordingConfig::effective(&config);
+        assert_eq!(
+            recording.language_for(TrackKind::Mic, &config.general.language),
+            "de"
+        );
+        assert_eq!(
+            recording.language_for(TrackKind::System, &config.general.language),
+            "auto"
+        );
+    }
+
+    #[test]
+    fn invalid_recording_language_is_an_error() {
+        type Key = fn(&mut RecordingConfig) -> &mut Option<String>;
+        let keys: [(&str, Key); 3] = [
+            ("language", |r| &mut r.language),
+            ("mic_language", |r| &mut r.mic_language),
+            ("system_language", |r| &mut r.system_language),
+        ];
+        for (key, field) in keys {
+            for bad in ["english", "", "1"] {
+                let mut config = validatable_config("groq");
+                config.recording = recording_config(|r| *field(r) = Some(bad.to_string()));
+                let err = config.validate().expect_err("invalid language").to_string();
+                assert!(
+                    err.contains(&format!("[recording] {key} = \"{bad}\"")),
+                    "{key} = {bad:?}: {err}"
+                );
+            }
+            for good in ["de", "auto", "en-US", "multi"] {
+                let mut config = validatable_config("groq");
+                config.recording = recording_config(|r| *field(r) = Some(good.to_string()));
+                assert!(
+                    recording_warnings(&config).is_empty(),
+                    "{key} = {good:?}: {:?}",
+                    recording_warnings(&config)
+                );
+            }
         }
     }
 
