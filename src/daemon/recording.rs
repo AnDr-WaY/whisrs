@@ -1794,8 +1794,8 @@ async fn summarize_one(context: &Arc<DaemonContext>, dir: &Path, id: &str) {
         });
     let Some(held) = hold_to_write(context, id).await else {
         warn!(
-            "recording {id} stayed busy for {SUMMARY_WRITE_WAIT:?}; its summary is made again \
-             at the next start"
+            "recording {id} stayed busy for {SUMMARY_WRITE_WAIT:?}; its summary is dropped, and \
+             made again at the next start if it was asked for or summaries are still on"
         );
         return;
     };

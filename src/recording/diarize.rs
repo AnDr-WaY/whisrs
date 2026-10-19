@@ -460,8 +460,8 @@ mod tests {
     /// network; one that crashed on the request is not sent it again.
     #[tokio::test]
     async fn an_unreachable_sidecar_is_retried_and_a_crash_is_final() {
-        let (listener, sidecar) = local().await;
-        drop(listener);
+        let (_closed, addr) = crate::transcription::test_server::refused_addr();
+        let sidecar = DiarizationSidecar::new(&format!("http://{addr}/diarize"), QUICK);
         let err = sidecar.diarize(wav(1), 0).await.unwrap_err();
         assert!(is_network_unavailable(&err), "{err:#}");
         assert!(

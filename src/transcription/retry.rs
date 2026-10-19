@@ -546,6 +546,12 @@ mod tests {
         then(stream).await;
     }
 
+    /// A URL that refuses connections while the returned socket lives.
+    fn refused_url() -> (tokio::net::TcpSocket, String) {
+        let (closed, addr) = crate::transcription::test_server::refused_addr();
+        (closed, format!("http://{addr}/transcriptions"))
+    }
+
     async fn local_listener() -> (tokio::net::TcpListener, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/transcriptions", listener.local_addr().unwrap());
@@ -572,9 +578,8 @@ mod tests {
             is_transport_error(&wrapped)
         };
 
-        // Connection refused: nothing listens on the port any more.
-        let (listener, url) = local_listener().await;
-        drop(listener);
+        // Connection refused: nothing listens on the port.
+        let (_closed, url) = refused_url();
         let err = post(&client, &url).await.unwrap_err();
         assert!(is_transport(err), "refused");
 
@@ -736,8 +741,7 @@ mod tests {
     /// not retry again.
     #[tokio::test]
     async fn a_lasting_network_error_ends_in_network_unavailable() {
-        let (listener, url) = local_listener().await;
-        drop(listener);
+        let (_closed, url) = refused_url();
         let client = reqwest::Client::new();
         let calls = AtomicUsize::new(0);
         let err = retry_with_backoff(RATE_LIMIT_BUDGET, &[], &QUICK_NETWORK, || {

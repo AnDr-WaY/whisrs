@@ -354,18 +354,30 @@ pub fn resolve_meta(root: &Path, query: &str) -> anyhow::Result<(PathBuf, Record
             .filter(|(_, h)| h.id.starts_with(query))
             .collect()
     };
-    // The ones that read, up to two: one is the answer, two are too many.
-    let mut readable = matches
-        .iter()
-        .filter_map(|(dir, _)| read_meta(dir).ok().map(|meta| (dir.clone(), meta)));
-    match (readable.next(), readable.next()) {
+    // Only the ones that read count; the first one read is kept, the
+    // others are dropped as soon as they are read.
+    let mut found = None;
+    let mut ids: Vec<&str> = Vec::new();
+    let mut unreadable = 0usize;
+    for (dir, header) in &matches {
+        match read_meta(dir) {
+            Ok(meta) => {
+                ids.push(header.id.as_str());
+                found.get_or_insert((dir.clone(), meta));
+            }
+            Err(_) => unreadable += 1,
+        }
+    }
+    match (found, ids.len()) {
+        (Some(found), 1) => Ok(found),
         (None, _) => bail!("no recording matches '{query}'"),
-        (Some(found), None) => Ok(found),
-        (Some(_), Some(_)) => {
-            let ids: Vec<&str> = matches.iter().map(|(_, h)| h.id.as_str()).collect();
+        (Some(_), count) => {
+            let more = match unreadable {
+                0 => String::new(),
+                n => format!(" ({n} more could not be read)"),
+            };
             bail!(
-                "'{query}' matches {} recordings: {}",
-                ids.len(),
+                "'{query}' matches {count} recordings: {}{more}",
                 ids.join(", ")
             )
         }
@@ -1036,6 +1048,20 @@ mod tests {
         );
         let err = resolve(root, "2026-01-01_1000_bad").unwrap_err();
         assert!(format!("{err:#}").contains("failed to parse"), "{err:#}");
+        // Too many: only the ones that read are counted and listed.
+        seed(
+            root,
+            at(2026, 1, 1, 11, 0),
+            Some("also"),
+            RecordingState::Done,
+            None,
+        );
+        let err = resolve(root, "2026-01-01").unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "'2026-01-01' matches 2 recordings: 2026-01-01_1100_also, \
+             2026-01-01_0900_good (1 more could not be read)"
+        );
 
         let mut no_rate = json.clone();
         no_rate.as_object_mut().unwrap().remove("sample_rate");

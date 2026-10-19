@@ -659,9 +659,7 @@ mod tests {
         let config = test_config();
         let quick = [std::time::Duration::from_millis(1); 4];
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (_closed, addr) = crate::transcription::test_server::refused_addr();
         let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let err = retry_with_backoff(RATE_LIMIT_BUDGET, &[], &quick, || {

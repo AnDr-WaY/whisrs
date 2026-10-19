@@ -1,7 +1,19 @@
 //! One-shot HTTP server for backend tests: what a request put on the wire.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
+
+/// An address that refuses connections while the returned socket lives: a
+/// port bound and never listened on. Bind it as `let (_closed, addr) =
+/// refused_addr();` (a bare `_` drops it at once). A listener bound and
+/// dropped instead frees its port, which a test running in parallel can be
+/// handed, so a connection meant to be refused reaches that test's server.
+pub(crate) fn refused_addr() -> (TcpSocket, std::net::SocketAddr) {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
+}
 
 /// A request as the server read it.
 pub(crate) struct Request {

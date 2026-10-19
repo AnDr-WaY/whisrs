@@ -3110,12 +3110,8 @@ mod tests {
     /// written with the voices unnamed.
     #[tokio::test]
     async fn an_llm_failure_never_fails_the_recording() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        drop(listener);
+        let (_closed, addr) = crate::transcription::test_server::refused_addr();
+        let url = format!("http://{addr}/v1/chat/completions");
         let (tmp, _) = call();
         let config = speaker_config(&format!(
             "diarization = \"backend\"\nname_speakers = true\n\
@@ -3203,7 +3199,8 @@ mod tests {
         served(server).await;
         naming::rename_speaker(tmp.path(), &config, "S2", "Omar").unwrap();
 
-        let down = sidecar_config(&dead_url().await, "");
+        let (_closed, dead) = dead_url();
+        let down = sidecar_config(&dead, "");
         let meta = process_call(tmp.path(), &down).await;
         assert!(speakers::separation_failure(&meta).is_some());
         assert_eq!(
@@ -3475,10 +3472,11 @@ mod tests {
         (url, server)
     }
 
-    /// A URL nothing listens on.
-    async fn dead_url() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        format!("http://{}/diarize", listener.local_addr().unwrap())
+    /// A URL that refuses connections while the returned socket lives
+    /// ([`crate::transcription::test_server::refused_addr`]).
+    fn dead_url() -> (tokio::net::TcpSocket, String) {
+        let (closed, addr) = crate::transcription::test_server::refused_addr();
+        (closed, format!("http://{addr}/diarize"))
     }
 
     async fn process_call(dir: &Path, config: &Config) -> RecordingMeta {
@@ -3591,7 +3589,8 @@ mod tests {
         silent.abort();
 
         let (tmp, _) = call();
-        let meta = process_call(tmp.path(), &sidecar_config(&dead_url().await, "")).await;
+        let (_closed, dead) = dead_url();
+        let meta = process_call(tmp.path(), &sidecar_config(&dead, "")).await;
         check(&meta, "the diarization sidecar could not be reached");
     }
 
