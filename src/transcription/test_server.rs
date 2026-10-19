@@ -59,11 +59,31 @@ pub(crate) async fn serve_responses(
     requests
 }
 
+/// Accept one connection, read the whole request, and close the connection
+/// without an answer: a server that crashed handling the request.
+pub(crate) async fn crash_after_request(listener: &TcpListener) -> Request {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    read_request(&mut stream).await
+}
+
 /// Read one request and answer it with `status` and `body`, closing the
 /// connection so the client opens a new one for its next request.
 async fn serve_one(listener: &TcpListener, status: u16, body: &str) -> Request {
     let (mut stream, _) = listener.accept().await.unwrap();
+    let request = read_request(&mut stream).await;
+    let reason = if status == 200 { "OK" } else { "Error" };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    request
+}
 
+/// Read a request's head and its whole body.
+async fn read_request(stream: &mut tokio::net::TcpStream) -> Request {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -91,15 +111,6 @@ async fn serve_one(listener: &TcpListener, status: u16, body: &str) -> Request {
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-
-    let reason = if status == 200 { "OK" } else { "Error" };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
-         content-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes()).await.unwrap();
-    stream.flush().await.unwrap();
     Request {
         head,
         body: buf.split_off(head_end),

@@ -661,9 +661,13 @@ your mic, or to a specific monitor source from `pactl list short sources`
 (names ending in `.monitor`), which is never followed. `whisrs config` lists
 the monitors under "Recording". If the system audio cannot be opened, the
 recording takes your mic only and notes that in the transcript. With
-`mic_device` and `[audio] device` at `"default"`, the mic records the sound
-server's default input, which PipeWire moves to a new default (a headset
-plugged in, a USB mic unplugged) by itself.
+`mic_device` and `[audio] device` at `"default"`, the mic records the ALSA
+default device, which whisrs does not move. Through PipeWire's ALSA plugin
+(`pipewire-alsa`, the usual setup) that is PipeWire's default input, and
+PipeWire moves it to a new default (a headset plugged in, a USB mic
+unplugged) by itself. Through the PulseAudio ALSA plugin, whether it moves
+depends on your PulseAudio setup, and on plain ALSA (no sound server) it
+stays on the device it opened.
 
 **Where recordings are saved.** Each recording gets its own folder under `dir`
 (default `~/.local/share/whisrs/recordings`), named after its start time and
@@ -704,6 +708,8 @@ recording needs 100 MB free in `dir` to start (about 10 minutes plus room to
 transcribe them). While it runs, the free space is checked every minute: one
 notification warns when less than 30 minutes fit, and with less than 2
 minutes left the recording stops, as at the time limit, and is transcribed.
+A check that gets no answer within 5 seconds (a hung network mount) is
+skipped, so it never delays the time limit.
 
 `max_duration_minutes` (default 180, at most 2160) stops a recording that was
 left running. A recording interrupted by a crash or reboot is recovered from its
@@ -730,9 +736,12 @@ recording is not failed: it waits for the network, shown as `waiting` by
 The daemon tries it again when it starts and every 10 minutes while it runs,
 for up to 24 hours after the recording stopped (144 tries at most), and then
 marks it failed. These tries do not count towards the three interrupted
-attempts above. `whisrs recording retry` tries a waiting recording at once.
-An `asr-sidecar` that is not running counts as no network; `local-whisper`
-never waits.
+attempts above. `whisrs recording retry` tries a waiting recording at once;
+a retry that finds no network more than 24 hours after the recording stopped
+fails at once instead of waiting. An `asr-sidecar` that is not running
+(connection refused) counts as no network, but one that takes a chunk and
+drops the connection crashed on it, so like its HTTP 500 that fails the
+recording without sending the chunk again. `local-whisper` never waits.
 
 ## The vocabulary file
 

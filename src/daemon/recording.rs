@@ -101,6 +101,33 @@ const DISK_STOP_MINUTES: u64 = 2;
 /// How the free space is read: [`store::free_space`], or a stand-in in tests.
 pub(crate) type FreeSpaceFn = fn(&Path) -> std::io::Result<u64>;
 
+/// Longest wait for one read of the free space. A hung network mount can
+/// block `statvfs` for minutes: the check is skipped instead, so neither a
+/// start nor a recording's time limit waits on it.
+const FREE_SPACE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What [`open_tracks`] gives a start: the captures, their metas, and why the
+/// system audio could not be opened.
+type OpenedTracks = (Vec<TrackCapture>, Vec<TrackMeta>, Option<String>);
+
+/// [`open_tracks`], or a stand-in.
+type OpenTracksFn =
+    fn(&Path, &str, Option<Result<SystemDevice>>, SilenceAlarm) -> Result<OpenedTracks>;
+
+/// How a start reaches the audio devices: [`resolve_system`] and
+/// [`open_tracks`], or stand-ins in tests, which must never open the host's
+/// mic or ask its sound server.
+#[derive(Clone, Copy)]
+struct Devices {
+    resolve_system: fn(SystemSource) -> Option<Result<SystemDevice>>,
+    open_tracks: OpenTracksFn,
+}
+
+const REAL_DEVICES: Devices = Devices {
+    resolve_system,
+    open_tracks,
+};
+
 /// How often [`run_network_retries`] looks for a recording waiting for the
 /// network whose next attempt is due ([`NETWORK_RETRY_EVERY`] after its last).
 const NETWORK_RETRY_TICK: Duration = Duration::from_secs(60);
@@ -341,6 +368,7 @@ pub(crate) struct RecordingRuntime {
     starting: std::sync::Mutex<Option<PathBuf>>,
     /// Reads the free space of the recordings folder.
     free_space: FreeSpaceFn,
+    devices: Devices,
 }
 
 impl RecordingRuntime {
@@ -362,6 +390,7 @@ impl RecordingRuntime {
             worker: std::sync::Mutex::new(None),
             starting: std::sync::Mutex::new(None),
             free_space: store::free_space,
+            devices: REAL_DEVICES,
         };
         (runtime, status_rx, queue_rx)
     }
@@ -657,7 +686,7 @@ fn open_tracks(
     mic: &str,
     system: Option<Result<SystemDevice>>,
     silence: SilenceAlarm,
-) -> Result<(Vec<TrackCapture>, Vec<TrackMeta>, Option<String>)> {
+) -> Result<OpenedTracks> {
     let mut captures = Vec::new();
     let mut metas = Vec::new();
 
@@ -755,14 +784,15 @@ async fn start(
     let title = title
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    check_space_to_start(context.recording.free_space, &root).await?;
+    check_space_to_start(context.recording.free_space, &root, FREE_SPACE_TIMEOUT).await?;
     let started_at = Local::now();
     let (id, dir) = store::create(&root, started_at, title.as_deref())?;
     let _starting = StartingGuard::new(&context.recording, &dir);
 
     let mic = mic_device(&recording_cfg, &context.config.audio.device);
     let system = system_source(recording_cfg.system_device.as_deref());
-    let system = tokio::task::spawn_blocking(move || resolve_system(system))
+    let devices = context.recording.devices;
+    let system = tokio::task::spawn_blocking(move || (devices.resolve_system)(system))
         .await
         .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("system source lookup panicked: {e}"))));
 
@@ -782,10 +812,12 @@ async fn start(
     let started = Instant::now();
     let open_dir = dir.clone();
     let silence = muted_mic_alarm(&id, context.notify);
-    let opened = tokio::task::spawn_blocking(move || open_tracks(&open_dir, &mic, system, silence))
-        .await
-        .context("audio start panicked")
-        .and_then(|r| r);
+    let opened = tokio::task::spawn_blocking(move || {
+        (devices.open_tracks)(&open_dir, &mic, system, silence)
+    })
+    .await
+    .context("audio start panicked")
+    .and_then(|r| r);
     let (mut tracks, track_metas, system_error) = match opened {
         Ok(opened) => opened,
         Err(e) => {
@@ -855,11 +887,25 @@ async fn start(
 }
 
 /// Refuse a start when the recordings folder has less than
-/// [`DISK_MIN_TO_START`] free. A free space that cannot be read does not
-/// stop a recording: the checks while it runs read it again.
-async fn check_space_to_start(free_space: FreeSpaceFn, root: &Path) -> Result<()> {
+/// [`DISK_MIN_TO_START`] free. A free space that cannot be read, or not
+/// within `timeout` ([`FREE_SPACE_TIMEOUT`]), does not stop a recording: the
+/// checks while it runs read it again.
+async fn check_space_to_start(
+    free_space: FreeSpaceFn,
+    root: &Path,
+    timeout: Duration,
+) -> Result<()> {
     let at = root.to_path_buf();
-    match tokio::task::spawn_blocking(move || free_space(&at)).await {
+    let read = tokio::task::spawn_blocking(move || free_space(&at));
+    let Ok(read) = tokio::time::timeout(timeout, read).await else {
+        warn!(
+            "reading the free space in {} took over {} s; starting without the check",
+            root.display(),
+            timeout.as_secs()
+        );
+        return Ok(());
+    };
+    match read {
         Ok(Ok(free)) if free < DISK_MIN_TO_START => bail!(
             "not enough free disk space to record: {} MB free in {}, and a recording \
              needs {} MB (about 10 minutes plus room to transcribe them)",
@@ -905,9 +951,67 @@ fn disk_room(free: u64, recorded: Duration) -> DiskRoom {
     }
 }
 
+/// Reads the free space for a recording's watch on the blocking pool,
+/// waiting at most [`FREE_SPACE_TIMEOUT`] and never past the time limit. A
+/// read that timed out (a hung network mount) is kept and waited on again
+/// at the next check rather than started anew, so a mount that never
+/// answers ties up one blocking thread, not one a minute.
+struct FreeSpaceReader {
+    read: FreeSpaceFn,
+    dir: PathBuf,
+    /// [`FREE_SPACE_TIMEOUT`], shorter in tests.
+    timeout: Duration,
+    pending: Option<JoinHandle<std::io::Result<u64>>>,
+    warned: bool,
+}
+
+impl FreeSpaceReader {
+    fn new(read: FreeSpaceFn, dir: PathBuf) -> Self {
+        Self {
+            read,
+            dir,
+            timeout: FREE_SPACE_TIMEOUT,
+            pending: None,
+            warned: false,
+        }
+    }
+
+    /// The free space, or `None` when it cannot be read by `limit` or
+    /// within its timeout (logged at WARN the first time).
+    async fn free(&mut self, id: &str, limit: tokio::time::Instant) -> Option<u64> {
+        let mut read = self.pending.take().unwrap_or_else(|| {
+            let (read, at) = (self.read, self.dir.clone());
+            tokio::task::spawn_blocking(move || read(&at))
+        });
+        let deadline = limit.min(tokio::time::Instant::now() + self.timeout);
+        match tokio::time::timeout_at(deadline, &mut read).await {
+            Ok(Ok(Ok(free))) => Some(free),
+            Ok(Ok(Err(e))) => {
+                debug!("could not read the free space for recording {id}: {e}");
+                None
+            }
+            Ok(Err(_)) => None,
+            Err(_) => {
+                if !self.warned {
+                    self.warned = true;
+                    warn!(
+                        "recording {id}: reading the free space in {} takes over {} s; \
+                         skipping the disk checks until it answers",
+                        self.dir.display(),
+                        self.timeout.as_secs()
+                    );
+                }
+                self.pending = Some(read);
+                None
+            }
+        }
+    }
+}
+
 /// Watch a recording in progress: stop it at its `minutes` limit, and every
 /// `check_every` read the free space in `dir`, warning once when it runs
 /// low and stopping it the way the time limit does when it is almost full.
+/// A free-space read never holds up the time limit ([`FreeSpaceReader`]).
 fn spawn_watch(
     context: &Arc<DaemonContext>,
     id: String,
@@ -920,6 +1024,7 @@ fn spawn_watch(
         let started = tokio::time::Instant::now();
         let limit = started + Duration::from_secs(u64::from(minutes) * 60);
         let mut warned = false;
+        let mut reader = FreeSpaceReader::new(ctx.recording.free_space, dir);
         loop {
             let next_check = tokio::time::Instant::now() + check_every;
             if next_check >= limit {
@@ -929,15 +1034,8 @@ fn spawn_watch(
                 return;
             }
             tokio::time::sleep_until(next_check).await;
-            let free_space = ctx.recording.free_space;
-            let at = dir.clone();
-            let free = match tokio::task::spawn_blocking(move || free_space(&at)).await {
-                Ok(Ok(free)) => free,
-                Ok(Err(e)) => {
-                    debug!("could not read the free space for recording {id}: {e}");
-                    continue;
-                }
-                Err(_) => continue,
+            let Some(free) = reader.free(&id, limit).await else {
+                continue;
             };
             match disk_room(free, started.elapsed()) {
                 DiskRoom::Enough => {}
@@ -1411,29 +1509,36 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
         }
         Err(e) => {
             let message = format!("{e:#}");
-            error!("recording {id} transcription failed: {message}");
             if let Err(write_err) = mark_failed(&dir, &message) {
                 error!("failed to record the failure of recording {id}: {write_err:#}");
             }
-            notify(
-                context,
-                &format!(
-                    "Recording transcription failed: {}. Retry with: whisrs recording retry {id}",
-                    truncate_preview(&message, NOTIFY_ERROR_MAX)
-                ),
-            );
+            transcription_failed(context, &id, &message);
         }
     }
     context.recording.update(|v| v.processing = None);
     sweep(context).await;
 }
 
+/// Log and notify that recording `id` failed with `message`.
+fn transcription_failed(context: &DaemonContext, id: &str, message: &str) {
+    error!("recording {id} transcription failed: {message}");
+    notify(
+        context,
+        &format!(
+            "Recording transcription failed: {}. Retry with: whisrs recording retry {id}",
+            truncate_preview(message, NOTIFY_ERROR_MAX)
+        ),
+    );
+}
+
 /// Mark recording `id` as waiting for the network after an attempt could
 /// not reach the backend, and show it so. Notified only when it starts
-/// waiting: the automatic attempts that fail after that stay quiet.
+/// waiting: the automatic attempts that fail after that stay quiet. Past
+/// its deadline already it fails instead, as a plain failure.
 async fn wait_for_network(context: &Arc<DaemonContext>, dir: &Path, id: &str, message: &str) {
     match mark_waiting(dir, message, Local::now()) {
-        Ok((meta, started)) => {
+        Ok(NoNetwork::TooLate(error)) => transcription_failed(context, id, &error),
+        Ok(NoNetwork::Waiting { meta, started }) => {
             warn!("recording {id} is waiting for the network: {message}");
             context
                 .recording
@@ -1509,13 +1614,26 @@ fn count_network_attempt(dir: &Path) -> Result<()> {
     store::write_meta(dir, &meta)
 }
 
+/// What became of a recording whose attempt found no network.
+#[derive(Debug)]
+enum NoNetwork {
+    /// Waiting for the network; `started` when the wait began with this
+    /// attempt, which is when it is notified.
+    Waiting {
+        meta: Box<RecordingMeta>,
+        started: bool,
+    },
+    /// Already past [`RecordingMeta::network_deadline`] (a manual retry more
+    /// than a day after the stop, or an automatic attempt that ran past it):
+    /// failed with this error instead of promising tries that never come.
+    TooLate(String),
+}
+
 /// Mark a recording as waiting for the network after an attempt failed for
-/// lack of it at `now`, starting its [`NetworkWait`] if it has none. The
-/// flag is true when the wait started here, which is when it is notified.
-fn mark_waiting(dir: &Path, message: &str, now: DateTime<Local>) -> Result<(RecordingMeta, bool)> {
+/// lack of it at `now`, starting its [`NetworkWait`] if it has none, or as
+/// failed when its deadline has passed.
+fn mark_waiting(dir: &Path, message: &str, now: DateTime<Local>) -> Result<NoNetwork> {
     let mut meta = store::read_meta(dir)?;
-    meta.status = RecordingState::Waiting;
-    meta.error = Some(message.to_string());
     let started = meta.network_wait.is_none();
     let wait = meta.network_wait.get_or_insert(NetworkWait {
         since: now,
@@ -1523,8 +1641,30 @@ fn mark_waiting(dir: &Path, message: &str, now: DateTime<Local>) -> Result<(Reco
         last_attempt_at: now,
     });
     wait.last_attempt_at = now;
+    if meta
+        .network_deadline()
+        .is_some_and(|deadline| now >= deadline)
+    {
+        let error = format!(
+            "no network, and recordings are retried automatically only for {} hours \
+             after they stop: {message}",
+            NETWORK_RETRY_FOR.as_secs() / 3600
+        );
+        if started {
+            meta.network_wait = None;
+        }
+        meta.status = RecordingState::Failed;
+        meta.error = Some(error.clone());
+        store::write_meta(dir, &meta)?;
+        return Ok(NoNetwork::TooLate(error));
+    }
+    meta.status = RecordingState::Waiting;
+    meta.error = Some(message.to_string());
     store::write_meta(dir, &meta)?;
-    Ok((meta, started))
+    Ok(NoNetwork::Waiting {
+        meta: Box::new(meta),
+        started,
+    })
 }
 
 /// End a recording's wait for the network: `failed`, with `why` before the
@@ -2252,6 +2392,13 @@ mod tests {
         build_context(root, backend, extra, store::free_space)
     }
 
+    /// The devices of every test context: a start that gets this far panics
+    /// instead of opening the host's mic or asking its sound server.
+    const NO_DEVICES: Devices = Devices {
+        resolve_system: |_| panic!("a test start looked up the system audio device"),
+        open_tracks: |_, _, _, _| panic!("a test start opened the audio devices"),
+    };
+
     fn build_context(
         root: &Path,
         backend: Arc<dyn TranscriptionBackend>,
@@ -2265,6 +2412,7 @@ mod tests {
         .unwrap();
         let (mut recording, _status_rx, queue_rx) = RecordingRuntime::new();
         recording.free_space = free_space;
+        recording.devices = NO_DEVICES;
         let context = DaemonContext {
             config,
             window_tracker: Arc::new(whisrs::window::NoopTracker),
@@ -3412,6 +3560,8 @@ mod tests {
 
     /// A start on a nearly full disk is refused before it creates a folder
     /// or opens a device; one whose free space cannot be read goes ahead.
+    /// Test contexts have no devices ([`NO_DEVICES`]): a start that got past
+    /// a broken check would fail on that, never open the host's mic.
     #[tokio::test]
     async fn a_start_without_disk_space_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3435,12 +3585,16 @@ mod tests {
         assert!(!root.exists(), "no folder was created");
         assert!(!context.recording.is_capturing());
 
-        assert!(check_space_to_start(unreadable_free_space, &root)
-            .await
-            .is_ok());
-        assert!(check_space_to_start(store::free_space, tmp.path())
-            .await
-            .is_ok());
+        assert!(
+            check_space_to_start(unreadable_free_space, &root, FREE_SPACE_TIMEOUT)
+                .await
+                .is_ok()
+        );
+        assert!(
+            check_space_to_start(store::free_space, tmp.path(), FREE_SPACE_TIMEOUT)
+                .await
+                .is_ok()
+        );
     }
 
     /// With the disk almost full the watch stops the recording the way the
@@ -3506,6 +3660,154 @@ mod tests {
         assert!(queue.try_recv().is_err());
         let session = context.recording.session.lock().await.take().unwrap();
         session.watch.unwrap().abort();
+    }
+
+    /// A session fed by the test whose writer has already finished. The
+    /// writer runs on the blocking pool, which a paused clock does not wait
+    /// for: a stop's writer timeout could otherwise fire before it is done.
+    fn finished_session(root: &Path) -> RecordingSession {
+        let (session, tx) = fed_session(root, "standup");
+        tx.send(vec![1000i16; 3200]).unwrap();
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.tracks[0].writer.is_finished() {
+            assert!(Instant::now() < deadline, "the writer never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        session
+    }
+
+    /// The time limit, through the watch on a paused clock: the recording
+    /// stops at its limit to the second, finalized and queued like any stop.
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_stops_a_recording_at_its_time_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = test_context(tmp.path(), working_backend());
+        let mut session = finished_session(tmp.path());
+        let (id, dir) = (session.meta.id.clone(), session.dir.clone());
+        let started = tokio::time::Instant::now();
+        session.watch = Some(spawn_watch(
+            &context,
+            id.clone(),
+            dir.clone(),
+            1,
+            Duration::from_secs(60),
+        ));
+        show_recording(&context, session).await;
+
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert!(context.recording.is_capturing(), "stopped before its limit");
+        let item = tokio::time::timeout(Duration::from_secs(120), queue.recv())
+            .await
+            .expect("not stopped at its limit")
+            .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
+        assert_eq!(item.recording.id, id);
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Processing);
+        assert_eq!(meta.end_reason, Some(EndReason::MaxDuration));
+        assert_eq!(meta.tracks[0].samples, 3200);
+        assert!(!context.recording.is_capturing());
+    }
+
+    /// A free-space read on a dead network mount: counts itself in `reads`
+    /// and returns only once `release` is set.
+    fn hang_until(reads: &AtomicUsize, release: &AtomicBool) -> std::io::Result<u64> {
+        reads.fetch_add(1, Ordering::SeqCst);
+        while !release.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Ok(u64::MAX)
+    }
+
+    /// Sets its flag however the test ends, so a hung read returns and the
+    /// runtime's shutdown does not wait on it forever.
+    struct Release(&'static AtomicBool);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// `read`, failing the test instead of hanging it when a hung free-space
+    /// read holds it up.
+    async fn bounded<T>(read: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .expect("held up by a hung free-space read")
+    }
+
+    static WATCH_READS: AtomicUsize = AtomicUsize::new(0);
+    static WATCH_RELEASE: AtomicBool = AtomicBool::new(false);
+
+    fn watch_hung_read(_: &Path) -> std::io::Result<u64> {
+        hang_until(&WATCH_READS, &WATCH_RELEASE)
+    }
+
+    /// A free-space read that hangs (a dead network mount) is given up on
+    /// after the timeout and never past the time limit, and is waited on
+    /// again at the next check instead of started anew. Real time: a paused
+    /// clock does not move while a blocking task runs.
+    #[tokio::test]
+    async fn a_hung_free_space_read_is_bounded_and_not_repeated() {
+        let _release = Release(&WATCH_RELEASE);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reader = FreeSpaceReader::new(watch_hung_read, tmp.path().to_path_buf());
+        reader.timeout = Duration::from_millis(20);
+        let far = tokio::time::Instant::now() + Duration::from_secs(600);
+        for _ in 0..3 {
+            let asked = Instant::now();
+            assert_eq!(bounded(reader.free("m", far)).await, None);
+            assert!(
+                asked.elapsed() < Duration::from_secs(2),
+                "{:?}",
+                asked.elapsed()
+            );
+        }
+        // However long the timeout, never past the time limit.
+        reader.timeout = Duration::from_secs(600);
+        let asked = Instant::now();
+        let limit = tokio::time::Instant::now() + Duration::from_millis(30);
+        assert_eq!(bounded(reader.free("m", limit)).await, None);
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert_eq!(WATCH_READS.load(Ordering::SeqCst), 1, "one read, waited on");
+
+        // Once it answers, the next check takes its answer.
+        WATCH_RELEASE.store(true, Ordering::Release);
+        assert_eq!(bounded(reader.free("m", far)).await, Some(u64::MAX));
+        assert_eq!(WATCH_READS.load(Ordering::SeqCst), 1);
+    }
+
+    static START_READS: AtomicUsize = AtomicUsize::new(0);
+    static START_RELEASE: AtomicBool = AtomicBool::new(false);
+
+    fn start_hung_read(_: &Path) -> std::io::Result<u64> {
+        hang_until(&START_READS, &START_RELEASE)
+    }
+
+    /// A start whose free-space read hangs goes ahead without the check.
+    #[tokio::test]
+    async fn a_start_does_not_wait_on_a_hung_free_space_read() {
+        let _release = Release(&START_RELEASE);
+        let tmp = tempfile::tempdir().unwrap();
+        let asked = Instant::now();
+        bounded(check_space_to_start(
+            start_hung_read,
+            tmp.path(),
+            Duration::from_millis(20),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            asked.elapsed()
+        );
     }
 
     /// What [`FlakyNetwork`] does with a request.
@@ -3615,8 +3917,11 @@ mod tests {
         assert_eq!(status.phase, RecordingPhase::Idle);
         assert_eq!(status.waiting, vec![id]);
         // The next attempt finds the wait already started: no new notice.
-        let (_, started) = mark_waiting(&dir, "still down", Local::now()).unwrap();
-        assert!(!started);
+        let next = mark_waiting(&dir, "still down", Local::now()).unwrap();
+        assert!(
+            matches!(next, NoNetwork::Waiting { started: false, .. }),
+            "{next:?}"
+        );
     }
 
     #[test]
@@ -3790,6 +4095,49 @@ mod tests {
         backend.set(UP);
         process_one(&context, item).await;
         assert_eq!(store::read_meta(&dir).unwrap().status, RecordingState::Done);
+    }
+
+    /// A retry more than a day after the stop that finds no network fails at
+    /// once with one reason, instead of promising tries every 10 minutes
+    /// that the next tick gives up on.
+    #[tokio::test]
+    async fn no_network_past_the_deadline_fails_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = test_context(tmp.path(), FlakyNetwork::new(DOWN));
+        let (dir, _) = waiting_recording(&context, &mut queue, tmp.path()).await;
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.ended_at = Some(Local::now() - chrono::Duration::hours(25));
+        store::write_meta(&dir, &meta).unwrap();
+        retry_waiting(&context, Local::now(), false).await;
+        assert_eq!(
+            store::read_meta(&dir).unwrap().status,
+            RecordingState::Failed
+        );
+
+        // Retried by hand, still offline.
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
+        process_one(&context, queue.try_recv().unwrap()).await;
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Failed);
+        assert_eq!(meta.network_wait, None);
+        let error = meta.error.unwrap();
+        assert!(
+            error.starts_with(
+                "no network, and recordings are retried automatically only for 24 hours \
+                 after they stop: "
+            ) && error.contains("could not reach the transcription service"),
+            "{error}"
+        );
+        assert_eq!(context.recording.status(), RecordingStatus::default());
+        retry_waiting(
+            &context,
+            Local::now() + chrono::Duration::minutes(11),
+            false,
+        )
+        .await;
+        assert!(queue.try_recv().is_err(), "no automatic try follows");
     }
 
     /// `cancel` acts on the recording in progress only: with none, it is the

@@ -399,7 +399,19 @@ pub fn resolve_input_strict(name: &str) -> anyhow::Result<ResolvedInput> {
 /// The monitor source of the default output device, i.e. what the speakers
 /// are playing: the PulseAudio default sink's name plus `.monitor`, checked
 /// to exist. Returns the bare source name, for [`resolve_input_strict`].
+/// A cached connection that reports no default is replaced once, since it
+/// may have outlived a restarted server.
 pub fn default_monitor_source() -> anyhow::Result<String> {
+    default_monitor_source_with(true)
+}
+
+/// [`default_monitor_source`], replacing a cached connection that reports
+/// no default output only when `reconnect` is set. A healthy connection
+/// gives the same answer when there simply is no output device, and dropping
+/// it leaks its client thread, socket and server client (see
+/// [`is_host_level_error`]); a following capture asks every 2 s, so it
+/// reconnects only after its stream failed, as a server restart makes it.
+pub fn default_monitor_source_with(reconnect: bool) -> anyhow::Result<String> {
     let (host, cached) = pulse_host(Lookup::Capture).ok_or_else(|| {
         anyhow::anyhow!(
             "no PulseAudio server reachable (PipeWire needs pipewire-pulse), \
@@ -409,7 +421,7 @@ pub fn default_monitor_source() -> anyhow::Result<String> {
     let sink = match host.default_output_device() {
         Some(sink) => sink,
         // A cached connection can outlive a restarted server: reconnect once.
-        None if cached => {
+        None if cached && reconnect => {
             debug!("no default sink on the cached PulseAudio connection, reconnecting");
             invalidate_pulse_host();
             let (host, _) = pulse_host(Lookup::Capture)

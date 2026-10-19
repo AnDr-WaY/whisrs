@@ -46,6 +46,21 @@ const CLOCK_WINDOW: usize = 32;
 /// in one quick burst.
 const SPLICE_HOLD: Duration = Duration::from_millis(600);
 
+/// How many one-second blocks of zeros the capture thread sends per turn of
+/// its loop (every 50 ms) when a switch left a gap ([`Feed::pump`]): 200
+/// times real time, so an hour's outage is filled in 18 s, never in one
+/// burst of buffers.
+const GAP_BLOCKS_PER_PUMP: usize = 10;
+
+/// Least time between two replacements of the PulseAudio connection by a
+/// following capture ([`device::default_monitor_source_with`]): each one
+/// that turns out to be needless leaks a client thread and socket.
+const RECONNECT_EVERY: Duration = Duration::from_secs(60);
+
+/// How often a failure that repeats at every poll is logged at WARN again
+/// after its first time ([`Outage`]).
+const REPEAT_WARN_EVERY: Duration = Duration::from_secs(60);
+
 fn samples_to_duration(samples: usize) -> Duration {
     Duration::from_secs_f64(samples as f64 / f64::from(SAMPLE_RATE))
 }
@@ -131,19 +146,12 @@ pub(crate) fn gap_fill(resume_at: Instant, began: Instant) -> usize {
     (gap.as_secs_f64() * f64::from(SAMPLE_RATE)).round() as usize
 }
 
-/// `samples` zeros, a second at a time.
-fn silence(samples: usize) -> Vec<AudioChunk> {
-    let second = SAMPLE_RATE as usize;
-    (0..samples.div_ceil(second))
-        .map(|i| vec![0; second.min(samples - i * second)])
-        .collect()
-}
-
 /// Joins a following capture's new stream onto its track: holds the new
 /// stream's first [`SPLICE_HOLD`] of audio, estimates where it began
 /// ([`earliest_start`]), and lets it out behind the zeros that fill the time
 /// since the old stream's audio ended ([`gap_fill`]), so the track keeps the
-/// wall-clock timeline.
+/// wall-clock timeline. It only counts the zeros: they are sent by the
+/// capture thread ([`Feed::pump`]), never by a callback.
 pub(crate) struct Splice {
     resume_at: Instant,
     held: Vec<AudioChunk>,
@@ -162,8 +170,12 @@ impl Splice {
     }
 
     /// Take a chunk that arrived `at`. Once [`SPLICE_HOLD`] of audio is in,
-    /// returns the zeros and the held chunks to send, in order.
-    pub(crate) fn push(&mut self, chunk: AudioChunk, at: Instant) -> Option<Vec<AudioChunk>> {
+    /// returns how many zeros go first and the held chunks that follow them.
+    pub(crate) fn push(
+        &mut self,
+        chunk: AudioChunk,
+        at: Instant,
+    ) -> Option<(usize, Vec<AudioChunk>)> {
         self.held_samples += chunk.len();
         let began = earliest_start(at, self.held_samples);
         self.began = Some(self.began.map_or(began, |b| b.min(began)));
@@ -171,14 +183,19 @@ impl Splice {
         (samples_to_duration(self.held_samples) >= SPLICE_HOLD).then(|| self.release())
     }
 
-    /// The zeros and the held chunks, whatever was held so far.
-    pub(crate) fn release(&mut self) -> Vec<AudioChunk> {
+    /// How many zeros go first, and the chunks held so far.
+    pub(crate) fn release(&mut self) -> (usize, Vec<AudioChunk>) {
         let fill = self.began.map_or(0, |b| gap_fill(self.resume_at, b));
-        let mut out = silence(fill);
-        out.append(&mut self.held);
         self.held_samples = 0;
-        out
+        (fill, std::mem::take(&mut self.held))
     }
+}
+
+/// The zeros a [`Splice`] let go that the capture thread has not sent yet,
+/// and the chunks that go after them.
+struct Gap {
+    zeros: usize,
+    behind: Vec<AudioChunk>,
 }
 
 /// Where a stream's callback sends its chunks: through a [`Splice`] first
@@ -191,6 +208,11 @@ impl Splice {
 struct Feed {
     tx: mpsc::UnboundedSender<AudioChunk>,
     splice: Option<Splice>,
+    /// Zeros still to send before the chunks that came after the splice.
+    /// Never sent from a callback: after an outage of minutes, building them
+    /// there would hold up the audio thread. The capture thread sends them
+    /// ([`Feed::pump`]) while the callback queues its chunks behind them.
+    gap: Option<Gap>,
     retired: bool,
 }
 
@@ -205,6 +227,7 @@ impl Feed {
         Self {
             tx,
             splice,
+            gap: None,
             retired: false,
         }
     }
@@ -222,29 +245,72 @@ impl Feed {
         }
     }
 
-    /// Let out what the splice holds and ignore every later chunk.
+    /// Let out what the splice holds, behind all of its zeros, and ignore
+    /// every later chunk. Called by the capture thread.
     fn retire(&mut self) {
         if let Some(mut splice) = self.splice.take() {
-            for chunk in splice.release() {
-                let _ = self.tx.send(chunk);
-            }
+            let (zeros, held) = splice.release();
+            self.let_out(zeros, held);
         }
+        self.pump(usize::MAX);
         self.retired = true;
     }
 
     fn send(&mut self, chunk: AudioChunk, at: Instant) {
+        if let Some(gap) = self.gap.as_mut() {
+            gap.behind.push(chunk);
+            return;
+        }
         match self.splice.as_mut() {
             Some(splice) => {
-                if let Some(out) = splice.push(chunk, at) {
+                if let Some((zeros, held)) = splice.push(chunk, at) {
                     self.splice = None;
-                    for chunk in out {
-                        // A closed channel means the capture is stopping.
-                        let _ = self.tx.send(chunk);
-                    }
+                    self.let_out(zeros, held);
                 }
             }
             None => {
+                // A closed channel means the capture is stopping.
                 let _ = self.tx.send(chunk);
+            }
+        }
+    }
+
+    /// The chunks a splice let go: sent at once when no zeros go before
+    /// them, else queued behind the zeros for the capture thread.
+    fn let_out(&mut self, zeros: usize, held: Vec<AudioChunk>) {
+        if zeros == 0 {
+            for chunk in held {
+                let _ = self.tx.send(chunk);
+            }
+        } else {
+            self.gap = Some(Gap {
+                zeros,
+                behind: held,
+            });
+        }
+    }
+
+    /// Send up to `blocks` seconds of the gap's zeros and, once they are all
+    /// out, the chunks queued behind them. Called by the capture thread,
+    /// never a callback.
+    fn pump(&mut self, blocks: usize) {
+        let Some(gap) = self.gap.as_mut() else {
+            return;
+        };
+        let second = SAMPLE_RATE as usize;
+        for _ in 0..blocks {
+            if gap.zeros == 0 {
+                break;
+            }
+            let block = gap.zeros.min(second);
+            let _ = self.tx.send(vec![0; block]);
+            gap.zeros -= block;
+        }
+        if gap.zeros == 0 {
+            if let Some(gap) = self.gap.take() {
+                for chunk in gap.behind {
+                    let _ = self.tx.send(chunk);
+                }
             }
         }
     }
@@ -518,6 +584,100 @@ fn open_input(
     }
 }
 
+/// What a following capture needs from the sound server, so that
+/// [`Follower::follow`] can be tested without one.
+trait FollowHost {
+    type Stream;
+    /// The monitor of the default output. `reconnect` lets a cached
+    /// connection that reports no default be replaced
+    /// ([`device::default_monitor_source_with`]).
+    fn default_monitor(&mut self, reconnect: bool) -> anyhow::Result<String>;
+    /// Start a stream on `monitor`. With `resume_at` its audio is spliced on
+    /// behind the zeros since then ([`Splice`]); without, it starts the
+    /// track as a first stream would.
+    fn open(
+        &mut self,
+        monitor: &str,
+        resume_at: Option<Instant>,
+    ) -> anyhow::Result<(Self::Stream, SharedFeed)>;
+}
+
+/// The sound server itself, through cpal's PulseAudio host.
+struct PulseFollowHost<'a> {
+    tx: &'a mpsc::UnboundedSender<AudioChunk>,
+    hooks: &'a StreamHooks,
+}
+
+impl FollowHost for PulseFollowHost<'_> {
+    type Stream = cpal::Stream;
+
+    fn default_monitor(&mut self, reconnect: bool) -> anyhow::Result<String> {
+        device::default_monitor_source_with(reconnect)
+    }
+
+    fn open(
+        &mut self,
+        monitor: &str,
+        resume_at: Option<Instant>,
+    ) -> anyhow::Result<(cpal::Stream, SharedFeed)> {
+        open_input(
+            monitor,
+            self.tx,
+            &None,
+            self.hooks,
+            CaptureMode::Strict,
+            resume_at,
+        )
+        .map(|(stream, _, _, feed)| (stream, feed))
+    }
+}
+
+/// A failure that can repeat at every poll, for logging it without a line
+/// every 2 s: when it began and when it was last logged at WARN.
+#[derive(Debug, Default)]
+struct Outage {
+    since: Option<(Instant, Instant)>,
+}
+
+impl Outage {
+    /// It failed at `now`; true when that is the first failure of this
+    /// outage.
+    fn first(&mut self, now: Instant) -> bool {
+        if self.since.is_some() {
+            return false;
+        }
+        self.since = Some((now, now));
+        true
+    }
+
+    /// It failed at `now`; true when that is worth a WARN: the first
+    /// failure, then one every [`REPEAT_WARN_EVERY`].
+    fn warn_due(&mut self, now: Instant) -> bool {
+        match &mut self.since {
+            None => {
+                self.since = Some((now, now));
+                true
+            }
+            Some((_, warned)) if now.saturating_duration_since(*warned) >= REPEAT_WARN_EVERY => {
+                *warned = now;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.since.is_some()
+    }
+
+    /// It worked at `now`: how long the outage lasted, if there was one.
+    fn ended(&mut self, now: Instant) -> Option<Duration> {
+        self.since
+            .take()
+            .map(|(began, _)| now.saturating_duration_since(began))
+    }
+}
+
 /// A capture that follows the monitor of the default output.
 struct Follower {
     /// The monitor being recorded (or, after a failed switch, the one last
@@ -525,12 +685,40 @@ struct Follower {
     current: String,
     last_poll: Instant,
     /// Where the last stream's audio ended, kept across failed switches.
+    /// `None` until a stream delivered audio.
     resume_at: Option<Instant>,
     /// The current stream's feed, retired before the stream is dropped.
     feed: Option<SharedFeed>,
+    /// The stream failed and none opened since: reopen even if the default
+    /// output did not change.
+    broken: bool,
+    /// The stream failed and the default lookup has not been allowed to
+    /// replace the connection since. Only a failed stream (a restarted
+    /// server fails it) justifies replacing a connection that reports no
+    /// default: a healthy one says the same when there is no output device.
+    reconnect_owed: bool,
+    last_reconnect: Option<Instant>,
+    /// The default output could not be read.
+    lookup_outage: Outage,
+    /// The default's monitor could not be opened.
+    open_outage: Outage,
 }
 
 impl Follower {
+    fn new(current: &str, feed: SharedFeed, now: Instant) -> Self {
+        Self {
+            current: current.to_string(),
+            last_poll: now,
+            resume_at: None,
+            feed: Some(feed),
+            broken: false,
+            reconnect_owed: false,
+            last_reconnect: None,
+            lookup_outage: Outage::default(),
+            open_outage: Outage::default(),
+        }
+    }
+
     /// Retire the current stream's feed (see [`Feed`]).
     fn retire(&mut self) {
         if let Some(feed) = self.feed.take() {
@@ -538,62 +726,125 @@ impl Follower {
         }
     }
 
-    /// Every [`FOLLOW_POLL`]: when the default output changed, or the stream
-    /// failed or is gone, move to the default's monitor. The old stream is
-    /// dropped first, so where its audio ended is final when the new stream
-    /// is spliced on. A switch that fails leaves no stream and is tried
-    /// again at the next poll; the fill then covers the whole outage.
-    fn poll(
+    /// Send the zeros of the current stream's splice, a few blocks per call
+    /// ([`Feed::pump`]).
+    fn pump(&self) {
+        if let Some(feed) = &self.feed {
+            lock_feed(feed).pump(GAP_BLOCKS_PER_PUMP);
+        }
+    }
+
+    /// Every [`FOLLOW_POLL`]: [`Self::follow`].
+    fn poll<H: FollowHost>(
         &mut self,
-        stream: &mut Option<cpal::Stream>,
-        tx: &mpsc::UnboundedSender<AudioChunk>,
-        hooks: &StreamHooks,
+        stream: &mut Option<H::Stream>,
+        host: &mut H,
+        clock: &StreamClock,
+        failed: &AtomicBool,
     ) {
-        if self.last_poll.elapsed() < FOLLOW_POLL {
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_poll) < FOLLOW_POLL {
             return;
         }
-        self.last_poll = Instant::now();
-        let target = match device::default_monitor_source() {
-            Ok(target) => target,
+        self.last_poll = now;
+        self.follow(now, stream, host, clock, failed);
+    }
+
+    /// When the default output changed, or the stream failed (`failed`, set
+    /// by its error callback) or is gone, move to the default's monitor. The
+    /// old stream's feed is retired and the stream dropped first, so where
+    /// its audio ended is final when the new stream is spliced on. A switch
+    /// that fails leaves no stream and is tried again at the next poll; the
+    /// fill then covers the whole outage.
+    fn follow<H: FollowHost>(
+        &mut self,
+        now: Instant,
+        stream: &mut Option<H::Stream>,
+        host: &mut H,
+        clock: &StreamClock,
+        failed: &AtomicBool,
+    ) {
+        if failed.swap(false, Ordering::AcqRel) {
+            self.broken = true;
+            self.reconnect_owed = true;
+        }
+        let reconnect = self.reconnect_owed
+            && self
+                .last_reconnect
+                .is_none_or(|at| now.saturating_duration_since(at) >= RECONNECT_EVERY);
+        if reconnect {
+            self.reconnect_owed = false;
+            self.last_reconnect = Some(now);
+        }
+        let target = match host.default_monitor(reconnect) {
+            Ok(target) => {
+                if let Some(lasted) = self.lookup_outage.ended(now) {
+                    info!(
+                        "the default output can be read again ({target}), after {} s",
+                        lasted.as_secs()
+                    );
+                }
+                target
+            }
             Err(e) => {
-                debug!("could not read the default output: {e:#}");
+                if self.lookup_outage.first(now) {
+                    warn!(
+                        "could not read the default output: {e:#}; the system audio keeps \
+                         its source until it can"
+                    );
+                } else {
+                    debug!("could not read the default output: {e:#}");
+                }
                 return;
             }
         };
-        let failed = hooks.failed.swap(false, Ordering::AcqRel);
-        if target == self.current && !failed && stream.is_some() {
+        if target == self.current && !self.broken && stream.is_some() {
             return;
         }
-        if target != self.current {
-            info!(
+        let what = if target != self.current {
+            format!(
                 "the default output changed: recording the system audio from {target} \
                  instead of {}",
                 self.current
-            );
+            )
         } else {
-            info!("reopening the system audio from {target}");
+            format!("reopening the system audio from {target}")
+        };
+        if self.open_outage.active() {
+            debug!("{what}");
+        } else {
+            info!("{what}");
         }
         self.retire();
         if let Some(old) = stream.take() {
             drop(old);
-            self.resume_at = hooks.clock.audio_end().or(self.resume_at);
-            hooks.clock.reset();
+            self.resume_at = clock.audio_end().or(self.resume_at);
+            clock.reset();
         }
-        let resume_at = self.resume_at.unwrap_or_else(Instant::now);
-        match open_input(
-            &target,
-            tx,
-            &None,
-            hooks,
-            CaptureMode::Strict,
-            Some(resume_at),
-        ) {
-            Ok((opened, _, _, feed)) => {
+        match host.open(&target, self.resume_at) {
+            Ok((opened, feed)) => {
                 *stream = Some(opened);
                 self.feed = Some(feed);
+                self.broken = false;
+                if let Some(lasted) = self.open_outage.ended(now) {
+                    info!(
+                        "recording the system audio from {target} again, after {} s",
+                        lasted.as_secs()
+                    );
+                }
                 self.current = target;
             }
-            Err(e) => warn!("could not record the system audio from {target}: {e:#}; retrying"),
+            Err(e) => {
+                if self.open_outage.warn_due(now) {
+                    warn!(
+                        "could not record the system audio from {target}: {e:#}; retrying \
+                         every {} s",
+                        FOLLOW_POLL.as_secs()
+                    );
+                } else {
+                    debug!("could not record the system audio from {target}: {e:#}");
+                }
+            }
         }
     }
 }
@@ -631,12 +882,7 @@ fn setup_and_run(
     let started = Instant::now();
     let mut watchdog_armed = true;
     let mut stream = Some(stream);
-    let mut follower = follow.then(|| Follower {
-        current: device_name.trim().to_string(),
-        last_poll: Instant::now(),
-        resume_at: None,
-        feed: Some(feed),
-    });
+    let mut follower = follow.then(|| Follower::new(device_name.trim(), feed, Instant::now()));
     while !stop_signal.load(Ordering::Acquire) {
         std::thread::sleep(std::time::Duration::from_millis(50));
         if watchdog_armed && started.elapsed() >= FIRST_CHUNK_TIMEOUT {
@@ -646,7 +892,12 @@ fn setup_and_run(
             }
         }
         if let Some(follower) = follower.as_mut() {
-            follower.poll(&mut stream, &tx, &hooks);
+            follower.pump();
+            let mut host = PulseFollowHost {
+                tx: &tx,
+                hooks: &hooks,
+            };
+            follower.poll(&mut stream, &mut host, &hooks.clock, &hooks.failed);
         }
     }
 
@@ -877,13 +1128,6 @@ mod tests {
         assert_eq!(gap_fill(t0, t0), 0);
         // The new audio began before the old one ended: nothing to fill.
         assert_eq!(gap_fill(t0 + 100 * MS, t0), 0);
-        let zeros = silence(40_000);
-        assert_eq!(
-            zeros.iter().map(Vec::len).collect::<Vec<_>>(),
-            [16_000, 16_000, 8000]
-        );
-        assert!(zeros.iter().flatten().all(|&s| s == 0));
-        assert!(silence(0).is_empty());
     }
 
     /// The old stream's end comes from its least delayed recent chunk, not
@@ -913,9 +1157,9 @@ mod tests {
         assert_eq!(early.audio_end(), Some(early.base + 50 * MS));
     }
 
-    /// Feed `chunks` 100 ms chunks arriving at `arrivals` (ms after `t0`)
-    /// to `splice`; what it let out once it had [`SPLICE_HOLD`].
-    fn splice_out(splice: &mut Splice, t0: Instant, arrivals: &[u32]) -> Vec<AudioChunk> {
+    /// Feed 100 ms chunks arriving at `arrivals` (ms after `t0`) to
+    /// `splice`; the zeros and chunks it let out once it had [`SPLICE_HOLD`].
+    fn splice_out(splice: &mut Splice, t0: Instant, arrivals: &[u32]) -> (usize, Vec<AudioChunk>) {
         let mut out = None;
         for (i, &at) in arrivals.iter().enumerate() {
             assert!(out.is_none(), "let out before the hold was full");
@@ -933,10 +1177,9 @@ mod tests {
         // Steady: the new audio began 250 ms after the old ended, each chunk
         // arriving 30 ms after its audio, like the old stream's.
         let mut steady = Splice::new(t0 + 30 * MS);
-        let out = splice_out(&mut steady, t0, &[380, 480, 580, 680, 780, 880]);
-        let zeros: usize = out.iter().take_while(|c| c[0] == 0).map(Vec::len).sum();
+        let (zeros, out) = splice_out(&mut steady, t0, &[380, 480, 580, 680, 780, 880]);
         assert_eq!(zeros, 4000, "250 ms");
-        let audio: Vec<i16> = out.iter().skip(1).map(|c| c[0]).collect();
+        let audio: Vec<i16> = out.iter().map(|c| c[0]).collect();
         assert_eq!(audio, [1, 2, 3, 4, 5, 6], "every chunk, in order");
 
         // Burst: the audio began 50 ms after the old ended, and its first
@@ -944,9 +1187,82 @@ mod tests {
         // chunk alone it would begin 200 ms later than it did; the third
         // chunk and the steady ones after it show where it began.
         let mut burst = Splice::new(t0 + 30 * MS);
-        let out = splice_out(&mut burst, t0, &[380, 381, 382, 480, 580, 680]);
-        let zeros: usize = out.iter().filter(|c| c[0] == 0).map(Vec::len).sum();
+        let (zeros, _) = splice_out(&mut burst, t0, &[380, 381, 382, 480, 580, 680]);
         assert_eq!(zeros, 800, "50 ms, not 250 ms");
+    }
+
+    /// Everything a channel holds right now.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<AudioChunk>) -> Vec<AudioChunk> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// A splice that lets go after an outage sends no zeros from the
+    /// callback: the capture thread pumps them a few blocks at a time, the
+    /// chunks that arrive meanwhile wait behind them, and the track comes
+    /// out exact.
+    #[test]
+    fn the_zeros_are_sent_by_the_capture_thread_not_the_callback() {
+        let clock = StreamClock::new();
+        let t0 = clock.base;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // The old audio ended at t0; the new stream's began 25 s later and
+        // its chunks arrive on time.
+        let mut feed = Feed::new(tx, Some(Splice::new(t0)));
+        for k in 1..=6u64 {
+            let at = t0 + Duration::from_millis(25_000 + 100 * k);
+            feed.send_marked(vec![k as i16; 1600], at, &clock);
+        }
+        // The callback that filled the hold sent nothing: 25 s of zeros wait.
+        assert!(drain(&mut rx).is_empty(), "zeros sent from the callback");
+        let gap = feed.gap.as_ref().expect("the zeros are pending");
+        assert_eq!(gap.zeros, 25 * 16_000);
+        // A callback meanwhile queues behind them.
+        feed.send_marked(vec![7; 1600], t0 + 25_700 * MS, &clock);
+        assert!(drain(&mut rx).is_empty());
+
+        feed.pump(GAP_BLOCKS_PER_PUMP);
+        let first = drain(&mut rx);
+        assert_eq!(first.len(), GAP_BLOCKS_PER_PUMP, "a few blocks per turn");
+        assert!(first
+            .iter()
+            .all(|c| c.len() == 16_000 && c.iter().all(|&s| s == 0)));
+        let mut track: Vec<i16> = first.concat();
+        while feed.gap.is_some() {
+            feed.pump(GAP_BLOCKS_PER_PUMP);
+            track.extend(drain(&mut rx).concat());
+        }
+        // Then straight through again.
+        feed.send_marked(vec![8; 1600], t0 + 25_800 * MS, &clock);
+        track.extend(drain(&mut rx).concat());
+
+        let first_new = track.iter().position(|&s| s != 0).unwrap();
+        assert_eq!(first_new, 25 * 16_000, "25 s into the track");
+        let order: Vec<i16> = track[first_new..].chunks(1600).map(|c| c[0]).collect();
+        assert_eq!(order, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(track.len(), 25 * 16_000 + 8 * 1600);
+    }
+
+    /// A retired feed sends a gap the pump had not finished, and what is
+    /// queued behind it, at once: a stop right after a switch keeps it all.
+    #[test]
+    fn retiring_sends_a_pending_gap_whole() {
+        let clock = StreamClock::new();
+        let t0 = clock.base;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut feed = Feed::new(tx, Some(Splice::new(t0)));
+        for k in 1..=6u64 {
+            feed.send_marked(
+                vec![1; 1600],
+                t0 + Duration::from_millis(30_000 + 100 * k),
+                &clock,
+            );
+        }
+        feed.pump(1);
+        feed.retire();
+        let track = drain(&mut rx).concat();
+        assert_eq!(track.len(), 30 * 16_000 + 6 * 1600);
+        assert_eq!(track.iter().position(|&s| s != 0), Some(30 * 16_000));
+        assert!(feed.gap.is_none());
     }
 
     /// A retired feed lets out what it held, behind its zeros (a stop right
@@ -1007,6 +1323,255 @@ mod tests {
         assert_eq!(first_new, 3400 * 16);
         assert!(track[3000 * 16..first_new].iter().all(|&s| s == 0));
         assert_eq!(track.len(), (3400 + 500) * 16);
+    }
+
+    /// What happened to the stand-in streams, in order.
+    type Log = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A stand-in stream that notes, when dropped, whether its feed was
+    /// retired first.
+    struct FakeStream {
+        monitor: String,
+        feed: SharedFeed,
+        log: Log,
+    }
+
+    impl Drop for FakeStream {
+        fn drop(&mut self) {
+            let retired = lock_feed(&self.feed).retired;
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("drop {} retired={retired}", self.monitor));
+        }
+    }
+
+    /// A stand-in sound server: answers the default lookup with `default`
+    /// and records every lookup's `reconnect` and every open.
+    struct FakeHost {
+        default: Result<String, String>,
+        open_fails: bool,
+        reconnects: Vec<bool>,
+        opened: Vec<(String, Option<Instant>)>,
+        log: Log,
+        tx: mpsc::UnboundedSender<AudioChunk>,
+    }
+
+    impl FakeHost {
+        fn new(default: &str) -> Self {
+            Self {
+                default: Ok(default.to_string()),
+                open_fails: false,
+                reconnects: Vec::new(),
+                opened: Vec::new(),
+                log: Log::default(),
+                tx: mpsc::unbounded_channel().0,
+            }
+        }
+
+        fn drops(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl FollowHost for FakeHost {
+        type Stream = FakeStream;
+
+        fn default_monitor(&mut self, reconnect: bool) -> anyhow::Result<String> {
+            self.reconnects.push(reconnect);
+            self.default.clone().map_err(|e| anyhow::anyhow!(e))
+        }
+
+        fn open(
+            &mut self,
+            monitor: &str,
+            resume_at: Option<Instant>,
+        ) -> anyhow::Result<(FakeStream, SharedFeed)> {
+            self.opened.push((monitor.to_string(), resume_at));
+            if self.open_fails {
+                anyhow::bail!("device busy");
+            }
+            let feed: SharedFeed = Arc::new(std::sync::Mutex::new(Feed::new(
+                self.tx.clone(),
+                resume_at.map(Splice::new),
+            )));
+            let stream = FakeStream {
+                monitor: monitor.to_string(),
+                feed: Arc::clone(&feed),
+                log: Arc::clone(&self.log),
+            };
+            Ok((stream, feed))
+        }
+    }
+
+    /// A follower recording `monitor`, as `setup_and_run` starts one.
+    fn following(
+        host: &mut FakeHost,
+        monitor: &str,
+        now: Instant,
+    ) -> (Follower, Option<FakeStream>) {
+        let (stream, feed) = host.open(monitor, None).unwrap();
+        host.opened.clear();
+        (Follower::new(monitor, feed, now), Some(stream))
+    }
+
+    const SEC: Duration = Duration::from_secs(1);
+
+    /// It moves when the default output changes or the stream failed, never
+    /// otherwise; the old stream's feed is retired before the stream is
+    /// dropped, and the new one is spliced on where the old audio ended.
+    #[test]
+    fn the_follower_moves_when_the_default_changes_or_the_stream_fails() {
+        let clock = StreamClock::new();
+        let t0 = clock.base;
+        let failed = AtomicBool::new(false);
+        let mut host = FakeHost::new("a.monitor");
+        let (mut follower, mut stream) = following(&mut host, "a.monitor", t0);
+        clock.mark(t0 + 130 * MS, 1600);
+        let ended = clock.audio_end().unwrap();
+
+        // Same default, healthy stream: nothing to do.
+        follower.follow(t0 + 2 * SEC, &mut stream, &mut host, &clock, &failed);
+        assert!(host.opened.is_empty());
+        assert!(host.drops().is_empty());
+
+        // A new default: retire, drop, open it behind the old audio.
+        host.default = Ok("b.monitor".into());
+        follower.follow(t0 + 4 * SEC, &mut stream, &mut host, &clock, &failed);
+        assert_eq!(host.drops(), ["drop a.monitor retired=true"]);
+        assert_eq!(host.opened, [("b.monitor".to_string(), Some(ended))]);
+        assert_eq!(follower.current, "b.monitor");
+        assert_eq!(clock.audio_end(), None, "the clock starts over");
+
+        // The same default with a failed stream: reopen it.
+        clock.mark(t0 + 5 * SEC, 1600);
+        let ended = clock.audio_end().unwrap();
+        failed.store(true, Ordering::Release);
+        follower.follow(t0 + 6 * SEC, &mut stream, &mut host, &clock, &failed);
+        assert_eq!(host.drops()[1], "drop b.monitor retired=true");
+        assert_eq!(host.opened[1], ("b.monitor".to_string(), Some(ended)));
+        assert!(!failed.load(Ordering::Acquire));
+        follower.follow(t0 + 8 * SEC, &mut stream, &mut host, &clock, &failed);
+        assert_eq!(host.opened.len(), 2, "and then it is left alone");
+    }
+
+    /// A switch that fails leaves no stream and is tried again at every
+    /// poll, each time behind where the last audio ended, never behind the
+    /// moment of the retry.
+    #[test]
+    fn a_failed_switch_keeps_where_the_audio_ended() {
+        let clock = StreamClock::new();
+        let t0 = clock.base;
+        let failed = AtomicBool::new(false);
+        let mut host = FakeHost::new("b.monitor");
+        let (mut follower, mut stream) = following(&mut host, "a.monitor", t0);
+        clock.mark(t0 + 100 * MS, 1600);
+        let ended = clock.audio_end().unwrap();
+        host.open_fails = true;
+        for k in 1..=3 {
+            follower.follow(t0 + k * 2 * SEC, &mut stream, &mut host, &clock, &failed);
+            assert!(stream.is_none());
+            assert_eq!(follower.current, "a.monitor");
+        }
+        host.open_fails = false;
+        follower.follow(t0 + 8 * SEC, &mut stream, &mut host, &clock, &failed);
+        assert!(stream.is_some());
+        assert_eq!(follower.current, "b.monitor");
+        assert_eq!(host.opened.len(), 4);
+        assert!(
+            host.opened
+                .iter()
+                .all(|(m, at)| m == "b.monitor" && *at == Some(ended)),
+            "{:?}",
+            host.opened
+        );
+        assert_eq!(
+            host.drops(),
+            ["drop a.monitor retired=true"],
+            "dropped once"
+        );
+    }
+
+    /// "No default output" from a healthy connection never replaces it:
+    /// every replacement leaks the old connection's thread and socket. Only
+    /// a failed stream (a restarted server fails it) earns one, at most one
+    /// a minute.
+    #[test]
+    fn no_default_output_never_reconnects_a_healthy_connection() {
+        let clock = StreamClock::new();
+        let t0 = clock.base;
+        let failed = AtomicBool::new(false);
+        let mut host = FakeHost::new("a.monitor");
+        let (mut follower, mut stream) = following(&mut host, "a.monitor", t0);
+        host.default = Err("the PulseAudio server reports no default output device".into());
+
+        for k in 1..=100 {
+            follower.follow(t0 + k * 2 * SEC, &mut stream, &mut host, &clock, &failed);
+        }
+        assert_eq!(host.reconnects.len(), 100);
+        assert!(
+            host.reconnects.iter().all(|r| !r),
+            "reconnected on \"no default\""
+        );
+        assert!(stream.is_some(), "the stream is left alone");
+
+        // The stream fails: one reconnect, then none while the answer stays.
+        host.reconnects.clear();
+        failed.store(true, Ordering::Release);
+        for k in 101..=130 {
+            follower.follow(t0 + k * 2 * SEC, &mut stream, &mut host, &clock, &failed);
+        }
+        assert!(host.reconnects[0]);
+        assert!(host.reconnects[1..].iter().all(|r| !r));
+
+        // Another failure within the minute waits for it.
+        host.reconnects.clear();
+        let last = t0 + 202 * SEC;
+        failed.store(true, Ordering::Release);
+        follower.follow(last + 2 * SEC, &mut stream, &mut host, &clock, &failed);
+        follower.follow(last + 30 * SEC, &mut stream, &mut host, &clock, &failed);
+        follower.follow(last + 60 * SEC, &mut stream, &mut host, &clock, &failed);
+        follower.follow(last + 62 * SEC, &mut stream, &mut host, &clock, &failed);
+        assert_eq!(host.reconnects, [false, false, true, false]);
+        assert!(host.opened.is_empty());
+    }
+
+    /// A first stream that delivered nothing and failed: the next one starts
+    /// the track (no splice), as the first would have, instead of being
+    /// held and placed behind the moment of the reopen.
+    #[test]
+    fn a_reopen_with_no_audio_yet_starts_the_track() {
+        let clock = StreamClock::new();
+        let t0 = clock.base;
+        let failed = AtomicBool::new(true);
+        let mut host = FakeHost::new("a.monitor");
+        let (mut follower, mut stream) = following(&mut host, "a.monitor", t0);
+        follower.follow(t0 + 2 * SEC, &mut stream, &mut host, &clock, &failed);
+        assert_eq!(host.opened, [("a.monitor".to_string(), None)]);
+        assert!(lock_feed(follower.feed.as_ref().unwrap()).splice.is_none());
+    }
+
+    /// A failure that repeats at every poll: WARN at its first, then once a
+    /// minute; "first" only once per outage; the end reports how long.
+    #[test]
+    fn an_outage_is_logged_once_a_minute() {
+        let t0 = Instant::now();
+        let mut outage = Outage::default();
+        let warned: Vec<bool> = (0..=70)
+            .step_by(2)
+            .map(|s| outage.warn_due(t0 + s * SEC))
+            .collect();
+        assert_eq!(warned.iter().filter(|w| **w).count(), 2, "{warned:?}");
+        assert!(warned[0] && warned[30], "at 0 s and 60 s");
+        assert_eq!(outage.ended(t0 + 70 * SEC), Some(70 * SEC));
+        assert_eq!(outage.ended(t0 + 72 * SEC), None);
+
+        let mut lookup = Outage::default();
+        assert!(lookup.first(t0));
+        assert!((1..100).all(|s| !lookup.first(t0 + s * SEC)));
+        assert!(lookup.active());
+        lookup.ended(t0 + 100 * SEC);
+        assert!(lookup.first(t0 + 102 * SEC), "a new outage");
     }
 
     #[test]

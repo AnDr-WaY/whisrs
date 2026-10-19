@@ -91,13 +91,35 @@ impl std::error::Error for NetworkUnavailable {}
 pub fn is_transport_error(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
-        .any(|e| {
-            e.is_connect()
-                || e.is_timeout()
-                || e.is_request()
-                || e.is_body()
-                || (e.is_decode() && broke_off(e))
-        })
+        .any(is_transport)
+}
+
+fn is_transport(e: &reqwest::Error) -> bool {
+    e.is_connect()
+        || e.is_timeout()
+        || e.is_request()
+        || e.is_body()
+        || (e.is_decode() && broke_off(e))
+}
+
+/// The error of a request to a server the user runs (the `asr-sidecar`,
+/// usually on this machine). Only a failed connect stays a transport error
+/// ([`is_transport_error`]), so a recording waits for a server that is not
+/// running (yet). A connection that broke after the request went out means
+/// the server died handling it (out of memory, a crash in the model), and
+/// the same audio would take it down again: that is final, like the
+/// sidecar's HTTP 500, and no longer carries the reqwest error a retry
+/// layer would act on. The cloud backends post to fixed hosts and keep
+/// [`is_transport_error`] as it is.
+pub fn local_server_error(err: reqwest::Error, server: &str) -> anyhow::Error {
+    if err.is_connect() || !is_transport(&err) {
+        return err.into();
+    }
+    anyhow::anyhow!(
+        "{server} closed the connection while handling the request, so it likely crashed \
+         on this audio; not sent again: {:#}",
+        anyhow::Error::from(err)
+    )
 }
 
 /// Whether a reqwest decode error is the answer breaking off, an I/O error
