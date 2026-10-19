@@ -290,10 +290,48 @@ fn fill_gaps(labels: &mut [Option<String>]) {
     }
 }
 
+/// Whether text token `token` is word `word`, case and punctuation aside.
+fn same_word(token: &str, word: &str) -> bool {
+    let bare = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    bare(token) == bare(word)
+}
+
+/// The voice holding most of `words`' time, the earliest of a tie.
+fn main_voice(words: &[Word]) -> Option<String> {
+    let mut time: Vec<(&str, u64)> = Vec::new();
+    for word in words {
+        let Some(voice) = word.speaker.as_deref() else {
+            continue;
+        };
+        let length = word.end_ms.saturating_sub(word.start_ms);
+        match time.iter_mut().find(|(v, _)| *v == voice) {
+            Some((_, total)) => *total += length,
+            None => time.push((voice, length)),
+        }
+    }
+    let mut best: Option<(&str, u64)> = None;
+    for (voice, total) in time {
+        if best.is_none_or(|(_, most)| total > most) {
+            best = Some((voice, total));
+        }
+    }
+    best.map(|(voice, _)| voice.to_string())
+}
+
 /// `seg` with each part labelled by its voice: split where its words change
 /// voice, each part keeping its words. The parts keep the backend's
-/// punctuated text when it has one token per word, else they join the
-/// words' own text ([`join_words`]). A segment without word timings (local
+/// punctuated text when its tokens are the words, in order (case and
+/// punctuation aside), else they join the words' own text ([`join_words`])
+/// when that gives the text back. Otherwise the text holds something no
+/// word covers (Groq and OpenAI give a segment the words whose midpoint is
+/// in it, so a word at its edge can be in its text and in no word list):
+/// splitting would lose it, so the segment stays whole, with the voice that
+/// holds most of its words' time. A segment without word timings (local
 /// whisper) takes the segment's own label: the backend's, or the turn it
 /// overlaps most. Labels are dropped with [`Labels::None`].
 pub fn split_segment(mut seg: Segment, labels: Labels<'_>) -> Vec<Segment> {
@@ -329,7 +367,18 @@ pub fn split_segment(mut seg: Segment, labels: Labels<'_>) -> Vec<Segment> {
         return vec![seg];
     }
     let tokens: Vec<&str> = seg.text.split_whitespace().collect();
-    let keep_tokens = tokens.len() == words.len();
+    let keep_tokens = tokens.len() == words.len()
+        && tokens
+            .iter()
+            .zip(&words)
+            .all(|(token, word)| same_word(token, &word.text));
+    if !keep_tokens
+        && join_words(&seg.text, words.iter().map(|w| w.text.as_str())) != seg.text.trim()
+    {
+        seg.speaker = main_voice(&words);
+        seg.words = Some(words);
+        return vec![seg];
+    }
     let mut at = 0;
     groups
         .into_iter()
@@ -621,6 +670,36 @@ mod tests {
             .map(|s| s.text)
             .collect();
         assert_eq!(texts, ["ok so,", "yes"]);
+    }
+
+    /// A token no word covers would be lost by a split (Groq and OpenAI
+    /// can leave a segment's edge word out of its word list), so the
+    /// segment stays whole, with the voice of most of its words' time;
+    /// tokens that are not the words, in order, are not split by either.
+    #[test]
+    fn a_segment_with_a_token_no_word_covers_stays_whole() {
+        let mut s = seg(0, 4000, "How are you doing today?", None);
+        s.words = Some(vec![
+            word(0, 400, "How", Some("A")),
+            word(400, 900, "are", Some("A")),
+            word(2000, 2300, "you", Some("B")),
+            word(2300, 3900, "doing", Some("B")),
+        ]);
+        let out = split_segment(s, Labels::Backend);
+        assert_eq!(
+            lines(&out),
+            [(0, 4000, "How are you doing today?", Some("B"))]
+        );
+        assert_eq!(out[0].words.as_ref().unwrap().len(), 4, "the words stay");
+
+        // As many tokens as words, but not the same ones.
+        let mut s = seg(0, 2000, "Hello there", None);
+        s.words = Some(vec![
+            word(0, 900, "yellow", Some("A")),
+            word(1000, 2000, "where", Some("B")),
+        ]);
+        let out = split_segment(s, Labels::Backend);
+        assert_eq!(lines(&out), [(0, 2000, "Hello there", Some("B"))]);
     }
 
     /// A word without a label stays with its neighbours; a segment

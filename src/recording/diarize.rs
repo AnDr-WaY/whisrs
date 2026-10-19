@@ -147,7 +147,10 @@ impl DiarizationSidecar {
         if num_speakers > 0 {
             form = form.text("num_speakers", num_speakers.to_string());
         }
+        // Without the URL, which can hold a token: the error reaches
+        // recording.json, the transcript's notes and a notification.
         let error = |e: reqwest::Error| -> anyhow::Error {
+            let e = e.without_url();
             if e.is_timeout() {
                 anyhow::anyhow!(
                     "the diarization sidecar gave no answer within {} s",
@@ -393,6 +396,27 @@ mod tests {
         let server = tokio::spawn(async move { crash_after_request(&listener).await });
         let err = sidecar.diarize(wav(1), 0).await.unwrap_err();
         assert!(format!("{err:#}").contains("likely crashed"), "{err:#}");
+        server.await.unwrap();
+    }
+
+    /// The sidecar's URL, which can hold a token, stays out of its errors:
+    /// they reach recording.json, the transcript and a notification. A
+    /// crash on the request is the error that would carry it.
+    #[tokio::test]
+    async fn errors_leave_the_url_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/diarize?token=s3cret",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move { crash_after_request(&listener).await });
+        let err = DiarizationSidecar::new(&url, QUICK)
+            .diarize(wav(1), 0)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("likely crashed"), "{err:#}");
+        assert!(!format!("{err:#}").contains("s3cret"), "{err:#}");
+        assert!(!format!("{err:?}").contains("s3cret"), "{err:?}");
         server.await.unwrap();
     }
 

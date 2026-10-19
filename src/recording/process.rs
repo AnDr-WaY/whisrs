@@ -38,6 +38,7 @@ use super::{llm_names, naming};
 use super::{RecordingMeta, RecordingState, Segment, TrackKind, TranscriptSegment};
 use crate::audio::wav::encode_wav;
 use crate::replacements::Replacer;
+use crate::transcription::deepgram::refused_diarization;
 use crate::transcription::factory::{
     backend_identity, canonical_backend_name, create_backend_named, recording_backend_name,
     recording_model_label, recording_transcription_config,
@@ -213,6 +214,14 @@ async fn process_with_timing(
     // A note from an earlier attempt goes; this attempt adds its own.
     meta.errors
         .retain(|note| !note.starts_with(speakers::SEPARATION_FAILED));
+    for track in &transcribed {
+        if let Some(why) = &track.speech.refused {
+            meta.errors.push(speakers::separation_note(&format!(
+                "Deepgram refused speaker separation on the {} track, so it went without: {why}",
+                track.kind.file_stem()
+            )));
+        }
+    }
     let mut plan = plan;
     if let Method::Sidecar { url, .. } = &plan.method {
         let sidecar = DiarizationSidecar::new(url, sidecar_timing);
@@ -275,6 +284,9 @@ async fn process_with_timing(
             before - mic.len()
         );
     }
+    // Told apart is what a voice was found for, not what was asked: a
+    // mic-only recording, or a backend that labelled nobody, is "off".
+    let separated = mic.iter().chain(&system).any(|s| s.speaker.is_some());
 
     let has = |kind| meta.tracks.iter().any(|t| t.kind == kind);
     let user = user_name(&RecordingConfig::effective(config));
@@ -291,7 +303,11 @@ async fn process_with_timing(
     meta.segments = merge_channels(mic, system);
     let claims = llm_names::claims(config, &mut meta, &user, llm_names::LLM_TIMEOUT).await;
     naming::name_speakers(&mut meta, &user, &claims);
-    meta.diarization = Some(plan.method.label().to_string());
+    meta.diarization = Some(if separated {
+        plan.method.label().to_string()
+    } else {
+        Method::Off.label().to_string()
+    });
     meta.backend = Some(name);
     meta.model = Some(model);
     meta.status = RecordingState::Done;
@@ -346,6 +362,9 @@ struct TrackSpeech {
     segments: Vec<Segment>,
     /// The sample ranges of the track that were sent.
     regions: Vec<Range<usize>>,
+    /// Why the track went without the speakers it asked for: Deepgram
+    /// refused them ([`refused_diarization`]).
+    refused: Option<String>,
 }
 
 /// The turns of each voice in a track, from the diarization sidecar, on the
@@ -410,9 +429,12 @@ fn finish_track(
 ) -> Vec<Segment> {
     let shift = |ms: u64| (offset_ms + ms as i64).max(0) as u64;
     raw.into_iter()
+        // On the whole segment: a piece of it can be a short phrase the
+        // prompt holds without the segment being an echo.
+        .filter(|seg| !filters.is_prompt_echo(&seg.text))
         .flat_map(|seg| speakers::split_segment(seg, labels))
         .filter_map(|seg| {
-            let text = filters.apply(&seg.text)?;
+            let text = filters.clean(&seg.text)?;
             Some(Segment {
                 start_ms: shift(seg.start_ms),
                 end_ms: shift(seg.end_ms),
@@ -598,17 +620,25 @@ struct SegmentFilters {
 }
 
 impl SegmentFilters {
-    /// The cleaned text to keep, or `None` to drop the segment.
-    fn apply(&self, text: &str) -> Option<String> {
+    /// Whether `text` is the prompt echoed back, which drops the segment.
+    fn is_prompt_echo(&self, text: &str) -> bool {
+        let text = text.trim();
+        let echo = self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| !text.is_empty() && is_prompt_echo(text, prompt));
+        if echo {
+            debug!("dropping recording segment as a prompt echo: {text:?}");
+        }
+        echo
+    }
+
+    /// The text to keep with filler words removed and the replacements
+    /// made, or `None` when nothing is left.
+    fn clean(&self, text: &str) -> Option<String> {
         let text = text.trim();
         if text.is_empty() {
             return None;
-        }
-        if let Some(prompt) = &self.prompt {
-            if is_prompt_echo(text, prompt) {
-                debug!("dropping recording segment as a prompt echo: {text:?}");
-                return None;
-            }
         }
         let text = match &self.filler {
             Some(filter) => filter.apply(text),
@@ -818,6 +848,7 @@ async fn transcribe_track(
         return Ok(TrackSpeech {
             segments: Vec::new(),
             regions,
+            refused: None,
         });
     }
     let chunks = speech::pack(
@@ -839,6 +870,9 @@ async fn transcribe_track(
 
     let several = chunks.len() > 1;
     let mut out = Vec::new();
+    // Once Deepgram refused the track's speakers, the rest goes without.
+    let mut plain: Option<TranscriptionConfig> = None;
+    let mut refused = None;
     for (index, map) in chunks.into_iter().enumerate() {
         let raw = match cache.load(job.kind, &map) {
             Some(segments) => {
@@ -856,9 +890,27 @@ async fn transcribe_track(
                 };
                 let wav = encode_wav(&chunk)?;
                 drop(chunk);
-                let transcript = transcribe_with_retry(backend, &wav, tcfg).await?;
-                if let Err(e) = cache.store(job.kind, &map, &transcript.segments) {
-                    warn!("could not cache a transcribed chunk: {e:#}");
+                let request = plain.as_ref().unwrap_or(tcfg);
+                let transcript = match transcribe_with_retry(backend, &wav, request).await {
+                    // Speakers are never worth the transcript: the chunk goes
+                    // again without them.
+                    Err(e) if plain.is_none() && tcfg.diarize && refused_diarization(&e) => {
+                        warn!("{stem} track: Deepgram refused speaker separation: {e:#}");
+                        let mut without = tcfg.clone();
+                        without.diarize = false;
+                        let transcript = transcribe_with_retry(backend, &wav, &without).await?;
+                        refused = Some(format!("{e:#}"));
+                        plain = Some(without);
+                        transcript
+                    }
+                    result => result?,
+                };
+                // A chunk without the speakers it was to have is not cached
+                // as one with them, so a retry asks again.
+                if plain.is_none() {
+                    if let Err(e) = cache.store(job.kind, &map, &transcript.segments) {
+                        warn!("could not cache a transcribed chunk: {e:#}");
+                    }
                 }
                 transcript.segments
             }
@@ -881,6 +933,7 @@ async fn transcribe_track(
     Ok(TrackSpeech {
         segments: out,
         regions,
+        refused,
     })
 }
 
@@ -2751,6 +2804,138 @@ mod tests {
         assert!(md.contains("**[00:00:09] Omar:** good morning"), "{md}");
     }
 
+    /// A backend asked for speakers that labels nobody, or a recording
+    /// whose only track is not told apart, says it was not separated.
+    #[tokio::test]
+    async fn diarization_is_off_when_no_voice_was_found() {
+        let config = speaker_config("diarization = \"backend\"\n");
+        let (tmp, _) = call();
+        let backend = FakeBackend::new(&[(3000, "hi all"), (5000, "hello there")], None);
+        let meta = process_recording(
+            tmp.path(),
+            &config,
+            Some(backend as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.diarization.as_deref(), Some("off"));
+        assert_eq!(
+            speaker_names(&meta),
+            [("me", "Tester"), ("others", "Others")]
+        );
+
+        // The mic alone, not shared: nothing to tell apart.
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(track(5.0, &[(1.0, 1.0, 3000)])))]);
+        let meta = run_labelled(tmp.path(), call_voices(), &config).await;
+        assert_eq!(meta.diarization.as_deref(), Some("off"));
+        // With voices found, the method used.
+        let (tmp, _) = call();
+        let meta = run_labelled(tmp.path(), call_voices(), &config).await;
+        assert_eq!(meta.diarization.as_deref(), Some("asr-sidecar"));
+    }
+
+    /// Deepgram refusing speakers (a 400 about diarization) costs only the
+    /// speakers: the chunk goes again without them, the rest of the track
+    /// too, and the transcript says why.
+    #[tokio::test]
+    async fn a_refused_diarization_keeps_the_transcript() {
+        let (tmp, _) = deepgram_call();
+        let refused = r#"{"err_code":"Bad Request","err_msg":"diarize_model is not available for this project"}"#;
+        let (backend, server) = fake_deepgram(vec![
+            (200, DEEPGRAM_MIC),
+            (400, refused),
+            (200, DEEPGRAM_MIC),
+        ])
+        .await;
+        let meta = process_recording(tmp.path(), &deepgram_config(""), Some(backend))
+            .await
+            .unwrap();
+        let requests = served(server).await;
+        let line = |i: usize| requests[i].head.lines().next().unwrap().to_string();
+        assert!(line(1).contains("&diarize_model=latest"), "{}", line(1));
+        assert!(!line(2).contains("diarize"), "{}", line(2));
+        assert_eq!(meta.status, RecordingState::Done);
+        assert_eq!(
+            speaker_lines(&meta),
+            [("me", "Hi all."), ("others", "Hi all.")]
+        );
+        assert_eq!(meta.diarization.as_deref(), Some("off"));
+        let why = speakers::separation_failure(&meta).expect("a note");
+        assert!(
+            why.starts_with("Deepgram refused speaker separation on the system track")
+                && why.contains("diarize_model is not available"),
+            "{why}"
+        );
+        // A 400 about anything else still fails the recording.
+        let (tmp, _) = deepgram_call();
+        let (backend, server) = fake_deepgram(vec![
+            (200, DEEPGRAM_MIC),
+            (
+                400,
+                r#"{"err_code":"Bad Request","err_msg":"corrupt audio"}"#,
+            ),
+        ])
+        .await;
+        let err = process_recording(tmp.path(), &deepgram_config(""), Some(backend))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("corrupt audio"), "{err:#}");
+        served(server).await;
+    }
+
+    /// A line split between two voices is checked for a prompt echo
+    /// whole: the second voice's "Kubernetes." is in the vocabulary, but
+    /// the line is not an echo of it. A whole echo still goes.
+    #[test]
+    fn a_split_line_is_checked_for_a_prompt_echo_whole() {
+        let filters = SegmentFilters {
+            prompt: Some("Kubernetes, Terraform".into()),
+            filler: None,
+            replacer: None,
+        };
+        let words = [
+            ("Which", 0, 300, "A"),
+            ("one", 300, 500, "A"),
+            ("do", 500, 700, "A"),
+            ("you", 700, 900, "A"),
+            ("use?", 900, 1200, "A"),
+            ("Kubernetes.", 1500, 2500, "B"),
+        ]
+        .map(|(text, start_ms, end_ms, voice)| crate::recording::Word {
+            start_ms,
+            end_ms,
+            text: text.into(),
+            speaker: Some(voice.into()),
+        });
+        let line = Segment {
+            start_ms: 0,
+            end_ms: 2500,
+            text: "Which one do you use? Kubernetes.".into(),
+            speaker: None,
+            words: Some(words.to_vec()),
+        };
+        let out = finish_track(vec![line], Labels::Backend, &filters, 0);
+        let texts: Vec<(&str, Option<&str>)> = out
+            .iter()
+            .map(|s| (s.text.as_str(), s.speaker.as_deref()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ("Which one do you use?", Some("A")),
+                ("Kubernetes.", Some("B"))
+            ]
+        );
+        let echo = Segment {
+            start_ms: 3000,
+            end_ms: 4000,
+            text: "Kubernetes, Terraform".into(),
+            speaker: Some("A".into()),
+            words: None,
+        };
+        assert!(finish_track(vec![echo], Labels::Backend, &filters, 0).is_empty());
+    }
+
     /// A call where the first remote voice says its name.
     fn introduced_voices() -> Labelled {
         Labelled {
@@ -2857,6 +3042,11 @@ mod tests {
             meta.errors[0].starts_with(llm_names::NAMING_FAILED)
                 && meta.errors[0].contains("failed to reach the LLM API"),
             "{:?}",
+            meta.errors
+        );
+        assert!(
+            !meta.errors[0].contains("/v1/chat/completions"),
+            "the URL stays out: {:?}",
             meta.errors
         );
         let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();

@@ -592,12 +592,14 @@ unless its voices are told apart (see "Speakers" below).
 first speak: the transcript shows them as "Speaker 1", "Speaker 2" and so on,
 and `recording.json` lists them under `speakers` with their ids (`S1`, `S2`,
 ...), how long each one talks (`talk_ms`) and the method used
-(`diarization`). Nothing is guessed: when the system audio holds a single
-voice, it keeps the others label ("Others", or the name given with
-`--others`). A voice with less than 5 seconds of talk and under 2 % of its
-track is marked `minor` in `recording.json`, and its lines stay in the
-transcript. Speech the voices could not be matched to stays under the others
-label.
+(`diarization`, `off` when no voice was found). Nothing is guessed: when the
+system audio holds a single voice, it keeps the others label ("Others", or
+the name given with `--others`). A voice with less than 5 seconds of talk
+and under 2 % of its track is marked `minor` in `recording.json`, and its
+lines stay in the transcript; it does not count as a second voice, so a
+single main voice keeps the others label beside minor ones shown as
+"Speaker N". Speech the voices could not be matched to stays under the
+others label.
 
 `diarization = "backend"` takes the speakers the transcription backend labels:
 Deepgram (`diarize_model=latest`, sent only with the recording's own
@@ -610,7 +612,10 @@ other backend. `"off"` always keeps one speaker per track. Deepgram includes spe
 pre-recorded price, but not with its Whisper models: with one of those as
 `[deepgram] model`, each track stays one speaker. A backend labels voices
 per request, so a track sent as several chunks has its voices told apart per
-chunk, and the same person in two chunks becomes two speakers. With Deepgram
+chunk, and the same person in two chunks becomes two speakers. If Deepgram
+refuses speaker separation (an HTTP 400 about diarization, for a project
+that cannot have it), the track is sent again without it: the transcript is
+written with one speaker for that track, and its notes say why. With Deepgram
 a chunk holds an hour of speech: over an hour of speech on one track,
 speakers are separated per hour. For `asr-sidecar` a chunk is 10 minutes.
 
@@ -618,7 +623,8 @@ In an in-person meeting where several people share your mic, set
 `shared_mic = true`, or pass `--shared-mic` to `start`, `toggle` or `retry`
 (`--shared-mic=false` turns it off for one recording). The mic's voices are
 then told apart too (`M1`, `M2`, ...), and the mic is you only when it holds
-a single voice. A recording keeps the `shared_mic` it started with; a retry
+a single voice. With several, mic speech no voice was matched to is shown
+as "Mic". A recording keeps the `shared_mic` it started with; a retry
 given the option replaces it.
 
 **Naming the speakers.** A voice gets a name only when whisrs can tell who

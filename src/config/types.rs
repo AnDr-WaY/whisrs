@@ -2345,13 +2345,26 @@ impl Config {
         if recording.diarization == DiarizationMode::Backend {
             if let Ok(backend) = crate::transcription::factory::recording_backend_name(self) {
                 if crate::recording::speakers::backend_speakers(&backend, self).is_none() {
-                    warnings.push(ConfigWarning {
-                        message: format!(
+                    let deepgram = matches!(
+                        crate::transcription::factory::canonical_backend_name(&backend),
+                        "deepgram" | "deepgram-streaming"
+                    );
+                    let message = if deepgram {
+                        format!(
+                            "[recording] diarization = \"backend\", but [deepgram] model = \
+                             \"{}\" is one of Deepgram's Whisper models, which do not tell \
+                             voices apart, so each track stays one speaker. Use a Nova model, \
+                             or remove the key.",
+                            self.deepgram_model()
+                        )
+                    } else {
+                        format!(
                             "[recording] diarization = \"backend\", but the {backend} backend \
                              does not tell voices apart, so each track stays one speaker. Use \
                              a backend that does, or remove the key."
-                        ),
-                    });
+                        )
+                    };
+                    warnings.push(ConfigWarning { message });
                 }
             }
         }
@@ -5371,6 +5384,19 @@ mod tests {
         assert!(recording_warnings(&config)
             .iter()
             .all(|w| !w.contains("voices apart")));
+
+        // With Deepgram, only its Whisper models cannot, and the warning
+        // says the model is why.
+        let mut config = validatable_config("deepgram");
+        config.recording = recording_config(|r| r.diarization = DiarizationMode::Backend);
+        assert!(recording_warnings(&config).is_empty(), "nova-3");
+        config.deepgram.as_mut().unwrap().model = "whisper-large".into();
+        let warnings = recording_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("model = \"whisper-large\" is one of Deepgram's Whisper models"),
+            "{warnings:?}"
+        );
 
         // `auto` and `off` never warn.
         for mode in [DiarizationMode::Auto, DiarizationMode::Off] {

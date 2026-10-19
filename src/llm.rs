@@ -467,6 +467,9 @@ async fn chat_with_key(
         .json(&request)
         .send()
         .await
+        // Without the URL, which some endpoints carry a key in: the error
+        // reaches recording.json when the LLM names speakers.
+        .map_err(reqwest::Error::without_url)
         .context("failed to reach the LLM API; check your internet connection")?;
 
     let status = response.status();

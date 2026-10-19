@@ -225,6 +225,16 @@ pub fn supports_diarization(model: &str) -> bool {
     !model.starts_with("whisper")
 }
 
+/// Whether `err` is Deepgram refusing a request for its speakers: a 400
+/// whose message is about diarization (an account or model that cannot
+/// have it). The same audio goes through without them.
+pub fn refused_diarization(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let text = cause.to_string();
+        text.starts_with("Deepgram API error (400") && text.to_lowercase().contains("diariz")
+    })
+}
+
 /// The diarization model a recording asks for (`diarize_model`): the newest
 /// batch diarizer (v2 since 2026-05-13).
 pub const DIARIZE_MODEL: &str = "latest";

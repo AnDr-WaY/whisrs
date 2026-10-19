@@ -334,7 +334,8 @@ pub fn sweep_retention(root: &Path, days: i64, now: DateTime<Local>) -> Vec<Path
                 continue;
             }
         }
-        // A done recording has no cache left; this is for completeness.
+        // What a done recording keeps there: a diarization sidecar's voices,
+        // which go with the audio.
         let cache = dir.join(CACHE_DIR);
         match fs::remove_dir_all(&cache) {
             Ok(()) => {}
