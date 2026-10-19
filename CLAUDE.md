@@ -297,6 +297,7 @@ Environment variable overrides:
 ```fish
 cargo fmt                                      # fix formatting
 cargo clippy --all-targets -- -D warnings      # lint (must pass clean)
+cargo clippy --all-targets --no-default-features --features tray,overlay,hooks -- -D warnings   # the build without mcp (CI runs it)
 cargo test                                     # all tests must pass
 cargo build                                    # must compile
 ```

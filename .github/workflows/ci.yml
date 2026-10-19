@@ -34,6 +34,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # No release row builds without `mcp` (the minimal build has it), so
+      # this keeps the `whisrs mcp` stub of such a build compiling.
+      - name: Clippy without mcp
+        run: cargo clippy --all-targets --no-default-features --features tray,overlay,hooks -- -D warnings
+
       - name: Test
         run: cargo test
 
