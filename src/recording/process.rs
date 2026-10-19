@@ -10,7 +10,8 @@
 //! onto the recording timeline. Mic segments that still echo the system
 //! track are dropped, the voices become speakers, the two channels are
 //! merged, and the speakers are named ([`super::naming`]). The result lands
-//! in `recording.json` and `<id>.md`.
+//! in `recording.json` and `<id>.md`. With `[recording] summary`, the
+//! summary is made last ([`super::summary`]), once the transcript is safe.
 
 use std::ffi::CStr;
 use std::fs;
@@ -34,7 +35,7 @@ use super::speakers::{self, Labels, Method, Turn};
 use super::speech::{self, TimeMap};
 use super::split::frame_len;
 use super::store::{self, CACHE_DIR};
-use super::{llm_names, naming};
+use super::{llm_names, naming, summary};
 use super::{RecordingMeta, RecordingState, Segment, TrackKind, TranscriptSegment};
 use crate::audio::wav::encode_wav;
 use crate::replacements::Replacer;
@@ -318,14 +319,34 @@ async fn process_with_timing(
     meta.error = None;
     meta.network_wait = None;
 
-    write_private(
-        &store::transcript_path(dir, &meta.id),
-        render_markdown(&meta).as_bytes(),
-    )?;
-    store::write_meta(dir, &meta)?;
+    save(dir, &meta)?;
     // One folder holds both tracks' chunks.
     mic_request.cache.clear();
+
+    // The summary goes last, with the transcript already written: its
+    // failure is noted and leaves the recording done. A retry without
+    // `summary` keeps the summary it had.
+    if RecordingConfig::effective(config).summary {
+        if summary::apply(config, &mut meta, summary::SUMMARY_TIMEOUT)
+            .await
+            .is_ok()
+        {
+            info!("recording {}: summarized", meta.id);
+        }
+        if let Err(e) = save(dir, &meta) {
+            warn!("recording {}: failed to write the summary: {e:#}", meta.id);
+        }
+    }
     Ok(meta)
+}
+
+/// Write the transcript of `meta` (`<id>.md`), then `recording.json`.
+pub(crate) fn save(dir: &Path, meta: &RecordingMeta) -> anyhow::Result<()> {
+    write_private(
+        &store::transcript_path(dir, &meta.id),
+        render_markdown(meta).as_bytes(),
+    )?;
+    store::write_meta(dir, meta)
 }
 
 /// Give a track with no stored language (a recording made before languages
@@ -1461,6 +1482,126 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Sixty words, more than a summary needs.
+    const LONG_SPEECH: &str = "one two three four five six seven eight nine ten \
+        one two three four five six seven eight nine ten one two three four five six seven \
+        eight nine ten one two three four five six seven eight nine ten one two three four \
+        five six seven eight nine ten one two three four five six seven eight nine ten";
+
+    fn summary_config(url: &str, summary: bool) -> Config {
+        toml::from_str(&format!(
+            "[general]\nbackend = \"groq\"\n[recording]\nuser_name = \"Tester\"\n\
+             summary = {summary}\n[llm]\napi_key = \"k\"\nmodel = \"m\"\napi_url = \"{url}\"\n"
+        ))
+        .unwrap()
+    }
+
+    fn one_speech_recording() -> tempfile::TempDir {
+        recording(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]).0
+    }
+
+    /// With `summary`, the summary is made after the transcript and lands
+    /// in both files with the LLM's title; a retry makes a new one only
+    /// when `summary` is on, and keeps the old one when it is off.
+    #[tokio::test]
+    async fn the_summary_comes_last_and_a_retry_follows_the_config() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(crate::transcription::test_server::serve_responses(
+            listener,
+            vec![
+                (
+                    200,
+                    r#"{"choices":[{"message":{"role":"assistant","content":
+                       "{\"title\": \"Counting to ten\", \"summary\": \"First.\"}"}}]}"#,
+                ),
+                (
+                    200,
+                    r#"{"choices":[{"message":{"role":"assistant","content":
+                       "{\"title\": \"Counting again\", \"summary\": \"Second.\"}"}}]}"#,
+                ),
+            ],
+        ));
+        let backend = FakeBackend::new(&[(3000, LONG_SPEECH)], None);
+        let tmp = one_speech_recording();
+        let process = |summary: bool| {
+            let config = summary_config(&url, summary);
+            let backend = Arc::clone(&backend) as Arc<dyn TranscriptionBackend>;
+            let dir = tmp.path().to_path_buf();
+            async move {
+                process_recording(&dir, &config, Some(backend))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let meta = process(true).await;
+        assert_eq!(meta.status, RecordingState::Done);
+        assert_eq!(meta.summary.as_deref(), Some("First."));
+        assert_eq!(meta.title.as_deref(), Some("Counting to ten"));
+        assert_eq!(meta.title_source(), crate::recording::TitleSource::Llm);
+        assert_eq!(store::read_meta(tmp.path()).unwrap(), meta, "persisted");
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(md.contains("title: \"Counting to ten\"\n"), "{md}");
+        assert!(
+            md.contains(
+                "---\n\n## Summary\n\nFirst.\n\n## Transcript\n\n**[00:00:01] Tester:** one two"
+            ),
+            "{md}"
+        );
+
+        let meta = process(false).await;
+        assert_eq!(meta.summary.as_deref(), Some("First."), "kept, not asked");
+        let meta = process(true).await;
+        assert_eq!(meta.summary.as_deref(), Some("Second."));
+        assert_eq!(meta.title.as_deref(), Some("Counting again"));
+        assert_eq!(server.await.unwrap().len(), 2);
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            3,
+            "transcribed each time"
+        );
+    }
+
+    /// A summary that fails is noted and leaves the transcript done.
+    #[tokio::test]
+    async fn a_failed_summary_keeps_the_transcript_done() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        drop(listener);
+        let tmp = one_speech_recording();
+        let meta = process_recording(
+            tmp.path(),
+            &summary_config(&url, true),
+            Some(FakeBackend::new(&[(3000, LONG_SPEECH)], None) as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, RecordingState::Done);
+        assert_eq!(meta.summary, None);
+        assert_eq!(meta.errors.len(), 1, "{:?}", meta.errors);
+        assert!(
+            meta.errors[0].starts_with(summary::SUMMARY_FAILED)
+                && meta.errors[0].contains("failed to reach the LLM API"),
+            "{:?}",
+            meta.errors
+        );
+        assert_eq!(store::read_meta(tmp.path()).unwrap(), meta);
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(!md.contains("## Summary"), "{md}");
+        assert!(md.contains("**[00:00:01] Tester:** one two"), "{md}");
+        assert!(
+            md.contains("## Notes\n\n- the summary was not made: "),
+            "{md}"
+        );
     }
 
     #[tokio::test]

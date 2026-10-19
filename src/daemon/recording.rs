@@ -31,6 +31,7 @@ use whisrs::recording::recorder::{
     SILENCE_WARN_AFTER,
 };
 use whisrs::recording::speakers::separation_failure;
+use whisrs::recording::summary::{self, SUMMARY_FAILED, SUMMARY_TIMEOUT};
 use whisrs::recording::wav_repair::repair_wav;
 use whisrs::recording::{
     store, EndReason, NetworkWait, RecordingAction, RecordingMeta, RecordingOptions,
@@ -199,6 +200,17 @@ pub(crate) fn refuse_while_recording(
     Some(error_response(message))
 }
 
+/// What the processing worker does with a queued recording.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Job {
+    /// Transcribe it ([`process_recording`]).
+    #[default]
+    Transcribe,
+    /// Summarize its transcript (`whisrs recording summarize`), without
+    /// transcribing it again.
+    Summarize,
+}
+
 /// A recording that is capturing, processing, queued or waiting for the
 /// network, as shown in status.
 #[derive(Debug, Clone, PartialEq)]
@@ -210,6 +222,7 @@ pub(crate) struct ActiveRecording {
     /// Queued or processed as an automatic retry of a recording waiting for
     /// the network: it does not count towards [`MAX_ATTEMPTS`].
     network_retry: bool,
+    job: Job,
 }
 
 impl ActiveRecording {
@@ -220,6 +233,7 @@ impl ActiveRecording {
             started_at: meta.started_at,
             dir: dir.to_path_buf(),
             network_retry: false,
+            job: Job::Transcribe,
         }
     }
 }
@@ -260,6 +274,8 @@ impl RecordingView {
             dir: active.map(|a| a.dir.clone()),
             queued: self.queued.iter().map(|q| q.id.clone()).collect(),
             waiting: self.waiting.iter().map(|w| w.id.clone()).collect(),
+            summarizing: phase == RecordingPhase::Processing
+                && active.is_some_and(|a| a.job == Job::Summarize),
         }
     }
 
@@ -479,7 +495,7 @@ impl RecordingRuntime {
         }
         if view.is_pending(&recording.id) {
             bail!(
-                "recording {} is already queued for transcription",
+                "recording {} is already queued, being transcribed or being summarized",
                 recording.id
             );
         }
@@ -664,6 +680,7 @@ pub(crate) async fn handle_recording(
         RecordingAction::Retry => retry(&context, id.as_deref().unwrap_or("last"), &options).await,
         RecordingAction::Copy => copy(&context, id.as_deref().unwrap_or("last")).await,
         RecordingAction::Name => name(&context, id.as_deref().unwrap_or("last"), &options).await,
+        RecordingAction::Summarize => summarize(&context, id.as_deref().unwrap_or("last")).await,
     };
     match result {
         Ok(()) => recording_response(&context),
@@ -1488,8 +1505,8 @@ async fn name(context: &Arc<DaemonContext>, query: &str, options: &RecordingOpti
     whisrs::recording::naming::ensure_transcribed(&meta)?;
     if context.recording.hold(&meta.id).is_err() {
         bail!(
-            "recording {} is queued or being transcribed: name its speakers once its \
-             transcript is ready",
+            "recording {} is queued, being transcribed or being summarized: name its \
+             speakers once that is done",
             meta.id
         );
     }
@@ -1509,6 +1526,27 @@ async fn name(context: &Arc<DaemonContext>, query: &str, options: &RecordingOpti
         renamed.id,
         speaker.map_or("", |s| s.name.as_str())
     );
+    Ok(())
+}
+
+/// Queue a transcribed recording for a summary (`whisrs recording
+/// summarize`), whatever `[recording] summary` says. It goes through the
+/// processing queue, so it never runs beside a transcription, and a
+/// recording that is queued, being processed or held is refused. One
+/// without a transcript, or a config without an `[llm]`, is refused before
+/// anything is queued.
+async fn summarize(context: &Arc<DaemonContext>, query: &str) -> Result<()> {
+    let root = recordings_root(&context.config);
+    let dir = store::resolve(&root, query)?;
+    let meta = store::read_meta(&dir)?;
+    summary::ensure_summarizable(&meta, &context.config)?;
+    let active = ActiveRecording {
+        job: Job::Summarize,
+        ..ActiveRecording::from_meta(&dir, &meta)
+    };
+    context.recording.reserve(&active)?;
+    context.recording.dispatch(active)?;
+    info!("recording {} queued for a summary", meta.id);
     Ok(())
 }
 
@@ -1557,10 +1595,16 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
     let id = recording.id.clone();
     let dir = recording.dir.clone();
     let network_retry = recording.network_retry;
+    let job = recording.job;
     context.recording.update(|v| {
         v.queued.retain(|q| q.id != id);
         v.processing = Some(recording);
     });
+    if job == Job::Summarize {
+        summarize_one(context, &dir, &id).await;
+        context.recording.update(|v| v.processing = None);
+        return;
+    }
 
     // Counted before the attempt, so one that takes the daemon down with it
     // still counts towards [`MAX_ATTEMPTS`] at the next start. A graceful
@@ -1595,7 +1639,8 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
         Ok(meta) => {
             let md = store::transcript_path(&dir, &meta.id);
             info!("recording {id} transcript ready: {}", md.display());
-            notify(context, &ready_message(&md, &meta));
+            let summary_on = RecordingConfig::effective(&context.config).summary;
+            notify(context, &ready_message(&md, &meta, summary_on));
         }
         Err(e) if is_network_unavailable(&e) => {
             wait_for_network(context, &dir, &id, &format!("{e:#}")).await
@@ -1619,21 +1664,70 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
     sweep(context).await;
 }
 
+/// Summarize the recording in `dir` for `whisrs recording summarize`
+/// ([`summary::summarize_recording`]) and notify how it went. A panic is
+/// caught like one in processing, and the recording stays as it was.
+async fn summarize_one(context: &Arc<DaemonContext>, dir: &Path, id: &str) {
+    let result = AssertUnwindSafe(summary::summarize_recording(
+        dir,
+        &context.config,
+        SUMMARY_TIMEOUT,
+    ))
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|panic| {
+        Err(anyhow::anyhow!(
+            "the summary crashed: {}",
+            panic_message(&*panic)
+        ))
+    });
+    let why = match result {
+        Ok((meta, Ok(()))) => {
+            let md = store::transcript_path(dir, &meta.id);
+            info!("recording {id} summary ready: {}", md.display());
+            notify(
+                context,
+                &format!("Recording summary ready: {}", md.display()),
+            );
+            return;
+        }
+        Ok((_, Err(note))) => note
+            .strip_prefix(SUMMARY_FAILED)
+            .unwrap_or(&note)
+            .to_string(),
+        Err(e) => {
+            error!("recording {id} summary failed: {e:#}");
+            format!("{e:#}")
+        }
+    };
+    notify(
+        context,
+        &format!(
+            "Recording summary failed: {}",
+            truncate_preview(&why, NOTIFY_ERROR_MAX)
+        ),
+    );
+}
+
 /// The notification for a finished transcript at `md`. When its voices
 /// could not be told apart it says so and why: the transcript is fine, but
 /// not what speaker separation promised, and this is the one place the
 /// user hears of it (`recording.json` and the transcript's notes keep it).
-fn ready_message(md: &Path, meta: &RecordingMeta) -> String {
+/// With `summary_on`, a summary that could not be made is mentioned too.
+fn ready_message(md: &Path, meta: &RecordingMeta, summary_on: bool) -> String {
     let lost = meta
         .errors
         .iter()
         .filter(|note| note.starts_with(USER_NAME_LOST))
         .count();
-    let lost = match lost {
+    let mut lost = match lost {
         0 => String::new(),
         1 => "; 1 speaker name you gave no longer matches a voice".to_string(),
         n => format!("; {n} speaker names you gave no longer match a voice"),
     };
+    if summary_on && meta.errors.iter().any(|n| n.starts_with(SUMMARY_FAILED)) {
+        lost.push_str("; no summary (see its notes)");
+    }
     match separation_failure(meta) {
         Some(why) => format!(
             "Recording transcript ready, without speakers ({}){lost}: {}",
@@ -2192,11 +2286,17 @@ async fn stop_worker(runtime: &RecordingRuntime) {
         id,
         dir,
         network_retry,
+        job,
         ..
     }) = processing
     else {
         return;
     };
+    if job == Job::Summarize {
+        // A summary counts no attempt and leaves the recording done.
+        info!("recording {id}: summary interrupted by shutdown");
+        return;
+    }
     if network_retry {
         // It counted no attempt: put it back to waiting, so the next start
         // retries it as one more automatic attempt rather than an
@@ -2294,6 +2394,7 @@ mod tests {
             started_at: Local::now(),
             dir: PathBuf::from(format!("/m/{id}")),
             network_retry: false,
+            job: Job::Transcribe,
         }
     }
 
@@ -2674,7 +2775,7 @@ mod tests {
         let md = Path::new("/r/m/m.md");
         let mut meta = RecordingMeta::new("m".into(), None, Local::now());
         assert_eq!(
-            ready_message(md, &meta),
+            ready_message(md, &meta, false),
             "Recording transcript ready: /r/m/m.md"
         );
         meta.errors
@@ -2684,7 +2785,7 @@ mod tests {
                 "the diarization sidecar failed on the system track: refused",
             ));
         assert_eq!(
-            ready_message(md, &meta),
+            ready_message(md, &meta, false),
             "Recording transcript ready, without speakers (the diarization sidecar failed on \
              the system track: refused): /r/m/m.md"
         );
@@ -2700,7 +2801,7 @@ mod tests {
             "{USER_NAME_LOST}\"Sarah\" (was S1) matches no voice"
         ));
         assert_eq!(
-            ready_message(md, &meta),
+            ready_message(md, &meta, false),
             "Recording transcript ready; 1 speaker name you gave no longer matches a voice: \
              /r/m/m.md"
         );
@@ -2710,7 +2811,7 @@ mod tests {
         meta.errors
             .push(whisrs::recording::speakers::separation_note("refused"));
         assert_eq!(
-            ready_message(md, &meta),
+            ready_message(md, &meta, false),
             "Recording transcript ready, without speakers (refused); 2 speaker names you gave \
              no longer match a voice: /r/m/m.md"
         );
@@ -2919,7 +3020,7 @@ mod tests {
         context.recording.reserve(&active).unwrap();
         refused(
             name_speaker(&context, "me", "Yo").await,
-            "is queued or being transcribed",
+            "is queued, being transcribed or being summarized",
         );
         context.recording.unreserve(&meta.id);
 
@@ -2992,6 +3093,108 @@ mod tests {
         assert!(
             context.recording.hold(&id).is_ok(),
             "the sweep let go of it"
+        );
+    }
+
+    /// `recording summarize` for the newest recording, as the CLI sends it.
+    async fn summarize_last(context: &Arc<DaemonContext>) -> Response {
+        handle_recording(
+            Arc::clone(context),
+            RecordingAction::Summarize,
+            None,
+            Some("last".into()),
+            RecordingOptions::default(),
+        )
+        .await
+    }
+
+    fn refused(response: Response, want: &str) {
+        let Response::Error { message } = &response else {
+            panic!("accepted: {response:?}");
+        };
+        assert!(message.contains(want), "{want:?} not in {message:?}");
+    }
+
+    /// `recording summarize` goes through the processing queue: shown as
+    /// summarizing, refused while queued (a second summary, a retry, a
+    /// rename), then run by the worker, which rewrites the transcript with
+    /// the summary and transcribes nothing. A recording without a
+    /// transcript, or a config without an `[llm]`, is refused before
+    /// anything is queued.
+    #[tokio::test]
+    async fn summarize_goes_through_the_queue_and_rewrites_the_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crashed_recording(tmp.path());
+        let backend = working_backend();
+        // Nothing listens there: the transcript ("fine") is too short to
+        // be sent, and a request would fail.
+        let (context, mut queue) = test_context_with(
+            tmp.path(),
+            backend.clone(),
+            "[llm]\napi_key = \"k\"\napi_url = \"http://127.0.0.1:1/v1/chat/completions\"\n",
+        );
+        refused(
+            summarize_last(&context).await,
+            "has no transcript yet (status recording)",
+        );
+        recover_on_startup(Arc::clone(&context)).await;
+        process_one(&context, queue.try_recv().unwrap()).await;
+        let calls = backend.calls.load(Ordering::Relaxed);
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Done);
+        assert_eq!(meta.summary, None);
+
+        let response = summarize_last(&context).await;
+        let Response::Recording { recording } = response else {
+            panic!("refused: {response:?}");
+        };
+        assert_eq!(recording.phase, RecordingPhase::Processing);
+        assert!(recording.summarizing, "{recording:?}");
+        assert_eq!(recording.queued, std::slice::from_ref(&meta.id));
+        refused(summarize_last(&context).await, "is already queued");
+        assert!(retry(&context, "last", &RecordingOptions::default())
+            .await
+            .is_err());
+        refused(name_speaker(&context, "me", "Yo").await, "being summarized");
+
+        process_one(&context, queue.try_recv().expect("queued")).await;
+        assert!(queue.try_recv().is_err(), "queued once");
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            calls,
+            "nothing transcribed"
+        );
+        let after = store::read_meta(&dir).unwrap();
+        assert_eq!(after.summary.as_deref(), Some(summary::TOO_SHORT));
+        assert_eq!(after.segments, meta.segments);
+        assert_eq!(after.status, RecordingState::Done);
+        let md = std::fs::read_to_string(store::transcript_path(&dir, &after.id)).unwrap();
+        assert!(
+            md.contains("## Summary\n\nToo short to summarize.\n\n## Transcript\n\n"),
+            "{md}"
+        );
+        assert_eq!(context.recording.status(), RecordingStatus::default());
+
+        let (no_llm, mut queue) = test_context(tmp.path(), working_backend());
+        refused(summarize_last(&no_llm).await, "needs the [llm] section");
+        assert!(queue.try_recv().is_err());
+    }
+
+    /// With `summary` on, a summary that failed is named in the ready
+    /// notification; with it off, an old note is not.
+    #[test]
+    fn the_ready_notification_says_when_the_summary_failed() {
+        let md = Path::new("/r/m/m.md");
+        let mut meta = RecordingMeta::new("m".into(), None, Local::now());
+        meta.errors
+            .push(format!("{SUMMARY_FAILED}LLM API error (500)"));
+        assert_eq!(
+            ready_message(md, &meta, true),
+            "Recording transcript ready; no summary (see its notes): /r/m/m.md"
+        );
+        assert_eq!(
+            ready_message(md, &meta, false),
+            "Recording transcript ready: /r/m/m.md"
         );
     }
 

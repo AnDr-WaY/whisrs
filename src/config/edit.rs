@@ -654,6 +654,11 @@ fn edit_recording(config: &mut Config) -> Result<()> {
         .default(recording.name_speakers)
         .interact()
         .context("failed to read speaker naming")?;
+    recording.summary = Confirm::new()
+        .with_prompt("Summarize each transcript with the [llm] (sends the whole transcript to it)?")
+        .default(recording.summary)
+        .interact()
+        .context("failed to read the summary setting")?;
 
     // Devices.
     let devices = list_input_devices();

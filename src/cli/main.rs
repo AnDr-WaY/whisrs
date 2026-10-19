@@ -265,6 +265,13 @@ enum RecordingCmd {
         #[arg(required = true, num_args = 1..)]
         name: Vec<String>,
     },
+    /// Summarize a transcribed recording with the [llm] now, whatever
+    /// [recording] summary says, and title it when you gave it no title.
+    /// Nothing is transcribed again
+    Summarize {
+        /// Recording id, a unique id prefix, or `last`
+        id: String,
+    },
 }
 
 /// Output format of `whisrs recording show`.
@@ -560,6 +567,7 @@ async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
             Some(id),
             name_options(speaker, &name),
         ),
+        RecordingCmd::Summarize { id } => (RecordingAction::Summarize, None, Some(id), none()),
         RecordingCmd::List { json } => return recording_list(json),
         RecordingCmd::Show { id, format } => return recording_show(&id, format),
         RecordingCmd::Path { id } => {
@@ -585,6 +593,7 @@ async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
             match action {
                 RecordingAction::Copy => println!("Transcript copied to the clipboard."),
                 RecordingAction::Retry => println!("Queued for transcription."),
+                RecordingAction::Summarize => println!("Queued for a summary."),
                 _ => {}
             }
             println!("{}", format_recording_status(&recording, use_color));
@@ -816,6 +825,7 @@ fn format_recording_status(status: &RecordingStatus, use_color: bool) -> String 
     let (word, color) = match status.phase {
         RecordingPhase::Idle => ("Idle", ""),
         RecordingPhase::Recording => ("Recording", GREEN),
+        RecordingPhase::Processing if status.summarizing => ("Summarizing", YELLOW),
         RecordingPhase::Processing => ("Processing", YELLOW),
     };
     let mut line = if use_color {
@@ -1207,7 +1217,11 @@ mod tests {
             }
             _ => panic!("expected retry"),
         }
-        for action in ["show", "path", "copy", "retry"] {
+        match parse_recording(&["summarize", "last"]) {
+            RecordingCmd::Summarize { id } => assert_eq!(id, "last"),
+            _ => panic!("expected summarize"),
+        }
+        for action in ["show", "path", "copy", "retry", "summarize"] {
             let argv = ["whisrs", "recording", action];
             assert!(Cli::try_parse_from(argv).is_err(), "{action} needs an id");
         }
@@ -1300,6 +1314,15 @@ mod tests {
         assert_eq!(
             format_recording_status(&status, false),
             "Processing  id a  (2 queued)"
+        );
+        let summarizing = RecordingStatus {
+            summarizing: true,
+            queued: Vec::new(),
+            ..status
+        };
+        assert_eq!(
+            format_recording_status(&summarizing, false),
+            "Summarizing  id a"
         );
     }
 

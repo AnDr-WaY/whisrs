@@ -16,6 +16,7 @@ pub mod speakers;
 pub mod speech;
 pub mod split;
 pub mod store;
+pub mod summary;
 pub mod wav_repair;
 
 use chrono::{DateTime, Local};
@@ -171,6 +172,9 @@ pub enum RecordingAction {
     Copy,
     /// Name a speaker of a transcribed recording (`whisrs recording name`).
     Name,
+    /// Summarize a transcribed recording now (`whisrs recording summarize`),
+    /// without transcribing it again.
+    Summarize,
 }
 
 /// Daemon-level recording phase, reported over IPC and to the tray.
@@ -202,6 +206,10 @@ pub struct RecordingStatus {
     /// not counting one that is queued or being processed right now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting: Vec<String>,
+    /// The recording shown as processing is being summarized
+    /// ([`RecordingAction::Summarize`]), not transcribed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summarizing: bool,
 }
 
 /// Lifecycle of a single recording, stored as `status` in `recording.json`.
@@ -393,6 +401,20 @@ impl From<SpeakerNameEntry> for SpeakerName {
     }
 }
 
+/// Where a recording's title came from, stored as `title_source` in
+/// `recording.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TitleSource {
+    /// Given by the user (`-t`). Never replaced.
+    User,
+    /// None given: the transcript shows a dated default.
+    Default,
+    /// Made by the LLM with the summary ([`summary`]). A later summary may
+    /// replace it.
+    Llm,
+}
+
 /// One line of the final transcript, on the recording timeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptSegment {
@@ -411,6 +433,10 @@ pub struct RecordingMeta {
     pub id: String,
     #[serde(default)]
     pub title: Option<String>,
+    /// Where `title` came from. `None` in a recording made before this was
+    /// stored: see [`Self::title_source`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_source: Option<TitleSource>,
     pub status: RecordingState,
     pub started_at: DateTime<Local>,
     #[serde(default)]
@@ -488,6 +514,22 @@ pub struct RecordingMeta {
     /// manual retry or a finished transcript.
     #[serde(default)]
     pub network_wait: Option<NetworkWait>,
+    /// The summary of the transcript, in Markdown ([`summary`]), or
+    /// [`summary::TOO_SHORT`]. A retry keeps it unless it makes a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// The `[llm]` model that wrote `summary`; `None` when no LLM was asked
+    /// (a transcript too short to summarize).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_model: Option<String>,
+    /// When `summary` was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarized_at: Option<DateTime<Local>>,
+}
+
+/// Whether `text` holds more than whitespace.
+fn has_text(text: Option<&str>) -> bool {
+    text.is_some_and(|t| !t.trim().is_empty())
 }
 
 /// Current `recording.json` schema version.
@@ -499,10 +541,16 @@ pub const SAMPLE_RATE: u32 = 16_000;
 impl RecordingMeta {
     /// A fresh meta for a recording that just started.
     pub fn new(id: String, title: Option<String>, started_at: DateTime<Local>) -> Self {
+        let title_source = if has_text(title.as_deref()) {
+            TitleSource::User
+        } else {
+            TitleSource::Default
+        };
         Self {
             version: META_VERSION,
             id,
             title,
+            title_source: Some(title_source),
             status: RecordingState::Recording,
             started_at,
             ended_at: None,
@@ -526,7 +574,22 @@ impl RecordingMeta {
             audio_deleted: false,
             attempts: 0,
             network_wait: None,
+            summary: None,
+            summary_model: None,
+            summarized_at: None,
         }
+    }
+
+    /// Where the title came from: the stored `title_source`, else (a
+    /// recording made before it was stored, when only `-t` set a title) the
+    /// user's when there is a title.
+    pub fn title_source(&self) -> TitleSource {
+        self.title_source
+            .unwrap_or(if has_text(self.title.as_deref()) {
+                TitleSource::User
+            } else {
+                TitleSource::Default
+            })
     }
 
     /// When a recording waiting for the network gives up:
@@ -664,6 +727,11 @@ mod tests {
             minor: true,
         }];
         meta.model = Some("ggml-large-v3-turbo.bin".into());
+        meta.title = Some("Planning the move".into());
+        meta.title_source = Some(TitleSource::Llm);
+        meta.summary = Some("Moving on Friday.\n\n### Next steps\n- [ ] Book a van".into());
+        meta.summary_model = Some("gpt-4o-mini".into());
+        meta.summarized_at = Some(meta.started_at);
         meta.network_wait = Some(NetworkWait {
             since: meta.started_at,
             attempts: 2,
@@ -694,6 +762,37 @@ mod tests {
         assert_eq!(meta.diarization, None);
         assert!(meta.participants.is_empty());
         assert!(meta.speaker_names.is_empty());
+        assert_eq!(meta.summary, None);
+        assert_eq!(meta.title_source, None);
+        assert_eq!(meta.title_source(), TitleSource::Default);
+    }
+
+    /// A title is the user's when `-t` gave one; an older file without
+    /// `title_source` says so by having a title. A title the LLM made is
+    /// not the user's.
+    #[test]
+    fn the_title_source_follows_the_title() {
+        let now = Local::now();
+        let titled = RecordingMeta::new("m".into(), Some("Standup".into()), now);
+        assert_eq!(titled.title_source, Some(TitleSource::User));
+        let untitled = RecordingMeta::new("m".into(), None, now);
+        assert_eq!(untitled.title_source, Some(TitleSource::Default));
+        let blank = RecordingMeta::new("m".into(), Some("  ".into()), now);
+        assert_eq!(blank.title_source(), TitleSource::Default);
+
+        let old: RecordingMeta = serde_json::from_str(
+            r#"{"version":1,"id":"m","title":"Standup","status":"done",
+                "started_at":"2026-10-02T14:00:00+02:00","sample_rate":16000}"#,
+        )
+        .unwrap();
+        assert_eq!(old.title_source(), TitleSource::User);
+        let mut llm = old.clone();
+        llm.title_source = Some(TitleSource::Llm);
+        assert_eq!(llm.title_source(), TitleSource::Llm);
+        assert_eq!(
+            serde_json::to_string(&TitleSource::Default).unwrap(),
+            r#""default""#
+        );
     }
 
     /// A user's name loads as written before anchors were stored (a plain

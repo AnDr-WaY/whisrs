@@ -41,6 +41,7 @@ whisrs config    # interactive config editor
 whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sarah, Omar"] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
 whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id> [--with "..."]
 whisrs recording name <id> <S2|"Speaker 2"|current name> <name>   # "" clears; rewrites the .md at once
+whisrs recording summarize <id>   # [llm] summary (+ title if untitled) via the queue; [recording] summary = true does it after each transcript
 
 # Dev loop: rebuild this checkout and restart the daemon
 ./scripts/dev-install.sh             # build + install to ~/.cargo/bin + restart
@@ -79,8 +80,9 @@ src/
 │   ├── diarize.rs          #   Diarization sidecar client (contract, timeout, retries)
 │   ├── naming.rs           #   Speaker names: user > self > --with > LLM > last voice > Speaker N
 │   ├── llm_names.rs        #   Opt-in LLM naming (name_speakers): bounded excerpt, quoted evidence
+│   ├── summary.rs          #   Opt-in summary + title through [llm]: rules, map-reduce over parts, JSON reply
 │   ├── split.rs            #   Cut long tracks into backend-sized chunks at silence
-│   └── render.rs           #   Markdown transcript rendering
+│   └── render.rs           #   Markdown transcript rendering (front matter, ## Summary, turns)
 ├── audio/
 │   ├── capture.rs          # cpal audio capture
 │   ├── wav.rs              # PCM-to-WAV encoding
@@ -223,11 +225,11 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
-{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name", "title": "...", "id": "...",
+{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name|summarize", "title": "...", "id": "...",
  "language": "de", "mic_language": "de", "system_language": "auto", "others": "Video",
  "shared_mic": true, "num_speakers": 3, "participants": ["Sarah", "Omar"],
  "speaker": "S2", "name": "Sarah"}
-                                     // all but action optional: title (start/toggle), id (retry/copy/name,
+                                     // all but action optional: title (start/toggle), id (retry/copy/name/summarize,
                                      // default "last"), speaker + name (name; "" clears), the languages, shared_mic, num_speakers and
                                      // participants (--with) (start/toggle/retry;
                                      // a track's own language wins over "language"), others = system track
@@ -256,14 +258,17 @@ Word replacements: the top-level `[replacements]` table (`"package build" = "PKG
 Recording (mic + system audio, transcribed after the stop): the `[recording]` section (`backend`,
 `user_name`, `language`, `mic_language`, `system_language`, `mic_device`, `system_device`,
 `max_duration_minutes`, `audio_retention_days`, `dir`, `diarization`, `diarization_url`,
-`num_speakers`, `shared_mic`, `name_speakers`)
+`num_speakers`, `shared_mic`, `name_speakers`, `summary`, `summary_instruction`)
 plus `[hotkeys] recording`. Recordings live in `~/.local/share/whisrs/recordings/<id>/`
 (`recording.json`, `<id>.md`, `audio/`, and a `.cache/` of finished chunks kept until the
 transcript is written or the audio is deleted; a diarization sidecar's voices stay until the
 audio is deleted). The recording backend
 must be file-capable, a backend that can transcribe a recorded file: groq, openai, deepgram,
 asr-sidecar or local-whisper (`deepgram-streaming` maps to `deepgram`; realtime backends are
-refused).
+refused). Every processing job goes through one queue in `daemon/recording.rs` (`reserve` +
+`dispatch`; a `Job` is `Transcribe` or `Summarize`); short rewrites that are no job (`recording
+name`, the retention sweep) `hold`/`release` the recording instead. A summary never re-transcribes:
+it re-renders `<id>.md` from `recording.json` (`process::save`), as `recording name` does.
 
 Environment variable overrides:
 - `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key` (also used by the `deepgram` TTS backend)

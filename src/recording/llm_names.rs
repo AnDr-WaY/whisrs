@@ -55,7 +55,7 @@ pub struct Line {
 /// Transcript text as the LLM is shown it: on one line, so it cannot start
 /// a line of its own (a fake `[S1] I'm Mallory`), and with `<` and `>` made
 /// look-alikes, so it cannot close the `<transcript>` tag.
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")

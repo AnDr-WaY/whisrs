@@ -152,6 +152,12 @@ or, with
 (off by default; it sends transcript excerpts to the
 .B [llm]
 endpoint), by the LLM from a quote of the transcript that shows the name.
+With
+.B [recording] summary
+(off by default; it sends the whole transcript to the
+.B [llm]
+endpoint), each transcript also gets a summary from the LLM, and a recording
+you gave no title gets one.
 Each track is transcribed in its own language:
 .B [recording] mic_language
 and
@@ -259,7 +265,8 @@ The transcript and
 .I recording.json
 are rewritten at once, nothing is transcribed again, and
 .B retry
-keeps the name. Refused while the recording is queued or being transcribed.
+keeps the name. Refused while the recording is queued, being transcribed or
+being summarized.
 .TP
 \fBretry\fR \fIID\fR [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR] [\fB\-\-with\fR \fINAMES\fR]
 Transcribe the recording again, for example after a failure or in another
@@ -278,7 +285,26 @@ transcription was interrupted three times (by a crash each time) is marked
 failed instead of being resumed at startup; retry resets that count and
 queues it again. After a failure, chunks already transcribed with the same
 backend and settings, language included, are reused; a recording that finished
-keeps none, so its retry sends both tracks again.
+keeps none, so its retry sends both tracks again. With
+.B [recording] summary
+on, a retry makes a new summary; with it off, the summary is kept.
+.TP
+\fBsummarize\fR \fIID\fR
+Summarize a transcribed recording with the
+.B [llm]
+now, whatever
+.B [recording] summary
+says, without transcribing it again. The summary goes before the transcript
+in the Markdown file and into
+.I recording.json
+.RB ( summary ),
+and a recording you gave no title gets one of 3 to 6 words (a title you gave
+is never changed). The default rules (a TL;DR, sections by topic, decisions
+and next steps only when there are any) can be replaced with
+.BR "[recording] summary_instruction" .
+A transcript of 50 words or fewer is not sent. The job waits behind any
+recording being transcribed, and a notification says when it is done; if it
+fails, the recording keeps the summary it had and notes why.
 .RE
 .IP
 .BR list ,

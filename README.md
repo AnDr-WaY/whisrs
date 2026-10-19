@@ -239,6 +239,7 @@ whisrs llm-command-set <name>  # Reprogram a named LLM command from the current 
 whisrs speak     # Read the selected text aloud (alias: whisrs read; press again to stop)
 whisrs recording start -t "Standup"   # Record mic + system audio; stop | toggle | cancel | status
 whisrs recording show last            # Print the latest recording's transcript (list | path | copy | retry)
+whisrs recording summarize last       # Summarize a transcript with the [llm] (or [recording] summary = true for each)
 whisrs log       # Show recent transcription history
 whisrs log -n 5  # Show last 5 entries
 whisrs log --clear  # Clear all history

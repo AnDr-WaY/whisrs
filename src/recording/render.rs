@@ -1,21 +1,22 @@
 //! Rendering a processed recording as Markdown or plain text.
 //!
 //! Markdown is the `<id>.md` written next to `recording.json`: flat YAML front
-//! matter (readable by Obsidian and other note tools) followed by the
-//! transcript as speaker turns. Plain text is what `whisrs recording copy`
+//! matter (readable by Obsidian and other note tools), the summary when the
+//! recording has one, then the transcript as speaker turns. Plain text is what `whisrs recording copy`
 //! puts on the clipboard.
 
 use super::{RecordingMeta, TrackKind};
 
 /// Consecutive segments from one speaker, merged.
-struct Turn<'a> {
-    start_ms: u64,
-    speaker: &'a str,
-    text: String,
+pub(crate) struct Turn<'a> {
+    pub(crate) start_ms: u64,
+    /// A [`super::Speaker::id`].
+    pub(crate) speaker: &'a str,
+    pub(crate) text: String,
 }
 
 /// Merge consecutive same-speaker segments into turns.
-fn turns(meta: &RecordingMeta) -> Vec<Turn<'_>> {
+pub(crate) fn turns(meta: &RecordingMeta) -> Vec<Turn<'_>> {
     let mut out: Vec<Turn<'_>> = Vec::new();
     for seg in &meta.segments {
         let text = seg.text.trim();
@@ -38,7 +39,7 @@ fn turns(meta: &RecordingMeta) -> Vec<Turn<'_>> {
 }
 
 /// Display name for a speaker id, falling back to the id itself.
-fn speaker_name<'a>(meta: &'a RecordingMeta, id: &'a str) -> &'a str {
+pub(crate) fn speaker_name<'a>(meta: &'a RecordingMeta, id: &'a str) -> &'a str {
     meta.speakers
         .iter()
         .find(|s| s.id == id)
@@ -46,7 +47,7 @@ fn speaker_name<'a>(meta: &'a RecordingMeta, id: &'a str) -> &'a str {
 }
 
 /// `HH:MM:SS` for a millisecond offset.
-fn clock(ms: u64) -> String {
+pub(crate) fn clock(ms: u64) -> String {
     let secs = ms / 1000;
     format!(
         "{:02}:{:02}:{:02}",
@@ -78,7 +79,7 @@ fn yaml_str(s: &str) -> String {
 }
 
 /// The recording title, or a dated default.
-fn title(meta: &RecordingMeta) -> String {
+pub(crate) fn title(meta: &RecordingMeta) -> String {
     meta.title
         .as_deref()
         .map(str::trim)
@@ -88,7 +89,7 @@ fn title(meta: &RecordingMeta) -> String {
 }
 
 /// Recording length: `ended_at - started_at`, else the longest track.
-fn duration_ms(meta: &RecordingMeta) -> u64 {
+pub(crate) fn duration_ms(meta: &RecordingMeta) -> u64 {
     if let Some(ended) = meta.ended_at {
         let ms = (ended - meta.started_at).num_milliseconds();
         if ms > 0 {
@@ -166,7 +167,16 @@ pub fn render_markdown(meta: &RecordingMeta) -> String {
         out.push_str(&format!("model: {}\n", yaml_str(model)));
     }
     out.push_str(&language_lines(meta));
-    out.push_str("---\n\n## Transcript\n\n");
+    out.push_str("---\n\n");
+    if let Some(summary) = meta
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str(&format!("## Summary\n\n{summary}\n\n"));
+    }
+    out.push_str("## Transcript\n\n");
 
     let turns = turns(meta);
     if turns.is_empty() {
@@ -295,6 +305,28 @@ mod tests {
             **[00:01:05] Others:** Sounds good.\n\n\
             **[01:01:40] Yosif:** Bye.\n";
         assert_eq!(md, expected);
+    }
+
+    /// A summary goes between the front matter and the transcript; the
+    /// front matter gains nothing but the title.
+    #[test]
+    fn the_summary_comes_before_the_transcript() {
+        let mut m = meta();
+        let without = render_markdown(&m);
+        m.summary =
+            Some("  Quick update, then goodbye.\n\n### Next steps\n- [ ] Yosif: ship it\n".into());
+        let md = render_markdown(&m);
+        assert!(
+            md.contains(
+                "language: \"de\"\n---\n\n## Summary\n\nQuick update, then goodbye.\n\n\
+                 ### Next steps\n- [ ] Yosif: ship it\n\n## Transcript\n\n**[00:00:01] Yosif:**"
+            ),
+            "{md}"
+        );
+        let front = |md: &str| md[..md.find("---\n\n").unwrap()].to_string();
+        assert_eq!(front(&md), front(&without));
+        m.summary = Some("  ".into());
+        assert_eq!(render_markdown(&m), without, "a blank summary is none");
     }
 
     #[test]

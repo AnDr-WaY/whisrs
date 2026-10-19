@@ -36,7 +36,6 @@ use std::path::Path;
 
 use tracing::info;
 
-use super::render::render_markdown;
 use super::speakers::{ME, MIC, MIC_LABEL, OTHERS, SOURCE_CHANNEL, SOURCE_NONE, SOURCE_SELF};
 use super::{
     store, RecordingMeta, RecordingState, Speaker, SpeakerName, TrackKind, TranscriptSegment,
@@ -738,11 +737,7 @@ pub fn rename_speaker(
     let claims = kept_claims(&meta.speakers);
     let user = super::process::user_name(&RecordingConfig::effective(config));
     name_speakers(&mut meta, &user, &claims);
-    super::process::write_private(
-        &store::transcript_path(dir, &meta.id),
-        render_markdown(&meta).as_bytes(),
-    )?;
-    store::write_meta(dir, &meta)?;
+    super::process::save(dir, &meta)?;
     Ok((id, meta))
 }
 

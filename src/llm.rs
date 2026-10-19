@@ -348,7 +348,7 @@ fn is_fence_language_tag(info: &str) -> bool {
 
 /// Strip a code fence that wraps the whole answer, returning `text` unchanged
 /// when the answer isn't a single fenced block.
-fn strip_wrapping_code_fence(text: &str) -> &str {
+pub(crate) fn strip_wrapping_code_fence(text: &str) -> &str {
     let trimmed = text.trim();
     let Some(rest) = trimmed.strip_prefix("```") else {
         return text;

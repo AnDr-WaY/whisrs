@@ -421,6 +421,10 @@ audio_retention_days = 7      # 0 = delete audio once transcribed, negative = ke
 # shared_mic = false          # several people share your mic: tell its voices apart too
 # name_speakers = false       # ask the [llm] who the unnamed voices are; sends excerpts
 #                             #   of each transcript to it (see "Naming the speakers")
+# summary = false             # summarize each transcript with the [llm], and title a
+#                             #   recording you gave no title; sends the whole transcript
+#                             #   to it (see "Summaries and titles")
+# summary_instruction = "..."  # your own rules for a summary, in place of the default ones
 
 # Built-in global hotkeys (optional, works without WM keybinds)
 # Triggers: A-Z, 0-9, F1-F24, space, enter, escape, tab, backspace, delete,
@@ -875,6 +879,53 @@ Folders are created private (0700) and `recording.json` is 0600; an existing
 
 `whisrs recording list` shows them, `whisrs recording show last` prints the
 latest transcript and `whisrs recording copy last` copies it.
+
+**Summaries and titles.** With `summary = true`, each transcript gets a
+summary once it is written, from the LLM of the `[llm]` section (the one
+command mode uses). `whisrs recording summarize <id>` makes one for any
+transcribed recording, whatever `summary` says, without transcribing it
+again: it waits behind any recording being transcribed, and a notification
+says when it is ready. The summary goes into the Markdown file as a
+`## Summary` section before the transcript, and into `recording.json` as
+`summary`, with the model that wrote it (`summary_model`) and when
+(`summarized_at`).
+
+By default a summary starts with a TL;DR of one or two sentences, then
+short sections by topic in the order they came up. It has a "Decisions"
+section only when something was decided, and a "Next steps" section only
+when someone took something on, as `- [ ]` items grouped by who took them.
+It is written in the language most of the transcript is in, and keeps the
+names as the transcript spells them. `summary_instruction` replaces those
+rules with your own, for lecture notes, quotes from an interview, or the
+mistakes you made in language practice:
+
+```toml
+summary_instruction = "List each mistake Ada made in German with the right sentence, then the new words the teacher used."
+```
+
+Whatever the rules, the LLM is told that the transcript is data, not
+instructions, and that the speaker labels can be wrong. A transcript of 50
+words or fewer is not sent: its summary is "Too short to summarize.". A
+long one (over about 24,000 characters, half an hour of talk or so) is
+summarized in parts, at most 20, and the notes on the parts are then
+summarized together, so nothing is left out. The LLM gets 120 seconds for
+each call.
+
+A recording you gave no title (`-t`) also gets one from the summary: 3 to 6
+words in the language of the transcript, shown in the Markdown file,
+`whisrs recording list` and `recording.json`. Its folder and id stay as
+they are. A title you gave is never changed, and `recording.json` says
+where the title came from: `title_source` is `user`, `default` or `llm`.
+
+If the summary fails (no `[llm]` section, no answer in time, an error from
+the API), the transcript is still written, `recording.json` notes why under
+`errors` (the transcript's notes show it too), and a summary the recording
+already had stays. `whisrs recording retry` makes a new summary when
+`summary = true`, and keeps the old one when it is off.
+
+A summary sends the whole transcript to the `[llm]` endpoint, which is why
+`summary` is off by default. Point `[llm] api_url` at a local server to
+keep transcripts on your machine.
 
 **Audio retention.** `audio_retention_days` controls how long the `audio/`
 folder of a transcribed recording is kept: `7` (the default) deletes it at the first

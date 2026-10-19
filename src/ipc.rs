@@ -62,7 +62,8 @@ pub enum Command {
     /// `shared_mic`, `num_speakers`, `participants`) set the languages and
     /// speaker settings of a new recording or a retry and the label of the
     /// system track; a request without them gets the config defaults.
-    /// `name` takes `speaker` and `name` (blank clears it).
+    /// `name` takes `speaker` and `name` (blank clears it); `summarize`
+    /// takes only `id`.
     Recording {
         action: RecordingAction,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -625,6 +626,17 @@ mod tests {
         assert_eq!(back, json);
     }
 
+    /// `summarize` is an action of its own and takes an id.
+    #[test]
+    fn recording_summarize_roundtrip() {
+        let json = r#"{"cmd":"recording","action":"summarize","id":"last"}"#;
+        let Command::Recording { action, id, .. } = serde_json::from_str(json).unwrap() else {
+            panic!("not a recording command");
+        };
+        assert_eq!(action, RecordingAction::Summarize);
+        assert_eq!(id.as_deref(), Some("last"));
+    }
+
     #[test]
     fn recording_response_roundtrip() {
         let status = RecordingStatus {
@@ -635,6 +647,7 @@ mod tests {
             dir: Some(PathBuf::from("/tmp/m")),
             queued: vec!["2026-10-01_0900".to_string()],
             waiting: vec!["2026-09-30_1500".to_string()],
+            summarizing: true,
         };
         let resp = Response::Recording {
             recording: status.clone(),

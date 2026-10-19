@@ -128,6 +128,16 @@ pub struct RecordingConfig {
     /// sends the transcript's words to the LLM.
     #[serde(default)]
     pub name_speakers: bool,
+    /// Summarize each transcript with the `[llm]` once it is written, and
+    /// title a recording that has no title of the user's
+    /// ([`crate::recording::summary`]). Off by default: it sends the whole
+    /// transcript to the LLM. `whisrs recording summarize` works either way.
+    #[serde(default)]
+    pub summary: bool,
+    /// What the summary should look like, in place of the default rules
+    /// ([`crate::recording::summary::DEFAULT_RULES`]). Blank is unset.
+    #[serde(default)]
+    pub summary_instruction: Option<String>,
 }
 
 /// `[recording] diarization`: how the voices of a recording are told apart.
@@ -174,6 +184,8 @@ impl Default for RecordingConfig {
             num_speakers: 0,
             shared_mic: false,
             name_speakers: false,
+            summary: false,
+            summary_instruction: None,
         }
     }
 }
@@ -182,6 +194,16 @@ impl RecordingConfig {
     /// The effective recording config: `[recording]` if present, else defaults.
     pub fn effective(config: &Config) -> RecordingConfig {
         config.recording.clone().unwrap_or_default()
+    }
+
+    /// The rules a summary follows: `summary_instruction`, trimmed, else
+    /// the default ones. Blank is unset.
+    pub fn summary_rules(&self) -> &str {
+        self.summary_instruction
+            .as_deref()
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+            .unwrap_or(crate::recording::summary::DEFAULT_RULES)
     }
 
     /// `diarization_url`, trimmed; blank is unset.
@@ -2375,6 +2397,16 @@ impl Config {
                 message: "[recording] name_speakers = true but there is no [llm] section, so \
                           the LLM names no speakers (each recording notes why). Add [llm] \
                           api_key, model and api_url, as for command mode, or remove the key."
+                    .to_string(),
+            });
+        }
+
+        // So does summarizing them.
+        if recording.summary && self.llm.is_none() {
+            warnings.push(ConfigWarning {
+                message: "[recording] summary = true but there is no [llm] section, so \
+                          recordings get no summary (each one notes why). Add [llm] api_key, \
+                          model and api_url, as for command mode, or remove the key."
                     .to_string(),
             });
         }
@@ -5326,6 +5358,48 @@ mod tests {
         assert!(recording_warnings(&config).is_empty());
         config.llm = None;
         config.recording = recording_config(|r| r.name_speakers = false);
+        assert!(recording_warnings(&config).is_empty());
+    }
+
+    /// `summary` is off by default and a known key, as is
+    /// `summary_instruction`; turned on without an `[llm]` section it warns.
+    /// A blank instruction keeps the default rules.
+    #[test]
+    fn summary_needs_an_llm() {
+        let recording = RecordingConfig::default();
+        assert!(!recording.summary);
+        assert_eq!(
+            recording.summary_rules(),
+            crate::recording::summary::DEFAULT_RULES
+        );
+        let text = "[recording]\nsummary = true\nsummary_instruction = \"  Five bullets.  \"\n";
+        let config: Config = toml::from_str(text).unwrap();
+        let effective = RecordingConfig::effective(&config);
+        assert!(effective.summary);
+        assert_eq!(effective.summary_rules(), "Five bullets.");
+        assert!(unknown_config_keys(text).is_empty());
+        let blank = RecordingConfig {
+            summary_instruction: Some(" \n ".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            blank.summary_rules(),
+            crate::recording::summary::DEFAULT_RULES
+        );
+
+        let mut config = validatable_config("groq");
+        config.recording = recording_config(|r| r.summary = true);
+        config.llm = None;
+        let warnings = recording_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("summary = true but there is no [llm] section"),
+            "{warnings:?}"
+        );
+        config.llm = Some(crate::llm::LlmConfig::default());
+        assert!(recording_warnings(&config).is_empty());
+        config.llm = None;
+        config.recording = recording_config(|r| r.summary = false);
         assert!(recording_warnings(&config).is_empty());
     }
 
