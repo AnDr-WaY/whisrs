@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 
 use whisrs::audio::capture::AudioCaptureHandle;
 use whisrs::audio::device::default_monitor_source;
+use whisrs::recording::naming::USER_NAME_LOST;
 use whisrs::recording::process::process_recording;
 use whisrs::recording::recorder::{
     is_disk_full, spawn_mic_writer, spawn_track_writer, SilenceAlarm, TrackStats,
@@ -470,6 +471,12 @@ impl RecordingRuntime {
     /// or [`Self::unreserve`].
     fn reserve(&self, recording: &ActiveRecording) -> Result<()> {
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if view.held.contains(&recording.id) {
+            bail!(
+                "recording {} is busy (being renamed or cleaned up); try again",
+                recording.id
+            );
+        }
         if view.is_pending(&recording.id) {
             bail!(
                 "recording {} is already queued for transcription",
@@ -1617,13 +1624,23 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
 /// not what speaker separation promised, and this is the one place the
 /// user hears of it (`recording.json` and the transcript's notes keep it).
 fn ready_message(md: &Path, meta: &RecordingMeta) -> String {
+    let lost = meta
+        .errors
+        .iter()
+        .filter(|note| note.starts_with(USER_NAME_LOST))
+        .count();
+    let lost = match lost {
+        0 => String::new(),
+        1 => "; 1 speaker name you gave no longer matches a voice".to_string(),
+        n => format!("; {n} speaker names you gave no longer match a voice"),
+    };
     match separation_failure(meta) {
         Some(why) => format!(
-            "Recording transcript ready, without speakers ({}): {}",
+            "Recording transcript ready, without speakers ({}){lost}: {}",
             truncate_preview(why, NOTIFY_ERROR_MAX),
             md.display()
         ),
-        None => format!("Recording transcript ready: {}", md.display()),
+        None => format!("Recording transcript ready{lost}: {}", md.display()),
     }
 }
 
@@ -2673,6 +2690,32 @@ mod tests {
         );
     }
 
+    /// A user's name that no longer matches a voice is counted in the
+    /// notification, the one place the user hears of it.
+    #[test]
+    fn the_ready_notification_counts_names_that_lost_their_voice() {
+        let md = Path::new("/r/m/m.md");
+        let mut meta = RecordingMeta::new("m".into(), None, Local::now());
+        meta.errors.push(format!(
+            "{USER_NAME_LOST}\"Sarah\" (was S1) matches no voice"
+        ));
+        assert_eq!(
+            ready_message(md, &meta),
+            "Recording transcript ready; 1 speaker name you gave no longer matches a voice: \
+             /r/m/m.md"
+        );
+        meta.errors.push(format!(
+            "{USER_NAME_LOST}\"Omar\" (was S2) matches no voice"
+        ));
+        meta.errors
+            .push(whisrs::recording::speakers::separation_note("refused"));
+        assert_eq!(
+            ready_message(md, &meta),
+            "Recording transcript ready, without speakers (refused); 2 speaker names you gave \
+             no longer match a voice: /r/m/m.md"
+        );
+    }
+
     /// What a start stores: each track's language from the command (its own,
     /// else `language`), else from `[recording]`, and the others label.
     #[test]
@@ -2930,9 +2973,13 @@ mod tests {
             "not shown"
         );
         assert!(context.recording.hold(&id).is_err());
-        assert!(retry(&context, "last", &RecordingOptions::default())
+        let err = retry(&context, "last", &RecordingOptions::default())
             .await
-            .is_err());
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("recording {id} is busy (being renamed or cleaned up); try again")
+        );
         assert!(queue.try_recv().is_err());
         sweep(&context).await;
         assert!(audio.exists(), "the sweep waits for it");

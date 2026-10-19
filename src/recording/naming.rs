@@ -504,31 +504,63 @@ fn anchor_of(segments: &[TranscriptSegment], id: &str) -> Option<VoiceAnchor> {
 /// Give each name the user gave a voice to the voice that first speaks on
 /// its track within [`ANCHOR_TOLERANCE_MS`] of where the named one did,
 /// whatever its id is now: a retry sends the audio again, and the voices
-/// can come back numbered differently. A name that finds no voice is
-/// dropped, and the returned note says so. A name without an anchor (a
-/// track's own speaker, or a name stored before anchors) stays on its id.
+/// can come back numbered differently. Names and voices are matched as a
+/// whole, nearest pairs first, each name and each voice at most once, so
+/// one name taking another's voice cannot push that name onto a stranger.
+/// A name whose track has voices this time but none for it is dropped, and
+/// the returned note says so. A name whose track has no voices told apart
+/// this time (the separation failed, or found one voice) waits, as it is,
+/// for an attempt that has them. A name without an anchor (a track's own
+/// speaker, or a name stored before anchors) stays on its id.
 pub fn rebind_user_names(meta: &mut RecordingMeta) -> Vec<String> {
     let old = std::mem::take(&mut meta.speaker_names);
     let (plain, anchored): (Vec<_>, Vec<_>) = old
         .into_iter()
         .partition(|(_, given)| given.anchor.is_none());
     let mut names: BTreeMap<String, SpeakerName> = plain.into_iter().collect();
-    let mut notes = Vec::new();
-    for (id, given) in anchored {
-        let anchor = given.anchor.expect("partitioned on the anchor");
-        let found = meta
-            .speakers
+    // This attempt's voices, where each first speaks; one a plain name
+    // holds is taken.
+    let voices: Vec<(&str, VoiceAnchor)> = meta
+        .speakers
+        .iter()
+        .filter(|s| voice_track(&s.id).is_some() && !names.contains_key(&s.id))
+        .filter_map(|s| Some((s.id.as_str(), anchor_of(&meta.segments, &s.id)?)))
+        .collect();
+    let anchors: Vec<VoiceAnchor> = anchored
+        .iter()
+        .map(|(_, given)| given.anchor.expect("partitioned on the anchor"))
+        .collect();
+    let mut pairs: Vec<(u64, usize, usize)> = Vec::new();
+    for (n, anchor) in anchors.iter().enumerate() {
+        for (v, (_, at)) in voices.iter().enumerate() {
+            let off = at.first_ms.abs_diff(anchor.first_ms);
+            if at.channel == anchor.channel && off <= ANCHOR_TOLERANCE_MS {
+                pairs.push((off, n, v));
+            }
+        }
+    }
+    pairs.sort_unstable();
+    let mut voice_of: Vec<Option<usize>> = vec![None; anchored.len()];
+    let mut taken = vec![false; voices.len()];
+    for (_, n, v) in pairs {
+        if voice_of[n].is_none() && !taken[v] {
+            voice_of[n] = Some(v);
+            taken[v] = true;
+        }
+    }
+    let told_apart = |channel: TrackKind| {
+        meta.speakers
             .iter()
-            .filter(|s| voice_track(&s.id).is_some() && !names.contains_key(&s.id))
-            .filter_map(|s| {
-                let at = anchor_of(&meta.segments, &s.id)?;
-                let off = at.first_ms.abs_diff(anchor.first_ms);
-                (at.channel == anchor.channel && off <= ANCHOR_TOLERANCE_MS).then_some((s, off))
-            })
-            .min_by_key(|(_, off)| *off);
-        match found {
-            Some((speaker, _)) => {
-                names.insert(speaker.id.clone(), given);
+            .any(|s| voice_track(&s.id) == Some(channel))
+    };
+    let mut notes = Vec::new();
+    for (((id, given), anchor), voice) in anchored.into_iter().zip(anchors).zip(voice_of) {
+        match voice {
+            Some(v) => {
+                names.insert(voices[v].0.to_string(), given);
+            }
+            None if !told_apart(anchor.channel) => {
+                names.entry(id).or_insert(given);
             }
             None => notes.push(format!(
                 "{USER_NAME_LOST}{:?} (was {id}) matches no voice after the speakers were \
@@ -1490,32 +1522,105 @@ mod tests {
             meta.errors
         );
 
-        // More than a second away, or on the other track: no voice.
-        for given in [
-            anchored("Far", 1000 + ANCHOR_TOLERANCE_MS + 1),
-            SpeakerName {
-                name: "Mic".into(),
-                anchor: Some(VoiceAnchor {
-                    channel: TrackKind::Mic,
-                    first_ms: 1000,
-                }),
-            },
-        ] {
-            let mut meta = meta.clone();
-            meta.errors.clear();
-            meta.segments
-                .retain(|s| s.speaker != "S2" && s.speaker != "S3");
-            meta.speakers.truncate(2);
-            meta.speaker_names = BTreeMap::from([("S1".into(), given.clone())]);
-            name_speakers(&mut meta, "Tester", &Claims::new());
-            assert!(meta.speaker_names.is_empty(), "{given:?}");
-            assert_eq!(meta.speakers[1].name, "Others", "{given:?}");
-        }
+        // More than a second away: no voice, dropped.
+        let mut one = meta.clone();
+        one.errors.clear();
+        one.segments
+            .retain(|s| s.speaker != "S2" && s.speaker != "S3");
+        one.speakers.truncate(2);
+        let mut far = one.clone();
+        far.speaker_names =
+            BTreeMap::from([("S1".into(), anchored("Far", 1000 + ANCHOR_TOLERANCE_MS + 1))]);
+        name_speakers(&mut far, "Tester", &Claims::new());
+        assert!(far.speaker_names.is_empty());
+        assert_eq!(far.speakers[1].name, "Others");
+        // On the other track, which has no voices told apart: it waits.
+        let on_the_mic = SpeakerName {
+            name: "Mic".into(),
+            anchor: Some(VoiceAnchor {
+                channel: TrackKind::Mic,
+                first_ms: 1000,
+            }),
+        };
+        let mut mic = one.clone();
+        mic.speaker_names = BTreeMap::from([("M1".into(), on_the_mic.clone())]);
+        name_speakers(&mut mic, "Tester", &Claims::new());
+        assert_eq!(
+            mic.speaker_names,
+            BTreeMap::from([("M1".into(), on_the_mic)])
+        );
+        assert_eq!(mic.speakers[1].name, "Others", "not on the system voice");
+        assert!(mic.errors.is_empty(), "{:?}", mic.errors);
         // A name stored without an anchor stays on its id.
         let mut meta = meta.clone();
         meta.speaker_names = BTreeMap::from([("S1".into(), SpeakerName::plain("Kim"))]);
         name_speakers(&mut meta, "Tester", &Claims::new());
         assert_eq!(meta.speakers[1].name, "Kim");
+    }
+
+    /// Names and voices are matched as a whole, nearest first: Omar's
+    /// voice, now first heard at 2.5 s, is nearer Omar's anchor (2.6 s)
+    /// than Sarah's (2.0 s), so it is Omar's; Sarah's voice is gone, and
+    /// the stranger at 3.4 s is no one's, rather than Omar's.
+    #[test]
+    fn names_and_voices_are_matched_as_a_whole() {
+        let mut meta = RecordingMeta::new("m".into(), None, chrono::Local::now());
+        meta.speakers = vec![
+            speaker(ME, TrackKind::Mic),
+            speaker("S1", TrackKind::System),
+            speaker("S2", TrackKind::System),
+        ];
+        meta.segments = vec![seg(0, ME), seg(2500, "S1"), seg(3400, "S2")];
+        meta.speaker_names = BTreeMap::from([
+            ("S1".into(), anchored("Sarah", 2000)),
+            ("S2".into(), anchored("Omar", 2600)),
+        ]);
+        name_speakers(&mut meta, "Tester", &Claims::new());
+        let names: Vec<(&str, &str)> = meta
+            .speakers
+            .iter()
+            .map(|s| (s.id.as_str(), s.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [("me", "Tester"), ("S1", "Omar"), ("S2", "Speaker 1")]
+        );
+        assert_eq!(
+            meta.speaker_names,
+            BTreeMap::from([("S1".into(), anchored("Omar", 2600))])
+        );
+        assert_eq!(meta.errors.len(), 1, "{:?}", meta.errors);
+        assert!(
+            meta.errors[0].contains("\"Sarah\" (was S1)"),
+            "{:?}",
+            meta.errors
+        );
+    }
+
+    /// When an attempt tells no voices apart on a name's track (the
+    /// sidecar was down, Deepgram refused), the name waits as it is, and
+    /// the next attempt that tells them apart puts it back on its voice.
+    #[test]
+    fn names_wait_while_voices_are_not_told_apart() {
+        let mut meta = RecordingMeta::new("m".into(), None, chrono::Local::now());
+        let names = BTreeMap::from([("S2".to_string(), anchored("Omar", 2000))]);
+        meta.speakers = vec![
+            speaker(ME, TrackKind::Mic),
+            speaker(OTHERS, TrackKind::System),
+        ];
+        meta.segments = vec![seg(0, ME), seg(1000, OTHERS)];
+        meta.speaker_names = names.clone();
+        name_speakers(&mut meta, "Tester", &Claims::new());
+        assert_eq!(meta.speaker_names, names, "kept as it was");
+        assert!(meta.errors.is_empty(), "{:?}", meta.errors);
+        assert_eq!(meta.speakers[1].name, "Others");
+
+        let (speakers, segments) = three_voices();
+        meta.speakers = speakers;
+        meta.segments = segments;
+        name_speakers(&mut meta, "Tester", &Claims::new());
+        assert_eq!(meta.speakers[2].name, "Omar", "back on its voice");
+        assert!(meta.errors.is_empty(), "{:?}", meta.errors);
     }
 
     /// A transcribed recording of three voices and three participants,

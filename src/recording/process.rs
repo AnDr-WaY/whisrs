@@ -3109,6 +3109,47 @@ mod tests {
         );
     }
 
+    /// A retry whose speaker separation fails keeps the names the user
+    /// gave as they are, and the next one that separates puts them back on
+    /// their voices.
+    #[tokio::test]
+    async fn a_failed_separation_keeps_the_users_names() {
+        let (tmp, _) = call();
+        let (url, server) = fake_sidecar(vec![(200, TWO_VOICES)]).await;
+        let config = sidecar_config(&url, "");
+        process_call(tmp.path(), &config).await;
+        served(server).await;
+        naming::rename_speaker(tmp.path(), &config, "S2", "Omar").unwrap();
+
+        let down = sidecar_config(&dead_url().await, "");
+        let meta = process_call(tmp.path(), &down).await;
+        assert!(speakers::separation_failure(&meta).is_some());
+        assert_eq!(
+            speaker_names(&meta),
+            [("me", "Tester"), ("others", "Others")]
+        );
+        assert_eq!(
+            meta.speaker_names.len(),
+            1,
+            "kept: {:?}",
+            meta.speaker_names
+        );
+        assert!(
+            meta.errors
+                .iter()
+                .all(|n| !n.starts_with(naming::USER_NAME_LOST)),
+            "{:?}",
+            meta.errors
+        );
+
+        // The sidecar's voices from the first attempt are cached.
+        let meta = process_call(tmp.path(), &config).await;
+        assert_eq!(
+            speaker_names(&meta),
+            [("me", "Tester"), ("S1", "Speaker 1"), ("S2", "Omar")]
+        );
+    }
+
     /// The mic is the user unless it is shared: then its voices are told
     /// apart too, and with two of them neither is named.
     #[tokio::test]

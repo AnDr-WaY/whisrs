@@ -140,12 +140,21 @@ pub fn render_markdown(meta: &RecordingMeta) -> String {
         "duration: {}\n",
         yaml_str(&clock(duration_ms(meta)))
     ));
-    if meta.speakers.is_empty() {
+    // The speakers heard in the transcript: a track's speaker with no line
+    // (silent system audio) stays in recording.json only, where `recording
+    // name` still finds it.
+    let heard: Vec<&str> = meta
+        .speakers
+        .iter()
+        .filter(|s| meta.segments.iter().any(|seg| seg.speaker == s.id))
+        .map(|s| s.name.as_str())
+        .collect();
+    if heard.is_empty() {
         out.push_str("speakers: []\n");
     } else {
         out.push_str("speakers:\n");
-        for speaker in &meta.speakers {
-            out.push_str(&format!("  - {}\n", yaml_str(&speaker.name)));
+        for name in heard {
+            out.push_str(&format!("  - {}\n", yaml_str(name)));
         }
     }
     out.push_str("tags: [recording]\n");
@@ -404,6 +413,22 @@ mod tests {
              [00:00:05] Speaker 1: Hello. Good to see you.\n\
              [00:00:09] Speaker 2: Morning.\n"
         );
+    }
+
+    /// The front matter lists the speakers that have a line, whatever
+    /// their talk time (an older file has none); the others stay in
+    /// recording.json.
+    #[test]
+    fn front_matter_lists_only_speakers_heard() {
+        let mut m = meta();
+        m.speakers
+            .push(speaker("S9", "Speaker 9", "none", TrackKind::System));
+        m.segments.retain(|s| s.speaker == "me");
+        let md = render_markdown(&m);
+        assert!(md.contains("speakers:\n  - \"Yosif\"\ntags:"), "{md}");
+        assert_eq!(m.speakers.len(), 3, "kept in the meta");
+        m.segments.clear();
+        assert!(render_markdown(&m).contains("speakers: []\n"));
     }
 
     #[test]

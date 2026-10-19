@@ -599,7 +599,9 @@ and under 2 % of its track is marked `minor` in `recording.json`, and its
 lines stay in the transcript; it does not count as a second voice, so a
 single main voice keeps the others label beside minor ones shown as
 "Speaker N". Speech the voices could not be matched to stays under the
-others label.
+others label. The transcript's front matter lists the speakers that have a
+line in it; `recording.json` lists every speaker, so `whisrs recording
+name` still finds one that said nothing.
 
 `diarization = "backend"` takes the speakers the transcription backend labels:
 Deepgram (`diarize_model=latest`, sent only with the recording's own
@@ -701,8 +703,13 @@ again, and the voices can come back numbered differently, so a name you
 gave a voice remembers where that voice first spoke (`anchor`: its track
 and `first_ms`) and follows it: after a retry it goes to the voice first
 heard on that track within a second of that moment, whatever its number is
-now. When no voice is, the name is dropped rather than put on someone
-else, and the transcript's notes ask you to name the speakers again. A name
+now, nearest first, each name and each voice used once. When the track
+has voices but none of them is, the name is dropped rather than put on
+someone else: the transcript's notes ask you to name the speakers again,
+and the notification that the transcript is ready says how many names
+were dropped. When a retry tells no voices apart on that track (the
+diarization sidecar was down, Deepgram refused), the name is kept as it is
+and comes back with the next retry that does. A name
 you gave a track's own speaker (you, or the system audio when its voices
 are not told apart) stays with it. Clearing a name you gave over the LLM's
 brings the LLM's name back only with the next retry, which asks it again.
