@@ -25,7 +25,10 @@ use tracing::{debug, error, info, warn};
 use whisrs::audio::capture::AudioCaptureHandle;
 use whisrs::audio::device::default_monitor_source;
 use whisrs::recording::process::process_recording;
-use whisrs::recording::recorder::{is_disk_full, spawn_track_writer, TrackStats};
+use whisrs::recording::recorder::{
+    is_disk_full, spawn_mic_writer, spawn_track_writer, SilenceAlarm, TrackStats,
+    SILENCE_WARN_AFTER,
+};
 use whisrs::recording::wav_repair::repair_wav;
 use whisrs::recording::{
     store, EndReason, NetworkWait, RecordingAction, RecordingMeta, RecordingOptions,
@@ -617,14 +620,39 @@ fn resolve_system(system: SystemSource) -> Option<Result<String>> {
     }
 }
 
+/// The alarm the mic's writer raises when the mic has sent only digital
+/// silence for [`SILENCE_WARN_AFTER`]: likely muted or the wrong device. It
+/// warns again only after real audio came back in between.
+fn muted_mic_alarm(id: &str, notify: bool) -> SilenceAlarm {
+    let id = id.to_string();
+    let minutes = SILENCE_WARN_AFTER.as_secs() / 60;
+    SilenceAlarm {
+        after: SILENCE_WARN_AFTER,
+        on_silence: Box::new(move || {
+            warn!("recording {id}: the microphone has sent only silence for {minutes} minutes");
+            if notify {
+                send_notification(
+                    "whisrs",
+                    &format!(
+                        "Recording: your mic has sent only silence for {minutes} minutes. \
+                         Is it muted?"
+                    ),
+                );
+            }
+        }),
+    }
+}
+
 /// Open the mic (required) and the system source (best effort), each with a
 /// writer started as soon as its capture is up so the first-chunk times are
-/// not skewed by the other device's start. Blocking: runs on the blocking
-/// pool, where the runtime handle is available for the writers.
+/// not skewed by the other device's start. The mic's writer raises
+/// `silence` when the mic is muted. Blocking: runs on the blocking pool,
+/// where the runtime handle is available for the writers.
 fn open_tracks(
     dir: &Path,
     mic: &str,
     system: Option<Result<String>>,
+    silence: SilenceAlarm,
 ) -> Result<(Vec<TrackCapture>, Vec<TrackMeta>, Option<String>)> {
     let mut captures = Vec::new();
     let mut metas = Vec::new();
@@ -634,7 +662,12 @@ fn open_tracks(
     let rx = handle
         .take_receiver()
         .context("mic capture has no receiver")?;
-    let writer = spawn_track_writer(rx, store::audio_path(dir, TrackKind::Mic), FLUSH_EVERY);
+    let writer = spawn_mic_writer(
+        rx,
+        store::audio_path(dir, TrackKind::Mic),
+        FLUSH_EVERY,
+        silence,
+    );
     captures.push(TrackCapture::new(TrackKind::Mic, Some(handle), writer));
     metas.push(track_meta(TrackKind::Mic, mic.to_string()));
 
@@ -733,7 +766,8 @@ async fn start(
 
     let started = Instant::now();
     let open_dir = dir.clone();
-    let opened = tokio::task::spawn_blocking(move || open_tracks(&open_dir, &mic, system))
+    let silence = muted_mic_alarm(&id, context.notify);
+    let opened = tokio::task::spawn_blocking(move || open_tracks(&open_dir, &mic, system, silence))
         .await
         .context("audio start panicked")
         .and_then(|r| r);

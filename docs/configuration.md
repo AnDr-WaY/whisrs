@@ -682,6 +682,12 @@ value keeps it forever. The transcript and `recording.json` are never deleted. A
 recording whose transcription failed always keeps its audio, so you can fix the
 cause (a missing API key, a network error) and run `whisrs recording retry`.
 
+**A muted mic.** If your microphone track sends only digital silence for 3
+minutes (a muted or wrong device; a quiet room is never that silent), a
+notification asks whether it is muted. It warns again only if the mic goes
+silent again after sending real audio. The system track is never checked,
+since a paused video is silent too.
+
 **Disk space.** A recording takes about 1.9 MB a minute per track, and
 transcribing it writes an echo-cancelled copy of your track next to them. A
 recording needs 100 MB free in `dir` to start (about 10 minutes plus room to
