@@ -253,6 +253,9 @@ async fn main() -> Result<()> {
     // a crashed attempt.
     context.recording.set_worker(worker);
     tokio::spawn(crate::recording::recover_on_startup(Arc::clone(&context)));
+    // Recordings that could not reach the backend are tried again every
+    // few minutes while the daemon runs.
+    tokio::spawn(crate::recording::run_network_retries(Arc::clone(&context)));
 
     // SIGTERM (systemd stop/restart, tray Quit) and SIGINT both finalize a
     // recording in progress before exiting, so it is transcribed on the next start.

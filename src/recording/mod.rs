@@ -17,6 +17,7 @@ pub mod wav_repair;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::ipc::validate_language_override;
 
@@ -130,6 +131,10 @@ pub struct RecordingStatus {
     /// Ids of recordings waiting for processing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued: Vec<String>,
+    /// Ids of recordings waiting for the network ([`RecordingState::Waiting`]),
+    /// not counting one that is queued or being processed right now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<String>,
 }
 
 /// Lifecycle of a single recording, stored as `status` in `recording.json`.
@@ -140,6 +145,33 @@ pub enum RecordingState {
     Processing,
     Done,
     Failed,
+    /// Transcription could not reach the backend: the daemon tries again
+    /// on its own ([`NetworkWait`]) until [`RecordingMeta::network_deadline`].
+    Waiting,
+}
+
+/// How often the daemon tries a recording waiting for the network again.
+pub const NETWORK_RETRY_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// How long after its stop a recording keeps waiting for the network
+/// before it becomes a plain failure.
+pub const NETWORK_RETRY_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Most automatic attempts one recording gets: one every
+/// [`NETWORK_RETRY_EVERY`] for [`NETWORK_RETRY_FOR`]. Daemon starts add an
+/// attempt each, so this also bounds a daemon that keeps restarting.
+pub const NETWORK_RETRY_MAX: u32 = 144;
+
+/// The automatic retries of a recording waiting for the network.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetworkWait {
+    /// When transcription first failed for lack of network.
+    pub since: DateTime<Local>,
+    /// Automatic attempts made so far. Separate from
+    /// [`RecordingMeta::attempts`], which they never raise.
+    pub attempts: u32,
+    /// When the last attempt (automatic or not) failed for lack of network.
+    pub last_attempt_at: DateTime<Local>,
 }
 
 /// Which audio source a track was captured from.
@@ -278,6 +310,10 @@ pub struct RecordingMeta {
     /// daemon is not requeued on every start forever.
     #[serde(default)]
     pub attempts: u32,
+    /// Set once transcription failed for lack of network, cleared by a
+    /// manual retry or a finished transcript.
+    #[serde(default)]
+    pub network_wait: Option<NetworkWait>,
 }
 
 /// Current `recording.json` schema version.
@@ -310,7 +346,18 @@ impl RecordingMeta {
             error: None,
             audio_deleted: false,
             attempts: 0,
+            network_wait: None,
         }
+    }
+
+    /// When a recording waiting for the network gives up:
+    /// [`NETWORK_RETRY_FOR`] after it stopped (or, with no stop time, after
+    /// it began waiting). `None` when it is not waiting.
+    pub fn network_deadline(&self) -> Option<DateTime<Local>> {
+        let wait = self.network_wait.as_ref()?;
+        let from = self.ended_at.unwrap_or(wait.since);
+        let span = chrono::Duration::from_std(NETWORK_RETRY_FOR).ok()?;
+        Some(from + span)
     }
 
     /// The stored language of track `kind`.
@@ -356,6 +403,10 @@ mod tests {
             serde_json::to_string(&TrackKind::System).unwrap(),
             r#""system""#
         );
+        assert_eq!(
+            serde_json::to_string(&RecordingState::Waiting).unwrap(),
+            r#""waiting""#
+        );
         assert_eq!(RecordingStatus::default().phase, RecordingPhase::Idle);
     }
 
@@ -374,6 +425,11 @@ mod tests {
         meta.system_language = Some("auto".into());
         meta.others_label = Some("Video".into());
         meta.model = Some("ggml-large-v3-turbo.bin".into());
+        meta.network_wait = Some(NetworkWait {
+            since: meta.started_at,
+            attempts: 2,
+            last_attempt_at: meta.started_at,
+        });
         let json = serde_json::to_string(&meta).unwrap();
         let back: RecordingMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back, meta);
@@ -392,6 +448,32 @@ mod tests {
         assert_eq!(meta.language(TrackKind::System), None);
         assert_eq!(meta.model, None);
         assert_eq!(meta.others_label(), DEFAULT_OTHERS_LABEL);
+        assert_eq!(meta.network_wait, None);
+        assert_eq!(meta.network_deadline(), None);
+    }
+
+    /// A waiting recording gives up a day after its stop, or after it began
+    /// waiting when it has no stop time.
+    #[test]
+    fn network_deadline_counts_from_the_stop() {
+        let started = Local::now() - chrono::Duration::hours(3);
+        let mut meta = RecordingMeta::new("m".into(), None, started);
+        let since = started + chrono::Duration::hours(2);
+        meta.network_wait = Some(NetworkWait {
+            since,
+            attempts: 0,
+            last_attempt_at: since,
+        });
+        assert_eq!(
+            meta.network_deadline(),
+            Some(since + chrono::Duration::hours(24))
+        );
+        let stopped = started + chrono::Duration::hours(1);
+        meta.ended_at = Some(stopped);
+        assert_eq!(
+            meta.network_deadline(),
+            Some(stopped + chrono::Duration::hours(24))
+        );
     }
 
     #[test]

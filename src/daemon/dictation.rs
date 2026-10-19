@@ -40,7 +40,7 @@ pub(crate) async fn handle_toggle(
             // only finds out when the backend rejects the language.
             let language = match validate_toggle_language(language) {
                 Ok(lang) => lang,
-                Err(response) => return response,
+                Err(message) => return Response::Error { message },
             };
 
             // Resolve the session language once: per-toggle override, else
@@ -490,19 +490,19 @@ fn resolve_language(override_lang: Option<String>, default_lang: &str) -> String
 
 /// Validate a per-toggle language override before recording starts.
 ///
-/// Returns the normalized override on success, or the error `Response` to
+/// Returns the normalized override on success, or the error message to
 /// send back to the CLI. Called on the start-press before any capture or
 /// state transition so a bad `-l` value (e.g. `english`) is rejected up
 /// front instead of failing a whole session at transcription time. The
 /// config default (`general.language`) is deliberately not validated.
-fn validate_toggle_language(language: Option<String>) -> Result<Option<String>, Response> {
+fn validate_toggle_language(language: Option<String>) -> Result<Option<String>, String> {
     match language {
         None => Ok(None),
         Some(lang) => match validate_language_override(&lang) {
             Ok(normalized) => Ok(Some(normalized)),
             Err(message) => {
                 warn!("rejected language override: {message}");
-                Err(Response::Error { message })
+                Err(message)
             }
         },
     }
@@ -530,8 +530,8 @@ mod tests {
     fn start_press_rejects_invalid_language_override_before_recording() {
         let ds = DaemonState::new();
 
-        let response = validate_toggle_language(Some("english".to_string())).unwrap_err();
-        assert!(matches!(response, Response::Error { .. }));
+        let message = validate_toggle_language(Some("english".to_string())).unwrap_err();
+        assert!(message.starts_with("invalid language"), "{message}");
 
         // handle_toggle returns that response without touching the state
         // machine — the daemon stays idle and no capture is started.

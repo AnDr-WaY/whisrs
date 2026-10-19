@@ -37,7 +37,9 @@ use crate::transcription::factory::{
     backend_identity, canonical_backend_name, create_backend_named, recording_backend_name,
     recording_model_label, recording_transcription_config,
 };
-use crate::transcription::retry::{retry_rate_limited, RateLimitExhausted, RATE_LIMIT_BUDGET};
+use crate::transcription::retry::{
+    is_network_unavailable, retry_rate_limited, RateLimitExhausted, RATE_LIMIT_BUDGET,
+};
 use crate::transcription::{TranscriptionBackend, TranscriptionConfig};
 use crate::{Config, RecordingConfig};
 
@@ -199,6 +201,7 @@ pub async fn process_recording(
     meta.model = Some(model);
     meta.status = RecordingState::Done;
     meta.error = None;
+    meta.network_wait = None;
 
     write_private(
         &store::transcript_path(dir, &meta.id),
@@ -639,10 +642,11 @@ async fn transcribe_track(
 }
 
 /// Transcribe one chunk, waiting out rate limits within
-/// [`RATE_LIMIT_BUDGET`] and retrying a server error a few times
+/// [`RATE_LIMIT_BUDGET`] and retrying a server or network error a few times
 /// ([`retry_rate_limited`]). Phrase backends retry each phrase inside
-/// `transcribe_segments` and give up with a [`RateLimitExhausted`], which
-/// this layer does not retry again, so the two waits never multiply.
+/// `transcribe_segments` and give up with a [`RateLimitExhausted`] or a
+/// [`NetworkUnavailable`](crate::transcription::retry::NetworkUnavailable),
+/// which this layer does not retry again, so the two waits never multiply.
 async fn transcribe_with_retry(
     backend: &dyn TranscriptionBackend,
     wav: &[u8],
@@ -651,7 +655,7 @@ async fn transcribe_with_retry(
     retry_rate_limited(RATE_LIMIT_BUDGET, || backend.transcribe_segments(wav, tcfg))
         .await
         .map_err(|err| {
-            if err.downcast_ref::<RateLimitExhausted>().is_some() {
+            if err.downcast_ref::<RateLimitExhausted>().is_some() || is_network_unavailable(&err) {
                 err.context(
                     "chunks finished before the failure are saved; retry resumes from the failed chunk",
                 )

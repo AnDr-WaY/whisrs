@@ -28,9 +28,11 @@ use whisrs::recording::process::process_recording;
 use whisrs::recording::recorder::{spawn_track_writer, TrackStats};
 use whisrs::recording::wav_repair::repair_wav;
 use whisrs::recording::{
-    store, EndReason, RecordingAction, RecordingMeta, RecordingOptions, RecordingPhase,
-    RecordingState, RecordingStatus, TrackKind, TrackMeta, DEFAULT_OTHERS_LABEL,
+    store, EndReason, NetworkWait, RecordingAction, RecordingMeta, RecordingOptions,
+    RecordingPhase, RecordingState, RecordingStatus, TrackKind, TrackMeta, DEFAULT_OTHERS_LABEL,
+    NETWORK_RETRY_EVERY, NETWORK_RETRY_FOR, NETWORK_RETRY_MAX,
 };
+use whisrs::transcription::retry::is_network_unavailable;
 use whisrs::{Config, RecordingConfig, Response};
 
 use crate::context::DaemonContext;
@@ -73,6 +75,10 @@ const MAX_ATTEMPTS: u32 = 3;
 
 /// Longest error text put in a notification.
 const NOTIFY_ERROR_MAX: usize = 200;
+
+/// How often [`run_network_retries`] looks for a recording waiting for the
+/// network whose next attempt is due ([`NETWORK_RETRY_EVERY`] after its last).
+const NETWORK_RETRY_TICK: Duration = Duration::from_secs(60);
 
 /// Start of the error a stop returns when it saved the recording but could
 /// not queue it. [`stop`] notifies it itself, since a compositor-bound
@@ -128,13 +134,17 @@ pub(crate) fn refuse_while_recording(
     Some(error_response(message))
 }
 
-/// A recording that is capturing, processing or queued, as shown in status.
+/// A recording that is capturing, processing, queued or waiting for the
+/// network, as shown in status.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ActiveRecording {
     id: String,
     title: Option<String>,
     started_at: DateTime<Local>,
     dir: PathBuf,
+    /// Queued or processed as an automatic retry of a recording waiting for
+    /// the network: it does not count towards [`MAX_ATTEMPTS`].
+    network_retry: bool,
 }
 
 impl ActiveRecording {
@@ -144,6 +154,7 @@ impl ActiveRecording {
             title: meta.title.clone(),
             started_at: meta.started_at,
             dir: dir.to_path_buf(),
+            network_retry: false,
         }
     }
 }
@@ -154,6 +165,12 @@ struct RecordingView {
     capturing: Option<ActiveRecording>,
     processing: Option<ActiveRecording>,
     queued: Vec<ActiveRecording>,
+    /// Waiting for the network ([`RecordingState::Waiting`]) and neither
+    /// queued nor processing: what [`retry_waiting`] looks at.
+    waiting: Vec<ActiveRecording>,
+    /// Ids whose automatic retries `cancel` stopped while one was queued or
+    /// running: that attempt fails the recording instead of waiting again.
+    wait_cancelled: Vec<String>,
 }
 
 impl RecordingView {
@@ -176,6 +193,7 @@ impl RecordingView {
             started_at: active.map(|a| a.started_at),
             dir: active.map(|a| a.dir.clone()),
             queued: self.queued.iter().map(|q| q.id.clone()).collect(),
+            waiting: self.waiting.iter().map(|w| w.id.clone()).collect(),
         }
     }
 
@@ -389,15 +407,40 @@ impl RecordingRuntime {
         self.update(|v| v.queued.retain(|q| q.id != id));
     }
 
-    /// Hand a reserved recording to the worker.
+    /// Hand a reserved recording to the worker. A recording waiting for the
+    /// network is no longer shown as waiting once it is queued.
     fn dispatch(&self, recording: ActiveRecording) -> Result<()> {
         let id = recording.id.clone();
         if self.queue_tx.send(QueuedRecording { recording }).is_err() {
             self.unreserve(&id);
             bail!("the recording processing worker is not running");
         }
-        self.update(|_| {});
+        self.update(|v| v.waiting.retain(|w| w.id != id));
         Ok(())
+    }
+
+    /// Show recording `recording` as waiting for the network.
+    fn show_waiting(&self, recording: ActiveRecording) {
+        self.update(|v| {
+            v.waiting.retain(|w| w.id != recording.id);
+            v.waiting.push(ActiveRecording {
+                network_retry: false,
+                ..recording
+            });
+        });
+    }
+
+    fn hide_waiting(&self, id: &str) {
+        self.update(|v| v.waiting.retain(|w| w.id != id));
+    }
+
+    /// Whether `cancel` stopped the network wait of recording `id` while an
+    /// attempt was pending, clearing the mark.
+    fn take_wait_cancelled(&self, id: &str) -> bool {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        let before = view.wait_cancelled.len();
+        view.wait_cancelled.retain(|c| c != id);
+        view.wait_cancelled.len() != before
     }
 }
 
@@ -972,14 +1015,14 @@ async fn stop(
     queued
 }
 
+/// Cancel the recording in progress and delete it. With none in progress,
+/// stop the automatic retries of the recordings waiting for the network
+/// instead ([`stop_waiting`]).
 async fn cancel(context: &Arc<DaemonContext>) -> Result<()> {
-    let session = context
-        .recording
-        .session
-        .lock()
-        .await
-        .take()
-        .context("no recording is in progress")?;
+    let session = context.recording.session.lock().await.take();
+    let Some(session) = session else {
+        return stop_waiting(context).await;
+    };
     if let Some(timer) = &session.timer {
         timer.abort();
     }
@@ -1117,6 +1160,15 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
     let QueuedRecording { recording } = item;
     let id = recording.id.clone();
     let dir = recording.dir.clone();
+    let network_retry = recording.network_retry;
+    if network_retry && context.recording.take_wait_cancelled(&id) {
+        // `cancel` stopped its wait while this attempt was queued.
+        context
+            .recording
+            .update(|v| v.queued.retain(|q| q.id != id));
+        stopped_waiting(context, &dir, &id, WAIT_CANCELLED).await;
+        return;
+    }
     context.recording.update(|v| {
         v.queued.retain(|q| q.id != id);
         v.processing = Some(recording);
@@ -1124,8 +1176,14 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
 
     // Counted before the attempt, so one that takes the daemon down with it
     // still counts towards [`MAX_ATTEMPTS`] at the next start. A graceful
-    // shutdown gives it back ([`stop_worker`]).
-    if let Err(e) = count_attempt(&dir) {
+    // shutdown gives it back ([`stop_worker`]). An automatic network retry
+    // counts towards its own cap ([`NETWORK_RETRY_MAX`]) instead.
+    let counted = if network_retry {
+        count_network_attempt(&dir)
+    } else {
+        count_attempt(&dir)
+    };
+    if let Err(e) = counted {
         error!("failed to record a processing attempt for recording {id}: {e:#}");
     }
     // A panic in a backend or in the processing itself must not leave the
@@ -1154,6 +1212,17 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
                 &format!("Recording transcript ready: {}", md.display()),
             );
         }
+        Err(e) if is_network_unavailable(&e) => {
+            let message = format!("{e:#}");
+            if context.recording.take_wait_cancelled(&id) {
+                if let Err(write_err) = mark_waiting(&dir, &message, Local::now()) {
+                    error!("failed to record the failure of recording {id}: {write_err:#}");
+                }
+                stopped_waiting(context, &dir, &id, WAIT_CANCELLED).await;
+            } else {
+                wait_for_network(context, &dir, &id, &message).await;
+            }
+        }
         Err(e) => {
             let message = format!("{e:#}");
             error!("recording {id} transcription failed: {message}");
@@ -1169,8 +1238,61 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
             );
         }
     }
+    context.recording.take_wait_cancelled(&id);
     context.recording.update(|v| v.processing = None);
     sweep(context).await;
+}
+
+/// Mark recording `id` as waiting for the network after an attempt could
+/// not reach the backend, and show it so. Notified only when it starts
+/// waiting: the automatic attempts that fail after that stay quiet.
+async fn wait_for_network(context: &Arc<DaemonContext>, dir: &Path, id: &str, message: &str) {
+    match mark_waiting(dir, message, Local::now()) {
+        Ok((meta, started)) => {
+            warn!("recording {id} is waiting for the network: {message}");
+            context
+                .recording
+                .show_waiting(ActiveRecording::from_meta(dir, &meta));
+            if started {
+                notify(
+                    context,
+                    &format!(
+                        "Recording: no network. whisrs tries again every {} minutes \
+                         for up to {} hours; whisrs recording retry {id} tries now",
+                        NETWORK_RETRY_EVERY.as_secs() / 60,
+                        NETWORK_RETRY_FOR.as_secs() / 3600
+                    ),
+                );
+            }
+        }
+        Err(e) => error!("failed to record that recording {id} waits for the network: {e:#}"),
+    }
+}
+
+/// Why `cancel` ended a recording's wait for the network.
+const WAIT_CANCELLED: &str = "stopped waiting for the network (whisrs recording cancel)";
+
+/// Fail recording `id` that was waiting for the network, keeping its audio
+/// for `whisrs recording retry`, and notify why. Blocking writes run off
+/// the runtime.
+async fn stopped_waiting(context: &Arc<DaemonContext>, dir: &Path, id: &str, why: &str) {
+    let fail_dir = dir.to_path_buf();
+    let reason = why.to_string();
+    let failed = tokio::task::spawn_blocking(move || fail_wait(&fail_dir, &reason))
+        .await
+        .context("recording bookkeeping panicked")
+        .and_then(|r| r);
+    context.recording.hide_waiting(id);
+    match failed {
+        Ok(()) => {
+            warn!("recording {id}: {why}");
+            notify(
+                context,
+                &format!("Recording {why}. Retry with: whisrs recording retry {id}"),
+            );
+        }
+        Err(e) => error!("failed to record the failure of recording {id}: {e:#}"),
+    }
 }
 
 /// The text of a caught panic's payload.
@@ -1193,6 +1315,204 @@ fn mark_failed(dir: &Path, message: &str) -> Result<()> {
     meta.status = RecordingState::Failed;
     meta.error = Some(message.to_string());
     store::write_meta(dir, &meta)
+}
+
+/// Count an automatic network retry ([`NetworkWait::attempts`]), never
+/// [`RecordingMeta::attempts`].
+fn count_network_attempt(dir: &Path) -> Result<()> {
+    let mut meta = store::read_meta(dir)?;
+    if let Some(wait) = meta.network_wait.as_mut() {
+        wait.attempts = wait.attempts.saturating_add(1);
+    }
+    store::write_meta(dir, &meta)
+}
+
+/// Mark a recording as waiting for the network after an attempt failed for
+/// lack of it at `now`, starting its [`NetworkWait`] if it has none. The
+/// flag is true when the wait started here, which is when it is notified.
+fn mark_waiting(dir: &Path, message: &str, now: DateTime<Local>) -> Result<(RecordingMeta, bool)> {
+    let mut meta = store::read_meta(dir)?;
+    meta.status = RecordingState::Waiting;
+    meta.error = Some(message.to_string());
+    let started = meta.network_wait.is_none();
+    let wait = meta.network_wait.get_or_insert(NetworkWait {
+        since: now,
+        attempts: 0,
+        last_attempt_at: now,
+    });
+    wait.last_attempt_at = now;
+    store::write_meta(dir, &meta)?;
+    Ok((meta, started))
+}
+
+/// End a recording's wait for the network: `failed`, with `why` before the
+/// last network error. Its audio and chunk cache stay for a retry.
+fn fail_wait(dir: &Path, why: &str) -> Result<()> {
+    let mut meta = store::read_meta(dir)?;
+    meta.status = RecordingState::Failed;
+    meta.error = Some(match meta.error.take() {
+        Some(last) => format!("{why}: {last}"),
+        None => why.to_string(),
+    });
+    store::write_meta(dir, &meta)
+}
+
+/// What [`retry_waiting`] does with a recording waiting for the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetworkRetry {
+    /// Queue an automatic attempt now.
+    Due,
+    /// Its last attempt was less than [`NETWORK_RETRY_EVERY`] ago.
+    NotYet,
+    /// Past [`RecordingMeta::network_deadline`] or [`NETWORK_RETRY_MAX`]:
+    /// fail it, for the reason given.
+    GiveUp(String),
+}
+
+/// Whether a recording waiting for the network gets an automatic attempt at
+/// `now`. `startup` makes it due whenever its last attempt was: the network
+/// may well be back after a reboot.
+fn network_retry_due(meta: &RecordingMeta, now: DateTime<Local>, startup: bool) -> NetworkRetry {
+    let Some(wait) = &meta.network_wait else {
+        return NetworkRetry::Due;
+    };
+    if meta
+        .network_deadline()
+        .is_some_and(|deadline| now >= deadline)
+    {
+        return NetworkRetry::GiveUp(format!(
+            "gave up waiting for the network {} hours after the recording stopped",
+            NETWORK_RETRY_FOR.as_secs() / 3600
+        ));
+    }
+    if wait.attempts >= NETWORK_RETRY_MAX {
+        return NetworkRetry::GiveUp(format!(
+            "gave up waiting for the network after {} automatic attempts",
+            wait.attempts
+        ));
+    }
+    let every = chrono::Duration::from_std(NETWORK_RETRY_EVERY).unwrap_or(chrono::Duration::MAX);
+    if startup || now.signed_duration_since(wait.last_attempt_at) >= every {
+        NetworkRetry::Due
+    } else {
+        NetworkRetry::NotYet
+    }
+}
+
+/// Queue an automatic attempt of every recording waiting for the network
+/// that is due ([`network_retry_due`]), and fail the ones out of time or
+/// attempts. At `startup` the waiting recordings are read from disk, later
+/// from the view. Each goes through the processing queue like any other
+/// recording, so it never runs beside another one, and is reserved first, so
+/// a manual retry and this never take it twice.
+async fn retry_waiting(context: &Arc<DaemonContext>, now: DateTime<Local>, startup: bool) {
+    let candidates: Vec<ActiveRecording> = if startup {
+        let root = recordings_root(&context.config);
+        tokio::task::spawn_blocking(move || store::waiting(&root))
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|(dir, meta)| ActiveRecording::from_meta(dir, meta))
+            .collect()
+    } else {
+        context
+            .recording
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiting
+            .clone()
+    };
+    for recording in candidates {
+        let id = recording.id.clone();
+        let meta = match store::read_meta(&recording.dir) {
+            Ok(meta) if meta.status == RecordingState::Waiting => meta,
+            Ok(_) => {
+                context.recording.hide_waiting(&id);
+                continue;
+            }
+            Err(e) => {
+                warn!("failed to read recording {id}: {e:#}");
+                context.recording.hide_waiting(&id);
+                continue;
+            }
+        };
+        let attempt = ActiveRecording {
+            network_retry: true,
+            ..ActiveRecording::from_meta(&recording.dir, &meta)
+        };
+        match network_retry_due(&meta, now, startup) {
+            NetworkRetry::NotYet => context.recording.show_waiting(attempt),
+            NetworkRetry::GiveUp(why) => {
+                if context.recording.reserve(&attempt).is_ok() {
+                    stopped_waiting(context, &recording.dir, &id, &why).await;
+                    context.recording.unreserve(&id);
+                }
+            }
+            NetworkRetry::Due => {
+                if context.recording.reserve(&attempt).is_err() {
+                    continue;
+                }
+                info!("recording {id}: trying the network again");
+                if let Err(e) = context.recording.dispatch(attempt) {
+                    warn!("failed to queue recording {id}: {e:#}");
+                }
+            }
+        }
+    }
+}
+
+/// Every [`NETWORK_RETRY_TICK`], queue the recordings waiting for the network
+/// whose next attempt is due. The first pass runs at startup, from
+/// [`recover_on_startup`].
+pub(crate) async fn run_network_retries(context: Arc<DaemonContext>) {
+    loop {
+        tokio::time::sleep(NETWORK_RETRY_TICK).await;
+        retry_waiting(&context, Local::now(), false).await;
+    }
+}
+
+/// `cancel` with no recording in progress: stop the automatic retries of
+/// every recording waiting for the network. Each is marked failed and keeps
+/// its audio, so `whisrs recording retry` still runs it. One whose attempt
+/// is queued or running is marked for that attempt to fail it
+/// ([`process_one`]).
+async fn stop_waiting(context: &Arc<DaemonContext>) -> Result<()> {
+    let (waiting, pending) = {
+        let mut view = context
+            .recording
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let pending: Vec<String> = view
+            .processing
+            .iter()
+            .chain(&view.queued)
+            .filter(|r| r.network_retry)
+            .map(|r| r.id.clone())
+            .collect();
+        for id in &pending {
+            if !view.wait_cancelled.contains(id) {
+                view.wait_cancelled.push(id.clone());
+            }
+        }
+        (view.waiting.clone(), pending)
+    };
+    if waiting.is_empty() && pending.is_empty() {
+        bail!("no recording is in progress");
+    }
+    for recording in waiting {
+        if context.recording.reserve(&recording).is_ok() {
+            stopped_waiting(context, &recording.dir, &recording.id, WAIT_CANCELLED).await;
+            context.recording.unreserve(&recording.id);
+        }
+    }
+    for id in pending {
+        info!(
+            "recording {id}: its network retry in progress fails it if the network is still down"
+        );
+    }
+    Ok(())
 }
 
 async fn sweep(context: &DaemonContext) {
@@ -1245,6 +1565,7 @@ fn recover_dir(dir: &Path, retry: Option<&RecordingOptions>) -> Result<Recording
     let mut meta = store::read_meta(dir)?;
     if let Some(options) = retry {
         meta.attempts = 0;
+        meta.network_wait = None;
         meta.apply_languages(options);
     }
     let mut repaired = Vec::new();
@@ -1387,6 +1708,8 @@ pub(crate) async fn recover_on_startup(context: Arc<DaemonContext>) {
         }
         recover_one(&context, dir).await;
     }
+    // The network may be back after a restart: try the waiting ones now.
+    retry_waiting(&context, Local::now(), true).await;
     sweep(&context).await;
 }
 
@@ -1476,11 +1799,29 @@ async fn stop_worker(runtime: &RecordingRuntime) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .processing
-        .as_ref()
-        .map(|p| (p.id.clone(), p.dir.clone()));
-    let Some((id, dir)) = processing else {
+        .clone();
+    let Some(ActiveRecording {
+        id,
+        dir,
+        network_retry,
+        ..
+    }) = processing
+    else {
         return;
     };
+    if network_retry {
+        // It counted no attempt: put it back to waiting, so the next start
+        // retries it as one more automatic attempt rather than an
+        // interrupted one.
+        match tokio::task::spawn_blocking(move || rewait(&dir)).await {
+            Ok(Ok(())) => info!(
+                "recording {id}: network retry interrupted by shutdown; it is retried on the next start"
+            ),
+            Ok(Err(e)) => warn!("recording {id}: failed to put it back to waiting: {e:#}"),
+            Err(e) => warn!("recording {id}: attempt bookkeeping panicked: {e}"),
+        }
+        return;
+    }
     match tokio::task::spawn_blocking(move || uncount_attempt(&dir)).await {
         Ok(Ok(true)) => info!(
             "recording {id}: transcription interrupted by shutdown; it resumes on the next start"
@@ -1489,6 +1830,17 @@ async fn stop_worker(runtime: &RecordingRuntime) {
         Ok(Err(e)) => warn!("recording {id}: failed to give back the interrupted attempt: {e:#}"),
         Err(e) => warn!("recording {id}: attempt bookkeeping panicked: {e}"),
     }
+}
+
+/// Put a recording whose automatic network retry a shutdown interrupted back
+/// to waiting. Only one still `processing` is touched. Blocking.
+fn rewait(dir: &Path) -> Result<()> {
+    let mut meta = store::read_meta(dir)?;
+    if meta.status == RecordingState::Processing && meta.network_wait.is_some() {
+        meta.status = RecordingState::Waiting;
+        store::write_meta(dir, &meta)?;
+    }
+    Ok(())
 }
 
 /// Undo [`count_attempt`] for a recording a shutdown interrupted. Only a
@@ -1553,6 +1905,7 @@ mod tests {
             title: Some(format!("{id} title")),
             started_at: Local::now(),
             dir: PathBuf::from(format!("/m/{id}")),
+            network_retry: false,
         }
     }
 
@@ -1570,6 +1923,7 @@ mod tests {
             capturing: Some(active("rec")),
             processing: Some(active("proc")),
             queued: vec![active("q")],
+            ..Default::default()
         };
         let status = view.status();
         assert_eq!(status.phase, RecordingPhase::Recording);
@@ -1584,6 +1938,7 @@ mod tests {
             capturing: None,
             processing: Some(active("proc")),
             queued: vec![],
+            ..Default::default()
         };
         assert_eq!(view.status().phase, RecordingPhase::Processing);
         assert_eq!(view.status().id.as_deref(), Some("proc"));
@@ -2857,6 +3212,489 @@ mod tests {
             "{message}"
         );
         assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+    }
+
+    /// What [`FlakyNetwork`] does with a request.
+    const DOWN: u8 = 0;
+    const UP: u8 = 1;
+    const HANG: u8 = 2;
+
+    /// A cloud backend whose network can be down (every request ends the
+    /// way the retry layer gives up on one), back up, or slow (a request
+    /// that hangs until `release`, then finds the network down).
+    struct FlakyNetwork {
+        mode: std::sync::atomic::AtomicU8,
+        calls: AtomicUsize,
+        release: tokio::sync::Notify,
+    }
+
+    impl FlakyNetwork {
+        fn new(mode: u8) -> Arc<Self> {
+            Arc::new(Self {
+                mode: std::sync::atomic::AtomicU8::new(mode),
+                calls: AtomicUsize::new(0),
+                release: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn set(&self, mode: u8) {
+            self.mode.store(mode, Ordering::Release);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for FlakyNetwork {
+        async fn transcribe(&self, _audio: &[u8], _config: &TranscriptionConfig) -> Result<String> {
+            unreachable!("recordings ask for segments")
+        }
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> Result<Transcript> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mode = self.mode.load(Ordering::Acquire);
+            if mode == HANG {
+                self.release.notified().await;
+            }
+            match mode {
+                DOWN | HANG => Err(whisrs::transcription::retry::NetworkUnavailable {
+                    message: "could not reach the transcription service after 110 s of \
+                              retries: Connection refused (os error 111)"
+                        .into(),
+                }
+                .into()),
+                _ => Ok(Transcript {
+                    segments: vec![Segment {
+                        start_ms: 0,
+                        end_ms: 1000,
+                        text: "back online".into(),
+                        speaker: None,
+                        words: None,
+                    }],
+                }),
+            }
+        }
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A crashed recording whose first attempt found no network: it is
+    /// left waiting, not failed, with the attempt counted as usual.
+    async fn waiting_recording(
+        context: &Arc<DaemonContext>,
+        queue: &mut mpsc::UnboundedReceiver<QueuedRecording>,
+        root: &Path,
+    ) -> (PathBuf, String) {
+        let dir = crashed_recording(root);
+        recover_on_startup(Arc::clone(context)).await;
+        process_one(context, queue.try_recv().unwrap()).await;
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Waiting);
+        (dir, meta.id)
+    }
+
+    #[tokio::test]
+    async fn a_network_failure_waits_instead_of_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FlakyNetwork::new(DOWN);
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
+        let (dir, id) = waiting_recording(&context, &mut queue, tmp.path()).await;
+
+        let meta = store::read_meta(&dir).unwrap();
+        assert!(
+            meta.error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not reach the transcription service")),
+            "{:?}",
+            meta.error
+        );
+        let wait = meta.network_wait.clone().unwrap();
+        assert_eq!(wait.attempts, 0);
+        assert_eq!(wait.since, wait.last_attempt_at);
+        assert_eq!(meta.attempts, 1, "the first attempt counts as usual");
+        let status = context.recording.status();
+        assert_eq!(status.phase, RecordingPhase::Idle);
+        assert_eq!(status.waiting, vec![id]);
+        // The next attempt finds the wait already started: no new notice.
+        let (_, started) = mark_waiting(&dir, "still down", Local::now()).unwrap();
+        assert!(!started);
+    }
+
+    #[test]
+    fn network_retry_schedule() {
+        let now = Local::now();
+        let minutes = chrono::Duration::minutes;
+        let mut meta = RecordingMeta::new("m".into(), None, now - minutes(90));
+        meta.status = RecordingState::Waiting;
+        meta.ended_at = Some(now - minutes(60));
+        assert_eq!(network_retry_due(&meta, now, false), NetworkRetry::Due);
+        meta.network_wait = Some(NetworkWait {
+            since: now - minutes(60),
+            attempts: 3,
+            last_attempt_at: now - minutes(5),
+        });
+        assert_eq!(network_retry_due(&meta, now, false), NetworkRetry::NotYet);
+        assert_eq!(
+            network_retry_due(&meta, now, true),
+            NetworkRetry::Due,
+            "a daemon start tries at once"
+        );
+        assert_eq!(
+            network_retry_due(&meta, now + minutes(5), false),
+            NetworkRetry::Due,
+            "ten minutes after the last attempt"
+        );
+
+        // A day after the stop, or out of attempts: give up, at startup too.
+        let deadline = meta.network_deadline().unwrap();
+        assert_eq!(deadline, now - minutes(60) + chrono::Duration::hours(24));
+        for startup in [false, true] {
+            let NetworkRetry::GiveUp(why) = network_retry_due(&meta, deadline, startup) else {
+                panic!("not given up at the deadline");
+            };
+            assert!(
+                why.contains("24 hours after the recording stopped"),
+                "{why}"
+            );
+        }
+        meta.network_wait.as_mut().unwrap().attempts = NETWORK_RETRY_MAX;
+        let NetworkRetry::GiveUp(why) = network_retry_due(&meta, now, true) else {
+            panic!("not given up at the cap");
+        };
+        assert!(why.contains("after 144 automatic attempts"), "{why}");
+    }
+
+    /// Automatic attempts come every ten minutes, never count towards
+    /// [`MAX_ATTEMPTS`], stay quiet, and finish the recording once the
+    /// network is back.
+    #[tokio::test]
+    async fn automatic_retries_finish_the_recording_when_the_network_is_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FlakyNetwork::new(DOWN);
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
+        let (dir, id) = waiting_recording(&context, &mut queue, tmp.path()).await;
+        let since = store::read_meta(&dir).unwrap().network_wait.unwrap().since;
+
+        // Not yet due.
+        retry_waiting(&context, Local::now() + chrono::Duration::minutes(5), false).await;
+        assert!(queue.try_recv().is_err());
+        assert_eq!(context.recording.status().waiting, vec![id.clone()]);
+
+        // More automatic attempts than MAX_ATTEMPTS, all without network.
+        for round in 1..=(MAX_ATTEMPTS + 2) {
+            let later = Local::now() + chrono::Duration::minutes(11);
+            retry_waiting(&context, later, false).await;
+            let item = queue
+                .try_recv()
+                .expect("due ten minutes after the last attempt");
+            assert!(item.recording.network_retry);
+            assert!(
+                context.recording.status().waiting.is_empty(),
+                "queued, not waiting"
+            );
+            process_one(&context, item).await;
+            let meta = store::read_meta(&dir).unwrap();
+            assert_eq!(meta.status, RecordingState::Waiting);
+            assert_eq!(meta.attempts, 1, "automatic attempts are not counted");
+            let wait = meta.network_wait.unwrap();
+            assert_eq!(wait.attempts, round);
+            assert_eq!(wait.since, since, "still the same wait: notified once");
+        }
+
+        backend.set(UP);
+        retry_waiting(
+            &context,
+            Local::now() + chrono::Duration::minutes(11),
+            false,
+        )
+        .await;
+        process_one(&context, queue.try_recv().unwrap()).await;
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Done);
+        assert_eq!(meta.network_wait, None);
+        assert_eq!(meta.attempts, 1);
+        let md = std::fs::read_to_string(store::transcript_path(&dir, &id)).unwrap();
+        assert!(md.contains("back online"), "{md}");
+        assert_eq!(context.recording.status(), RecordingStatus::default());
+    }
+
+    /// A day after the stop, or after [`NETWORK_RETRY_MAX`] attempts, a
+    /// waiting recording becomes a plain failure that a retry reruns.
+    #[tokio::test]
+    async fn waiting_ends_in_failed_after_a_day_or_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FlakyNetwork::new(DOWN);
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
+        let (dir, _) = waiting_recording(&context, &mut queue, tmp.path()).await;
+
+        let day_later = Local::now() + chrono::Duration::hours(25);
+        retry_waiting(&context, day_later, false).await;
+        assert!(queue.try_recv().is_err(), "not queued");
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Failed);
+        let error = meta.error.unwrap();
+        assert!(
+            error.starts_with(
+                "gave up waiting for the network 24 hours after the recording stopped: "
+            ) && error.contains("could not reach the transcription service"),
+            "{error}"
+        );
+        assert_eq!(context.recording.status(), RecordingStatus::default());
+
+        // The cap, found by a restarted daemon.
+        let mut meta = store::read_meta(&dir).unwrap();
+        meta.status = RecordingState::Waiting;
+        meta.network_wait.as_mut().unwrap().attempts = NETWORK_RETRY_MAX;
+        store::write_meta(&dir, &meta).unwrap();
+        let (next, mut next_queue) = test_context(tmp.path(), backend.clone());
+        recover_on_startup(Arc::clone(&next)).await;
+        assert!(next_queue.try_recv().is_err());
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Failed);
+        assert!(meta
+            .error
+            .unwrap()
+            .starts_with("gave up waiting for the network after 144"));
+
+        // A manual retry reruns it, with a fresh count.
+        backend.set(UP);
+        retry(&next, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
+        process_one(&next, next_queue.try_recv().unwrap()).await;
+        assert_eq!(store::read_meta(&dir).unwrap().status, RecordingState::Done);
+    }
+
+    /// `whisrs recording retry` on a waiting recording runs it at once as a
+    /// normal attempt: the wait and the counts start over.
+    #[tokio::test]
+    async fn a_manual_retry_ends_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FlakyNetwork::new(DOWN);
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
+        let (dir, _) = waiting_recording(&context, &mut queue, tmp.path()).await;
+
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Processing);
+        assert_eq!(meta.network_wait, None);
+        assert_eq!(meta.attempts, 0);
+        assert!(context.recording.status().waiting.is_empty());
+        let item = queue.try_recv().unwrap();
+        assert!(!item.recording.network_retry);
+        // A tick meanwhile does not queue it twice.
+        retry_waiting(&context, Local::now() + chrono::Duration::hours(1), false).await;
+        assert!(queue.try_recv().is_err());
+
+        backend.set(UP);
+        process_one(&context, item).await;
+        assert_eq!(store::read_meta(&dir).unwrap().status, RecordingState::Done);
+    }
+
+    /// `cancel` with nothing recording stops the automatic retries: the
+    /// recording fails with its audio kept, and a retry still runs it. With
+    /// nothing waiting either it is the usual error.
+    #[tokio::test]
+    async fn cancel_stops_the_wait_and_keeps_the_audio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FlakyNetwork::new(DOWN);
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
+        let (dir, _) = waiting_recording(&context, &mut queue, tmp.path()).await;
+
+        cancel(&context).await.unwrap();
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Failed);
+        assert!(
+            meta.error.unwrap().starts_with(WAIT_CANCELLED),
+            "the reason"
+        );
+        assert!(store::audio_path(&dir, TrackKind::Mic).exists());
+        assert_eq!(context.recording.status(), RecordingStatus::default());
+        retry_waiting(&context, Local::now() + chrono::Duration::hours(1), false).await;
+        assert!(queue.try_recv().is_err(), "no more automatic attempts");
+        let err = cancel(&context).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no recording is in progress"),
+            "{err:#}"
+        );
+
+        // Cancelled while its automatic attempt was queued: the attempt
+        // does not run.
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
+        process_one(&context, queue.try_recv().unwrap()).await;
+        retry_waiting(
+            &context,
+            Local::now() + chrono::Duration::minutes(11),
+            false,
+        )
+        .await;
+        let item = queue.try_recv().unwrap();
+        let calls = backend.calls.load(Ordering::Relaxed);
+        cancel(&context).await.unwrap();
+        process_one(&context, item).await;
+        assert_eq!(backend.calls.load(Ordering::Relaxed), calls, "not sent");
+        assert_eq!(
+            store::read_meta(&dir).unwrap().status,
+            RecordingState::Failed
+        );
+        assert_eq!(context.recording.status(), RecordingStatus::default());
+    }
+
+    /// Cancelled while its automatic attempt is running: that attempt, when
+    /// it still finds no network, fails the recording instead of waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_during_an_automatic_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FlakyNetwork::new(DOWN);
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
+        let (dir, _) = waiting_recording(&context, &mut queue, tmp.path()).await;
+
+        retry_waiting(
+            &context,
+            Local::now() + chrono::Duration::minutes(11),
+            false,
+        )
+        .await;
+        let item = queue.try_recv().unwrap();
+        backend.set(HANG);
+        let calls = backend.calls.load(Ordering::Relaxed);
+        let attempt = tokio::spawn({
+            let context = Arc::clone(&context);
+            async move { process_one(&context, item).await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.calls.load(Ordering::Relaxed) == calls {
+            assert!(Instant::now() < deadline, "the attempt never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cancel(&context).await.unwrap();
+        // The request in flight fails: still no network.
+        backend.release.notify_one();
+        attempt.await.unwrap();
+
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Failed);
+        assert!(meta.error.unwrap().starts_with(WAIT_CANCELLED));
+        assert_eq!(context.recording.status(), RecordingStatus::default());
+        assert!(context
+            .recording
+            .view
+            .lock()
+            .unwrap()
+            .wait_cancelled
+            .is_empty());
+    }
+
+    /// A restarted daemon tries a waiting recording at once, as an
+    /// automatic attempt, and a shutdown during one puts it back to waiting
+    /// without touching the crash count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_survives_a_daemon_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FlakyNetwork::new(DOWN);
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
+        let (dir, _) = waiting_recording(&context, &mut queue, tmp.path()).await;
+
+        // The next daemon start: queued at once, its last attempt was just now.
+        backend.set(HANG);
+        let (next, next_queue) = test_context(tmp.path(), backend.clone());
+        recover_on_startup(Arc::clone(&next)).await;
+        assert_eq!(next.recording.status().queued.len(), 1);
+        next.recording
+            .set_worker(tokio::spawn(run_worker(Arc::clone(&next), next_queue)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store::read_meta(&dir).unwrap().status != RecordingState::Processing {
+            assert!(
+                Instant::now() < deadline,
+                "the automatic attempt never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown(&next).await;
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Waiting, "back to waiting");
+        assert_eq!(meta.attempts, 1, "not given back, never counted");
+        assert_eq!(meta.network_wait.unwrap().attempts, 1);
+
+        // And the one after that finishes it.
+        backend.set(UP);
+        let (last, mut last_queue) = test_context(tmp.path(), backend.clone());
+        recover_on_startup(Arc::clone(&last)).await;
+        let item = last_queue.try_recv().unwrap();
+        assert!(item.recording.network_retry);
+        process_one(&last, item).await;
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Done);
+        assert_eq!(meta.attempts, 1);
+    }
+
+    /// An automatic attempt goes through the processing queue: while
+    /// another recording is being transcribed it waits its turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_automatic_attempt_waits_for_the_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FlakyNetwork::new(DOWN);
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
+        let (_, waiting_id) = waiting_recording(&context, &mut queue, tmp.path()).await;
+
+        // Another recording is being transcribed (slowly).
+        backend.set(HANG);
+        let busy = crashed_recording(tmp.path());
+        let meta = recover_dir(&busy, None).unwrap();
+        let busy_id = meta.id.clone();
+        context
+            .recording
+            .enqueue(ActiveRecording::from_meta(&busy, &meta))
+            .unwrap();
+        context
+            .recording
+            .set_worker(tokio::spawn(run_worker(Arc::clone(&context), queue)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while context.recording.status().id.as_deref() != Some(busy_id.as_str())
+            || !context.recording.status().queued.is_empty()
+        {
+            assert!(Instant::now() < deadline, "the worker never took it");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let calls = backend.calls.load(Ordering::Relaxed);
+
+        retry_waiting(
+            &context,
+            Local::now() + chrono::Duration::minutes(11),
+            false,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = context.recording.status();
+        assert_eq!(
+            status.id.as_deref(),
+            Some(busy_id.as_str()),
+            "still the busy one"
+        );
+        assert_eq!(status.queued, vec![waiting_id], "queued behind it");
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            calls,
+            "not sent meanwhile"
+        );
+        context
+            .recording
+            .worker
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .abort();
     }
 
     /// A recording session with its folder and meta on disk and a mic track

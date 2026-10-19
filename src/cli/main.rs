@@ -154,9 +154,12 @@ enum RecordingCmd {
         #[arg(long, value_name = "NAME", value_parser = whisrs::recording::validate_others_label)]
         others: Option<String>,
     },
-    /// Stop the recording and delete it
+    /// Stop the recording and delete it. With none in progress, stop the
+    /// automatic tries of recordings waiting for the network (their audio is
+    /// kept)
     Cancel,
-    /// Show whether a recording is in progress or processing
+    /// Show whether a recording is in progress or processing, and which
+    /// recordings wait for the network
     Status,
     /// List recordings, newest first
     List {
@@ -595,6 +598,7 @@ fn recording_list_json(dir: &std::path::Path, meta: &RecordingMeta) -> serde_jso
         "ended_at": meta.ended_at,
         "duration_secs": recording_duration_secs(meta),
         "dir": dir,
+        "error": meta.error,
     })
 }
 
@@ -620,6 +624,7 @@ fn recording_state_name(state: RecordingState) -> &'static str {
         RecordingState::Processing => "processing",
         RecordingState::Done => "done",
         RecordingState::Failed => "failed",
+        RecordingState::Waiting => "waiting",
     }
 }
 
@@ -671,6 +676,20 @@ fn not_ready_message(meta: &RecordingMeta) -> String {
             meta.error.as_deref().unwrap_or("unknown error"),
             meta.id
         ),
+        RecordingState::Waiting => {
+            let until = meta
+                .network_deadline()
+                .map(|d| format!(" until {}", d.format("%Y-%m-%d %H:%M")))
+                .unwrap_or_default();
+            format!(
+                "recording {} is waiting for the network: {}. whisrs tries again every {} \
+                 minutes{until}; `whisrs recording retry {}` tries now.",
+                meta.id,
+                meta.error.as_deref().unwrap_or("no network"),
+                whisrs::recording::NETWORK_RETRY_EVERY.as_secs() / 60,
+                meta.id
+            )
+        }
         state => format!(
             "recording {} has no transcript yet (status: {}).",
             meta.id,
@@ -707,6 +726,13 @@ fn format_recording_status(status: &RecordingStatus, use_color: bool) -> String 
     }
     if !status.queued.is_empty() {
         line.push_str(&format!("  ({} queued)", status.queued.len()));
+    }
+    if !status.waiting.is_empty() {
+        line.push_str(&format!(
+            "  ({} waiting for the network: {})",
+            status.waiting.len(),
+            status.waiting.join(", ")
+        ));
     }
     line
 }
@@ -1049,6 +1075,37 @@ mod tests {
         meta.error = Some("backend down".into());
         assert!(not_ready_message(&meta).contains("backend down"));
         assert!(not_ready_message(&meta).contains("whisrs recording retry m1"));
+
+        meta.status = RecordingState::Waiting;
+        meta.ended_at = Some(at(11, 0));
+        meta.error = Some("could not reach the transcription service".into());
+        meta.network_wait = Some(whisrs::recording::NetworkWait {
+            since: at(11, 1),
+            attempts: 0,
+            last_attempt_at: at(11, 1),
+        });
+        assert_eq!(
+            not_ready_message(&meta),
+            "recording m1 is waiting for the network: could not reach the transcription \
+             service. whisrs tries again every 10 minutes until 2026-10-03 11:00; \
+             `whisrs recording retry m1` tries now."
+        );
+        assert!(format_recording_row(&meta, 2).contains("  waiting     "));
+        let json = recording_list_json(std::path::Path::new("/m/m1"), &meta);
+        assert_eq!(json["status"], "waiting");
+        assert_eq!(json["error"], "could not reach the transcription service");
+    }
+
+    #[test]
+    fn recording_status_lists_the_ones_waiting_for_the_network() {
+        let status = RecordingStatus {
+            waiting: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_recording_status(&status, false),
+            "Idle  (2 waiting for the network: a, b)"
+        );
     }
 
     #[test]

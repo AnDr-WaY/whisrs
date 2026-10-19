@@ -195,10 +195,13 @@ Meant for a compositor hotkey. The options are those of
 and apply when this starts a recording.
 .TP
 .B cancel
-Stop the recording and delete it.
+Stop the recording and delete it. With no recording in progress, stop the
+automatic tries of the recordings waiting for the network instead; they are
+marked failed and keep their audio.
 .TP
 .B status
-Print whether a recording is in progress or processing.
+Print whether a recording is in progress or processing, and which recordings
+are waiting for the network.
 .TP
 \fBlist\fR [\fB\-\-json\fR]
 List recordings, newest first, with id, start time, duration, status and title.

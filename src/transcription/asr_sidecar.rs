@@ -287,7 +287,9 @@ impl TranscriptionBackend for AsrSidecarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcription::retry::{retry_transient, RATE_LIMIT_BUDGET};
+    use crate::transcription::retry::{
+        is_network_unavailable, retry_transient, retry_with_backoff, RATE_LIMIT_BUDGET,
+    };
     use crate::transcription::test_server::{serve_once, serve_responses};
     use tokio::net::TcpListener;
 
@@ -627,5 +629,52 @@ mod tests {
         .unwrap();
         assert_eq!(t.segments[0].text, "ok");
         assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    /// A sidecar that drops the connection is retried on the network
+    /// schedule and the chunk goes through once it answers; one that is not
+    /// running at all ends in a network failure, which the recording waits
+    /// out instead of failing.
+    #[tokio::test]
+    async fn network_errors_are_retried_then_waited_out() {
+        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
+        let config = test_config();
+        let quick = [std::time::Duration::from_millis(1); 4];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // The first connection is reset before any answer.
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_zero_linger().unwrap();
+            drop(stream);
+            serve_responses(
+                listener,
+                vec![(
+                    200,
+                    r#"{"text": "ok", "segments": [{"start": 1.0, "end": 2.0, "text": "ok"}]}"#,
+                )],
+            )
+            .await
+        });
+        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let t = retry_with_backoff(RATE_LIMIT_BUDGET, &[], &quick, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap();
+        assert_eq!(t.segments[0].text, "ok");
+        assert_eq!(server.await.unwrap().len(), 1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let backend = AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None);
+        let err = retry_with_backoff(RATE_LIMIT_BUDGET, &[], &quick, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap_err();
+        assert!(is_network_unavailable(&err), "{err:#}");
     }
 }

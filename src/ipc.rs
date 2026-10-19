@@ -595,6 +595,7 @@ mod tests {
             started_at: Some(chrono::Local::now()),
             dir: Some(PathBuf::from("/tmp/m")),
             queued: vec!["2026-10-01_0900".to_string()],
+            waiting: vec!["2026-09-30_1500".to_string()],
         };
         let resp = Response::Recording {
             recording: status.clone(),

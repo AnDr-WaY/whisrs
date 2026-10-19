@@ -259,10 +259,25 @@ pub fn interrupted(root: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// Recordings waiting for the network, oldest first.
+pub fn waiting(root: &Path) -> Vec<(PathBuf, RecordingMeta)> {
+    match list(root) {
+        Ok(recordings) => recordings
+            .into_iter()
+            .rev()
+            .filter(|(_, m)| m.status == RecordingState::Waiting)
+            .collect(),
+        Err(e) => {
+            warn!("failed to scan recordings for ones waiting for the network: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 /// Delete the `audio/` dir of `Done` recordings that ended at least `days`
 /// days before `now` (by `ended_at`, else `started_at`), mark them
 /// `audio_deleted`, and return their dirs. `0` sweeps every `Done` recording;
-/// a negative value keeps audio forever. `Failed`, `Recording` and
+/// a negative value keeps audio forever. `Failed`, `Waiting`, `Recording` and
 /// `Processing` recordings are never touched, so their audio stays retryable.
 pub fn sweep_retention(root: &Path, days: i64, now: DateTime<Local>) -> Vec<PathBuf> {
     if days < 0 {
@@ -487,8 +502,26 @@ mod tests {
             RecordingState::Failed,
             None,
         );
+        let later = seed(
+            root,
+            at(2026, 1, 6, 9, 0),
+            None,
+            RecordingState::Waiting,
+            None,
+        );
+        let earlier = seed(
+            root,
+            at(2026, 1, 5, 9, 0),
+            None,
+            RecordingState::Waiting,
+            None,
+        );
 
+        // Waiting for the network is not interrupted: recovery leaves it to
+        // the automatic retries.
         assert_eq!(interrupted(root), vec![proc_, rec]);
+        let waiting: Vec<PathBuf> = waiting(root).into_iter().map(|(dir, _)| dir).collect();
+        assert_eq!(waiting, vec![earlier, later], "oldest first");
     }
 
     #[test]
@@ -541,6 +574,13 @@ mod tests {
             RecordingState::Processing,
             None,
         );
+        let waiting = seed(
+            root,
+            at(2026, 1, 4, 9, 0),
+            Some("w"),
+            RecordingState::Waiting,
+            Some(at(2026, 1, 4, 10, 0)),
+        );
 
         assert!(sweep_retention(root, -1, now).is_empty());
         assert!(old.join("audio").exists());
@@ -559,7 +599,7 @@ mod tests {
         assert_eq!(sweep_retention(root, 0, now), vec![recent.clone()]);
         assert!(!recent.join("audio").exists());
 
-        for dir in [&failed, &rec, &proc_] {
+        for dir in [&failed, &rec, &proc_, &waiting] {
             assert!(dir.join("audio").exists(), "{}", dir.display());
             assert!(!read_meta(dir).unwrap().audio_deleted);
         }

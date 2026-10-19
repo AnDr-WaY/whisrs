@@ -568,7 +568,9 @@ Uses that work today:
 `whisrs recording start [--title ...]` (or the `[hotkeys] recording` binding,
 or "Start recording (mic + system audio)" in the tray menu) starts a
 recording; `whisrs recording stop` ends it and queues the transcript.
-`whisrs recording cancel` stops and deletes it. The `recording` hotkey and
+`whisrs recording cancel` stops and deletes it (with no recording in progress,
+it stops the automatic tries of recordings waiting for the network, see below).
+The `recording` hotkey and
 `whisrs recording toggle` (for a compositor binding) start a recording when
 none is in progress and stop the one that is.
 
@@ -695,6 +697,19 @@ seconds apart, except a 500 from `asr-sidecar`, which is usually an error in
 the sidecar itself. Each finished chunk is saved in the recording's `.cache/`
 folder, so a retry after a failure only sends what was not transcribed yet.
 The cache is deleted once the transcript is written.
+
+**No network.** A chunk that gets no answer at all (no network, a name that
+does not resolve, a refused or dropped connection, a TLS error) is retried 5,
+15, 30 and 60 seconds apart. If the network is still down after that, the
+recording is not failed: it waits for the network, shown as `waiting` by
+`whisrs recording list` and `whisrs recording status`, with one notification.
+The daemon tries it again when it starts and every 10 minutes while it runs,
+for up to 24 hours after the recording stopped (144 tries at most), and then
+marks it failed. These tries do not count towards the three interrupted
+attempts above. `whisrs recording retry` tries a waiting recording at once, and
+`whisrs recording cancel` with no recording in progress stops the tries and
+marks it failed, keeping its audio. An `asr-sidecar` that is not running
+counts as no network; `local-whisper` never waits.
 
 ## The vocabulary file
 
