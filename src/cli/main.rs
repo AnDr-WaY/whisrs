@@ -125,8 +125,19 @@ impl LanguageArgs {
             others,
             shared_mic: speakers.shared_mic,
             num_speakers: speakers.num_speakers,
+            participants: speakers.with.map(|p| p.0),
         }
     }
+}
+
+/// The names `--with` lists, parsed by
+/// [`whisrs::recording::naming::parse_participants`]. A newtype so clap
+/// takes the option once, as one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Participants(Vec<String>);
+
+fn parse_with(list: &str) -> Result<Participants, String> {
+    whisrs::recording::naming::parse_participants(list).map(Participants)
 }
 
 /// How the voices of a recording are told apart (`start`, `toggle`,
@@ -151,6 +162,12 @@ struct SpeakerArgs {
         value_parser = clap::value_parser!(u32).range(0..=i64::from(whisrs::recording::NUM_SPEAKERS_MAX))
     )]
     num_speakers: Option<u32>,
+    /// Who the recording is with, separated by commas (e.g. "Sarah, Omar"),
+    /// to name the voices: one voice and one name, or the last voice left
+    /// when the others are named. On `retry` it replaces the stored names;
+    /// `--with ""` clears them
+    #[arg(long = "with", value_name = "NAMES", value_parser = parse_with)]
+    with: Option<Participants>,
 }
 
 #[derive(Subcommand)]
@@ -860,6 +877,7 @@ mod tests {
             others: Some("Video".into()),
             shared_mic: None,
             num_speakers: None,
+            participants: None,
         };
         for action in ["start", "toggle"] {
             let cmd = parse_recording(&[
@@ -995,6 +1013,50 @@ mod tests {
                 let mut argv = vec!["whisrs", "recording"];
                 argv.extend_from_slice(head);
                 argv.extend_from_slice(&["--num-speakers", bad]);
+                assert!(Cli::try_parse_from(argv).is_err(), "{head:?} {bad}");
+            }
+        }
+    }
+
+    /// `--with` takes names separated by commas on `start`, `toggle` and
+    /// `retry`, trimmed; a blank list is nobody; bad lists are refused
+    /// before anything reaches the daemon.
+    #[test]
+    fn recording_with_parses() {
+        for head in [&["start"][..], &["toggle"], &["retry", "last"]] {
+            let options = |extra: &[&str]| {
+                let mut args = head.to_vec();
+                args.extend_from_slice(extra);
+                match parse_recording(&args) {
+                    RecordingCmd::Start { speakers, .. }
+                    | RecordingCmd::Toggle { speakers, .. }
+                    | RecordingCmd::Retry { speakers, .. } => {
+                        LanguageArgs::default().into_options(None, speakers)
+                    }
+                    _ => panic!("expected start, toggle or retry"),
+                }
+            };
+            assert_eq!(options(&[]).participants, None, "{head:?}");
+            assert_eq!(
+                options(&["--with", " Sarah, Omar Haddad "]).participants,
+                Some(vec!["Sarah".to_string(), "Omar Haddad".to_string()]),
+                "{head:?}"
+            );
+            assert_eq!(
+                options(&["--with", ""]).participants,
+                Some(Vec::new()),
+                "{head:?}"
+            );
+            let too_many = (0..21).map(|i| format!("p{i}")).collect::<Vec<_>>();
+            for bad in [
+                "Sarah,,Omar",
+                "Sarah, sarah",
+                "Sarah\u{7}",
+                &too_many.join(","),
+            ] {
+                let mut argv = vec!["whisrs", "recording"];
+                argv.extend_from_slice(head);
+                argv.extend_from_slice(&["--with", bad]);
                 assert!(Cli::try_parse_from(argv).is_err(), "{head:?} {bad}");
             }
         }

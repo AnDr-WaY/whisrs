@@ -38,7 +38,7 @@ whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
 whisrs config    # interactive config editor
-whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
+whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sarah, Omar"] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
 whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id>
 
 # Dev loop: rebuild this checkout and restart the daemon
@@ -76,6 +76,7 @@ src/
 │   ├── process.rs          #   Echo-cancel, send the speech, transcribe (cached, rate-limit retry), merge, write
 │   ├── speakers.rs         #   Speaker separation: plan, align words to voices, ids by first appearance
 │   ├── diarize.rs          #   Diarization sidecar client (contract, timeout, retries)
+│   ├── naming.rs           #   Speaker names: user > self > --with > last voice > Speaker N
 │   ├── split.rs            #   Cut long tracks into backend-sized chunks at silence
 │   └── render.rs           #   Markdown transcript rendering
 ├── audio/
@@ -222,10 +223,10 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
 {"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy", "title": "...", "id": "...",
  "language": "de", "mic_language": "de", "system_language": "auto", "others": "Video",
- "shared_mic": true, "num_speakers": 3}
+ "shared_mic": true, "num_speakers": 3, "participants": ["Sarah", "Omar"]}
                                      // all but action optional: title (start/toggle), id (retry/copy,
-                                     // default "last"), the languages, shared_mic and num_speakers
-                                     // (start/toggle/retry;
+                                     // default "last"), the languages, shared_mic, num_speakers and
+                                     // participants (--with) (start/toggle/retry;
                                      // a track's own language wins over "language"), others = system track
                                      // label (start/toggle). Validated by the daemon
                                      // (RecordingOptions::validated)

@@ -56,10 +56,9 @@ pub enum Command {
     /// `title` names a new recording (`start`/`toggle`); `id` selects an
     /// existing one (`retry`/`copy`). `options` (flat on the wire:
     /// `language`, `mic_language`, `system_language`, `others`,
-    /// `shared_mic`, `num_speakers`) set the languages and speaker settings
-    /// of a new
-    /// recording or a retry and the label of the system track; a request
-    /// without them gets the config defaults.
+    /// `shared_mic`, `num_speakers`, `participants`) set the languages and
+    /// speaker settings of a new recording or a retry and the label of the
+    /// system track; a request without them gets the config defaults.
     Recording {
         action: RecordingAction,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -548,6 +547,7 @@ mod tests {
             others: Some("Video".to_string()),
             shared_mic: Some(true),
             num_speakers: Some(3),
+            participants: Some(vec!["Sarah".to_string(), "Omar".to_string()]),
         };
         let cmd = Command::Recording {
             action: RecordingAction::Start,
@@ -558,7 +558,7 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
             json,
-            r#"{"cmd":"recording","action":"start","title":"Lesson 50","language":"de","system_language":"auto","others":"Video","shared_mic":true,"num_speakers":3}"#
+            r#"{"cmd":"recording","action":"start","title":"Lesson 50","language":"de","system_language":"auto","others":"Video","shared_mic":true,"num_speakers":3,"participants":["Sarah","Omar"]}"#
         );
         let parsed: Command = serde_json::from_str(&json).unwrap();
         assert!(
@@ -567,7 +567,7 @@ mod tests {
         );
 
         let retry: Command = serde_json::from_str(
-            r#"{"cmd":"recording","action":"retry","id":"last","mic_language":"en","shared_mic":false,"num_speakers":0}"#,
+            r#"{"cmd":"recording","action":"retry","id":"last","mic_language":"en","shared_mic":false,"num_speakers":0,"participants":[]}"#,
         )
         .unwrap();
         let Command::Recording {
@@ -587,6 +587,7 @@ mod tests {
                 mic_language: Some("en".to_string()),
                 shared_mic: Some(false),
                 num_speakers: Some(0),
+                participants: Some(Vec::new()),
                 ..Default::default()
             }
         );

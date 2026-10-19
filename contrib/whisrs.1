@@ -171,7 +171,7 @@ is taken, it may be a full id, a unique id prefix, or
 for the newest recording. Requires an action:
 .RS
 .TP
-\fBstart\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR] [\fB\-l\fR, \fB\-\-language\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR]
+\fBstart\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR] [\fB\-l\fR, \fB\-\-language\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR] [\fB\-\-with\fR \fINAMES\fR]
 Start a recording. The optional title goes into the transcript and the
 folder name.
 .B \-l
@@ -197,11 +197,15 @@ tells a diarization sidecar
 .RB ( "[recording] diarization_url" )
 how many voices the system audio holds (your mic, when there is no system
 audio), from 0 (let it decide) to 20.
+.B \-\-with
+says who the recording is with, names separated by commas (at most 20), to
+name the voices on the system audio: one voice and one name, or the last
+voice left once the others have names.
 .TP
 .B stop
 Stop the recording and queue it for transcription.
 .TP
-\fBtoggle\fR [\fB\-t\fR \fITITLE\fR] [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR]
+\fBtoggle\fR [\fB\-t\fR \fITITLE\fR] [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR] [\fB\-\-with\fR \fINAMES\fR]
 Start a recording when none is in progress, otherwise stop the one that is.
 Meant for a compositor hotkey. The options are those of
 .B start
@@ -236,16 +240,19 @@ Print the recording's folder.
 \fBcopy\fR \fIID\fR
 Copy the transcript to the clipboard.
 .TP
-\fBretry\fR \fIID\fR [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR]
+\fBretry\fR \fIID\fR [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR] [\fB\-\-with\fR \fINAMES\fR]
 Transcribe the recording again, for example after a failure or in another
 language. A language given here replaces the one the recording saved (as for
 .BR start ,
 .B \-l
 covers both tracks); a track left out keeps its own.
-.B \-\-shared\-mic
-and
+.BR \-\-shared\-mic ,
 .B \-\-num\-speakers
-likewise replace the saved settings, and leaving them out keeps them. A recording whose
+and
+.B \-\-with
+likewise replace the saved settings, and leaving them out keeps them
+.RB ( "\-\-with \(dq\(dq"
+clears the names). A recording whose
 transcription was interrupted three times (by a crash each time) is marked
 failed instead of being resumed at startup; retry resets that count and
 queues it again. After a failure, chunks already transcribed with the same

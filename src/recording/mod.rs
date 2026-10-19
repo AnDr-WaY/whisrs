@@ -7,6 +7,7 @@
 
 pub mod diarize;
 pub mod echo;
+pub mod naming;
 pub mod process;
 pub mod recorder;
 pub mod render;
@@ -18,6 +19,7 @@ pub mod wav_repair;
 
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -64,10 +66,10 @@ pub fn validate_others_label(label: &str) -> Result<String, String> {
 }
 
 /// Per-recording settings a `recording` command may carry, all optional.
-/// The languages, `num_speakers` and `shared_mic` apply to `start`, a
-/// `toggle` that starts, and `retry`; `others` to `start` and `toggle`. What
-/// is left out keeps the config default, or for a retry what the recording
-/// stored.
+/// The languages, `num_speakers`, `shared_mic` and `participants` apply to
+/// `start`, a `toggle` that starts, and `retry`; `others` to `start` and
+/// `toggle`. What is left out keeps the config default, or for a retry what
+/// the recording stored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingOptions {
     /// Language of both tracks.
@@ -90,13 +92,19 @@ pub struct RecordingOptions {
     /// decide (`[recording] num_speakers`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_speakers: Option<u32>,
+    /// Who the recording is with (`--with "Sarah, Omar"`), for naming its
+    /// speakers ([`naming`]). An empty list names nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participants: Option<Vec<String>>,
 }
 
 impl RecordingOptions {
     /// Every given value checked and normalized: the languages by the `-l`
     /// rule ([`validate_language_override`]), `others` by
-    /// [`validate_others_label`]. The daemon runs this on every request: the
-    /// socket is open to any client, not only the CLI that checks first.
+    /// [`validate_others_label`], the participants by
+    /// [`naming::validate_participants`]. The daemon runs this on every
+    /// request: the socket is open to any client, not only the CLI that
+    /// checks first.
     pub fn validated(self) -> Result<Self, String> {
         let language =
             |value: Option<String>| value.map(|v| validate_language_override(&v)).transpose();
@@ -107,6 +115,10 @@ impl RecordingOptions {
             others: self.others.map(|o| validate_others_label(&o)).transpose()?,
             shared_mic: self.shared_mic,
             num_speakers: self.num_speakers.map(validate_num_speakers).transpose()?,
+            participants: self
+                .participants
+                .map(naming::validate_participants)
+                .transpose()?,
         })
     }
 
@@ -278,8 +290,10 @@ pub struct Speaker {
     /// for, as `"others"` does on the system track.
     pub id: String,
     pub name: String,
-    /// How the name was found: `"self"` (the user), `"channel"` (the track's
-    /// label: the others label), or `"none"` (unnamed: `Speaker N`).
+    /// How the name was found ([`naming`]): `"user"` (`whisrs recording
+    /// name`), `"self"` (the user), `"with"` (the one participant), `"last"`
+    /// (the last participant left), `"channel"` (the track's label: the
+    /// others label), or `"none"` (unnamed: `Speaker N`).
     pub source: String,
     /// The words that named the speaker, when a name came from the
     /// transcript.
@@ -348,6 +362,15 @@ pub struct RecordingMeta {
     /// from the config.
     #[serde(default)]
     pub num_speakers: Option<u32>,
+    /// Who the recording is with (`--with`), set at start (a retry given
+    /// them replaces them). Empty when nobody was named.
+    #[serde(default)]
+    pub participants: Vec<String>,
+    /// The names the user gave speakers (`whisrs recording name`), by
+    /// speaker id. Kept apart from `speakers`, which processing computes
+    /// again, so a retry keeps them; they win over every other name.
+    #[serde(default)]
+    pub speaker_names: BTreeMap<String, String>,
     /// How the voices were told apart, set by processing: `"off"`, or the
     /// method and model, e.g. `"deepgram:latest"`. `None` in a recording
     /// processed before speakers were separated.
@@ -408,6 +431,8 @@ impl RecordingMeta {
             others_label: None,
             shared_mic: None,
             num_speakers: None,
+            participants: Vec::new(),
+            speaker_names: BTreeMap::new(),
             diarization: None,
             backend: None,
             model: None,
@@ -451,8 +476,8 @@ impl RecordingMeta {
     }
 
     /// Replace what a retry's `options` give: the languages
-    /// ([`Self::apply_languages`]), `shared_mic` and `num_speakers`. The
-    /// rest keep theirs.
+    /// ([`Self::apply_languages`]), `shared_mic`, `num_speakers` and the
+    /// participants. The rest keep theirs.
     pub fn apply_options(&mut self, options: &RecordingOptions) {
         self.apply_languages(options);
         if let Some(shared) = options.shared_mic {
@@ -460,6 +485,9 @@ impl RecordingMeta {
         }
         if let Some(n) = options.num_speakers {
             self.num_speakers = Some(n);
+        }
+        if let Some(participants) = &options.participants {
+            self.participants = participants.clone();
         }
     }
 
@@ -528,6 +556,8 @@ mod tests {
         meta.others_label = Some("Video".into());
         meta.shared_mic = Some(true);
         meta.num_speakers = Some(3);
+        meta.participants = vec!["Sarah".into(), "Omar".into()];
+        meta.speaker_names = BTreeMap::from([("S2".to_string(), "Dana".to_string())]);
         meta.diarization = Some("deepgram:latest".into());
         meta.speakers = vec![Speaker {
             id: "S1".into(),
@@ -567,6 +597,8 @@ mod tests {
         assert_eq!(meta.shared_mic, None);
         assert_eq!(meta.num_speakers, None);
         assert_eq!(meta.diarization, None);
+        assert!(meta.participants.is_empty());
+        assert!(meta.speaker_names.is_empty());
     }
 
     /// A `recording.json` processed before speakers were separated loads:
@@ -643,6 +675,22 @@ mod tests {
         assert_eq!(meta.language(TrackKind::Mic), Some("de"), "kept");
         meta.apply_options(&RecordingOptions::default());
         assert_eq!(meta.num_speakers, Some(4), "kept");
+
+        // Participants given replace the stored ones, none keeps them, and
+        // an empty list clears them.
+        meta.participants = vec!["Sarah".into()];
+        meta.apply_options(&RecordingOptions::default());
+        assert_eq!(meta.participants, ["Sarah"], "kept");
+        meta.apply_options(&RecordingOptions {
+            participants: Some(vec!["Omar".into(), "Dana".into()]),
+            ..Default::default()
+        });
+        assert_eq!(meta.participants, ["Omar", "Dana"]);
+        meta.apply_options(&RecordingOptions {
+            participants: Some(Vec::new()),
+            ..Default::default()
+        });
+        assert!(meta.participants.is_empty());
     }
 
     /// A waiting recording gives up a day after its first failed try,
@@ -674,6 +722,7 @@ mod tests {
             others: Some("  Video  ".into()),
             shared_mic: Some(true),
             num_speakers: Some(NUM_SPEAKERS_MAX),
+            participants: Some(vec![" Sarah ".into(), "Omar".into()]),
         }
         .validated()
         .unwrap();
@@ -686,6 +735,7 @@ mod tests {
                 others: Some("Video".into()),
                 shared_mic: Some(true),
                 num_speakers: Some(NUM_SPEAKERS_MAX),
+                participants: Some(vec!["Sarah".into(), "Omar".into()]),
             }
         );
         assert_eq!(
@@ -733,6 +783,35 @@ mod tests {
         .validated()
         .unwrap_err();
         assert!(err.contains("num_speakers is 21"), "{err}");
+        // And participants it would not send.
+        for (names, want) in [
+            (vec![" ".to_string()], "a name is empty"),
+            (vec!["Sarah, Omar".to_string()], "comma"),
+            (
+                vec!["Sarah".to_string(), "SARAH".to_string()],
+                "listed twice",
+            ),
+            (vec!["x".to_string(); 21], "at most 20"),
+        ] {
+            let err = RecordingOptions {
+                participants: Some(names.clone()),
+                ..Default::default()
+            }
+            .validated()
+            .unwrap_err();
+            assert!(err.contains(want), "{names:?}: {err}");
+        }
+        // An empty list is nobody: a retry clears the participants with it.
+        assert_eq!(
+            RecordingOptions {
+                participants: Some(Vec::new()),
+                ..Default::default()
+            }
+            .validated()
+            .unwrap()
+            .participants,
+            Some(Vec::new())
+        );
     }
 
     /// A track's own language wins over `language`, which covers the

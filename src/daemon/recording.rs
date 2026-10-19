@@ -752,9 +752,9 @@ fn open_tracks(
 
 /// The meta of a recording that is starting: each track's language from
 /// `options` ([`RecordingOptions::language_for`]), else from the config
-/// ([`RecordingConfig::language_for`]), the label of the system track, and
+/// ([`RecordingConfig::language_for`]), the label of the system track,
 /// whether the mic is shared and how many voices to look for, from
-/// `options` else the config.
+/// `options` else the config, and who the recording is with.
 fn new_meta(
     id: String,
     title: Option<String>,
@@ -780,6 +780,7 @@ fn new_meta(
     );
     meta.shared_mic = Some(options.shared_mic.unwrap_or(recording.shared_mic));
     meta.num_speakers = Some(options.num_speakers.unwrap_or(recording.num_speakers));
+    meta.participants = options.participants.clone().unwrap_or_default();
     meta
 }
 
@@ -2620,14 +2621,22 @@ mod tests {
 
         assert_eq!(meta.num_speakers, Some(0), "the config's");
 
+        assert!(meta.participants.is_empty());
+
         let meta =
             stored(r#"{"cmd":"recording","action":"start","shared_mic":true,"num_speakers":4}"#);
         assert_eq!(meta.shared_mic, Some(true));
         assert_eq!(meta.num_speakers, Some(4));
+
+        let meta = stored(
+            r#"{"cmd":"recording","action":"toggle","participants":[" Sarah","Omar Haddad "]}"#,
+        );
+        assert_eq!(meta.participants, ["Sarah", "Omar Haddad"]);
     }
 
     /// `shared_mic` is stored at start from the config when the command
-    /// gives none, kept by a retry without it, and replaced by one with it.
+    /// gives none, kept by a retry without it, and replaced by one with it;
+    /// the participants likewise.
     #[tokio::test]
     async fn shared_mic_is_stored_and_a_retry_replaces_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2636,6 +2645,7 @@ mod tests {
         let (id, dir) = store::create(tmp.path(), Local::now(), None).unwrap();
         let mut meta = new_meta(id, None, Local::now(), &Default::default(), &context.config);
         assert_eq!(meta.shared_mic, Some(true), "from the config");
+        meta.participants = vec!["Sarah".into()];
         meta.status = RecordingState::Failed;
         meta.tracks.push(track_meta(TrackKind::Mic, "test".into()));
         store::write_meta(&dir, &meta).unwrap();
@@ -2649,15 +2659,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store::read_meta(&dir).unwrap().shared_mic, Some(true));
+        assert_eq!(store::read_meta(&dir).unwrap().participants, ["Sarah"]);
         process_one(&context, queue.try_recv().unwrap()).await;
 
         let options = options_from_ipc(
-            r#"{"cmd":"recording","action":"retry","id":"last","shared_mic":false}"#,
+            r#"{"cmd":"recording","action":"retry","id":"last","shared_mic":false,
+                "participants":["Omar","Dana"]}"#,
         );
         retry(&context, "last", &options.validated().unwrap())
             .await
             .unwrap();
-        assert_eq!(store::read_meta(&dir).unwrap().shared_mic, Some(false));
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.shared_mic, Some(false));
+        assert_eq!(meta.participants, ["Omar", "Dana"]);
     }
 
     /// Bad values from a client other than the CLI are refused before a
@@ -2684,6 +2698,9 @@ mod tests {
             ("retry", r#""language":"german""#),
             ("start", r#""num_speakers":21"#),
             ("retry", r#""num_speakers":99"#),
+            ("start", r#""participants":["Sarah",""]"#),
+            ("toggle", r#""participants":["Sarah, Omar"]"#),
+            ("retry", r#""participants":["Sarah","sarah"]"#),
         ] {
             let cmd = format!(r#"{{"cmd":"recording","action":"{action}",{json}}}"#);
             let whisrs::Command::Recording {
@@ -2702,7 +2719,8 @@ mod tests {
             assert!(
                 message.starts_with("invalid language")
                     || message.contains("others label")
-                    || message.starts_with("num_speakers is"),
+                    || message.starts_with("num_speakers is")
+                    || message.starts_with("participants: "),
                 "{cmd}: {message}"
             );
         }

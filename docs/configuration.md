@@ -619,6 +619,32 @@ then told apart too (`M1`, `M2`, ...), and the mic is you only when it holds
 a single voice. A recording keeps the `shared_mic` it started with; a retry
 given the option replaces it.
 
+**Naming the speakers.** A voice gets a name only when whisrs can tell who
+it is; every other voice stays "Speaker N". These steps run in order, and
+the first one that names a speaker wins:
+
+1. Your mic is you (`user_name`), when it holds one voice.
+2. `--with "Sarah, Omar"` on `start` or `toggle` says who the recording is
+   with: names separated by commas, at most 20, each up to 64 characters.
+   When the system audio holds exactly one voice and you list exactly one
+   person, that voice is them.
+3. When every voice on the system audio but one has a name, one person you
+   listed is left, there are as many voices as people listed, and
+   `shared_mic` is off, the last voice is that person.
+4. Everyone else is "Speaker N", numbered in the order they first speak. A
+   single voice on the system audio keeps the others label instead.
+
+A `minor` voice is never named after someone you listed, and does not count
+as a voice. Your own name in the `--with` list is you and is not counted.
+With a shared mic that holds other voices, one person listed is not enough
+to name the one voice on the system audio, since that person may be in the
+room with you. `--with` names only voices that were told apart: with one
+speaker per track, name the system audio with `--others` instead.
+`whisrs recording retry <id> --with "..."` replaces the names, and
+`--with ""` clears them. `recording.json` keeps them as `participants`, and
+each speaker's `source` says how it got its name: `self`, `with`, `last`,
+`channel` (the others label) or `none` (Speaker N).
+
 **A diarization sidecar.** A local server that only finds who speaks when,
 so speakers can be told apart offline or with a backend that cannot do it
 (Groq, OpenAI, `local-whisper`). whisrs sends it each separated track once,

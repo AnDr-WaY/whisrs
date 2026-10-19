@@ -8,8 +8,9 @@
 //! the segments are mapped back, split where the voice changes when the
 //! track's voices are told apart ([`super::speakers`]), filtered and moved
 //! onto the recording timeline. Mic segments that still echo the system
-//! track are dropped, the voices become speakers, and the two channels are
-//! merged. The result lands in `recording.json` and `<id>.md`.
+//! track are dropped, the voices become speakers, the two channels are
+//! merged, and the speakers are named ([`super::naming`]). The result lands
+//! in `recording.json` and `<id>.md`.
 
 use std::ffi::CStr;
 use std::fs;
@@ -28,6 +29,7 @@ use tracing::{debug, info, warn};
 
 use super::diarize::{DiarizationSidecar, Timing};
 use super::echo::{cancel_echo, EchoOutcome};
+use super::naming;
 use super::render::render_markdown;
 use super::speakers::{self, Labels, Method, Turn};
 use super::speech::{self, TimeMap};
@@ -287,6 +289,7 @@ async fn process_with_timing(
     };
     meta.speakers = speakers::assign(&mut mic, &mut system, &context);
     meta.segments = merge_channels(mic, system);
+    naming::name_speakers(&mut meta, &user);
     meta.diarization = Some(plan.method.label().to_string());
     meta.backend = Some(name);
     meta.model = Some(model);
@@ -2689,6 +2692,62 @@ mod tests {
             md.contains("**[00:00:04] Video:** hello there good morning so the plan\n"),
             "{md}"
         );
+    }
+
+    /// `--with` one person and one remote voice: the voice is them, in the
+    /// transcript and its front matter.
+    #[tokio::test]
+    async fn the_one_participant_names_the_one_remote_voice() {
+        let (tmp, _) = call();
+        let mut meta = store::read_meta(tmp.path()).unwrap();
+        meta.participants = vec!["Sarah".into()];
+        store::write_meta(tmp.path(), &meta).unwrap();
+        let mut backend = call_voices();
+        backend.voices = vec![
+            ("hi all", "0"),
+            ("hello there", "1"),
+            ("good morning", "1"),
+            ("so the plan", "1"),
+        ];
+        let config = speaker_config("diarization = \"backend\"\n");
+        let meta = run_labelled(tmp.path(), backend, &config).await;
+        assert_eq!(speaker_names(&meta), [("me", "Tester"), ("S1", "Sarah")]);
+        assert_eq!(meta.speakers[1].source, "with");
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(
+            md.contains("speakers:\n  - \"Tester\"\n  - \"Sarah\"\n"),
+            "{md}"
+        );
+        assert!(md.contains("**[00:00:04] Sarah:** hello there"), "{md}");
+    }
+
+    /// The names the user gave are kept by processing, which names the
+    /// rest around them: here the last voice left is the last participant.
+    #[tokio::test]
+    async fn the_users_names_are_kept_and_the_last_voice_named() {
+        let (tmp, _) = call();
+        let mut meta = store::read_meta(tmp.path()).unwrap();
+        meta.participants = vec!["Sarah".into(), "Omar".into()];
+        meta.speaker_names = [("S1".to_string(), "Sarah".to_string())].into();
+        store::write_meta(tmp.path(), &meta).unwrap();
+        let config = speaker_config("diarization = \"backend\"\n");
+        let meta = run_labelled(tmp.path(), call_voices(), &config).await;
+        let sources: Vec<(&str, &str, &str)> = meta
+            .speakers
+            .iter()
+            .map(|s| (s.id.as_str(), s.name.as_str(), s.source.as_str()))
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                ("me", "Tester", "self"),
+                ("S1", "Sarah", "user"),
+                ("S2", "Omar", "last")
+            ]
+        );
+        assert_eq!(meta.speaker_names.len(), 1, "kept as given");
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(md.contains("**[00:00:09] Omar:** good morning"), "{md}");
     }
 
     /// The mic is the user unless it is shared: then its voices are told
