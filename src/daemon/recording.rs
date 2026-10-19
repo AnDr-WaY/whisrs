@@ -521,7 +521,8 @@ fn mic_device(recording: &RecordingConfig, audio_device: &str) -> String {
 /// Where the system track comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SystemSource {
-    /// The monitor of the default output device, looked up at start.
+    /// The monitor of the default output device, looked up at start and
+    /// followed when the default output changes.
     DefaultMonitor,
     /// `"none"`: record the mic only.
     Off,
@@ -610,13 +611,28 @@ pub(crate) async fn handle_recording(
     }
 }
 
-/// Find the system track's source name. Blocking. `None` when the recording
+/// The system track's source as resolved at start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SystemDevice {
+    name: String,
+    /// The default output's monitor: the capture moves when the default
+    /// output changes. A source named in the config is never followed.
+    follow_default: bool,
+}
+
+/// Find the system track's source. Blocking. `None` when the recording
 /// takes the mic only.
-fn resolve_system(system: SystemSource) -> Option<Result<String>> {
+fn resolve_system(system: SystemSource) -> Option<Result<SystemDevice>> {
     match system {
         SystemSource::Off => None,
-        SystemSource::DefaultMonitor => Some(default_monitor_source()),
-        SystemSource::Named(name) => Some(Ok(name)),
+        SystemSource::DefaultMonitor => Some(default_monitor_source().map(|name| SystemDevice {
+            name,
+            follow_default: true,
+        })),
+        SystemSource::Named(name) => Some(Ok(SystemDevice {
+            name,
+            follow_default: false,
+        })),
     }
 }
 
@@ -651,7 +667,7 @@ fn muted_mic_alarm(id: &str, notify: bool) -> SilenceAlarm {
 fn open_tracks(
     dir: &Path,
     mic: &str,
-    system: Option<Result<String>>,
+    system: Option<Result<SystemDevice>>,
     silence: SilenceAlarm,
 ) -> Result<(Vec<TrackCapture>, Vec<TrackMeta>, Option<String>)> {
     let mut captures = Vec::new();
@@ -671,12 +687,23 @@ fn open_tracks(
     captures.push(TrackCapture::new(TrackKind::Mic, Some(handle), writer));
     metas.push(track_meta(TrackKind::Mic, mic.to_string()));
 
-    let Some(system_name) = system else {
+    let Some(system) = system else {
         return Ok((captures, metas, None));
     };
     // The strict start's errors already name the device.
-    let opened =
-        system_name.and_then(|name| AudioCaptureHandle::start_strict(&name).map(|h| (name, h)));
+    let opened = system.and_then(
+        |SystemDevice {
+             name,
+             follow_default,
+         }| {
+            let handle = if follow_default {
+                AudioCaptureHandle::start_following_monitor(&name)
+            } else {
+                AudioCaptureHandle::start_strict(&name)
+            };
+            handle.map(|h| (name, h))
+        },
+    );
     match opened {
         Ok((name, mut handle)) => {
             let rx = handle
@@ -755,9 +782,9 @@ async fn start(
     // open leaves a recording recovery can find, never an orphan audio folder.
     let mut meta = new_meta(id.clone(), title, started_at, options, &context.config);
     meta.tracks = vec![track_meta(TrackKind::Mic, mic.clone())];
-    if let Some(Ok(name)) = &system {
+    if let Some(Ok(system)) = &system {
         meta.tracks
-            .push(track_meta(TrackKind::System, name.clone()));
+            .push(track_meta(TrackKind::System, system.name.clone()));
     }
     if let Err(e) = store::write_meta(&dir, &meta) {
         remove_recording_dir(&dir).await;
@@ -2160,6 +2187,18 @@ mod tests {
             system_source(Some("x.monitor")),
             SystemSource::Named("x.monitor".into())
         );
+        // A source named in the config is recorded as is, never followed;
+        // only the default output's monitor is (resolved at start, which
+        // needs a sound server, so it is covered end to end).
+        let named = resolve_system(SystemSource::Named("x.monitor".into()));
+        assert_eq!(
+            named.unwrap().unwrap(),
+            SystemDevice {
+                name: "x.monitor".into(),
+                follow_default: false
+            }
+        );
+        assert!(resolve_system(SystemSource::Off).is_none());
     }
 
     #[test]

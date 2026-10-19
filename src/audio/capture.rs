@@ -2,9 +2,12 @@
 //!
 //! Opens the configured input device (see [`super::device`]) at 16kHz mono
 //! 16-bit and pushes audio chunks into a tokio mpsc channel for downstream
-//! processing.
+//! processing. A recording's system track can follow the default output
+//! ([`AudioCaptureHandle::start_following_monitor`]): its capture moves to
+//! the new default's monitor, with the gap filled with zeros so the track
+//! keeps its timeline.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +32,232 @@ pub(super) const CHANNELS: u16 = 1;
 /// the cases cpal does not bound: a PulseAudio `play()` blocks until the
 /// first data arrives, and listing sources on a hung server never returns.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often a following capture asks the sound server for the default
+/// output. A query on the capture thread, never in a stream callback.
+const FOLLOW_POLL: Duration = Duration::from_secs(2);
+
+/// How many of a stream's latest chunks [`StreamClock`] keeps: about 3 s of
+/// PulseAudio chunks, short enough that clock drift does not matter.
+const CLOCK_WINDOW: usize = 32;
+
+/// How much of a new stream's audio [`Splice`] holds before it decides where
+/// that audio began: a stream may hand over what it buffered while starting
+/// in one quick burst.
+const SPLICE_HOLD: Duration = Duration::from_millis(600);
+
+fn samples_to_duration(samples: usize) -> Duration {
+    Duration::from_secs_f64(samples as f64 / f64::from(SAMPLE_RATE))
+}
+
+/// When a stream's audio began, estimated from its chunks: each chunk's
+/// arrival minus the audio the stream delivered up to it is that start plus
+/// the chunk's delivery delay, so the smallest is the best estimate. Old and
+/// new stream are measured alike, so their common delay cancels out.
+fn earliest_start(arrived: Instant, delivered: usize) -> Instant {
+    arrived
+        .checked_sub(samples_to_duration(delivered))
+        .unwrap_or(arrived)
+}
+
+/// Where the current stream of a capture is on the wall clock, written by
+/// its callbacks and read by the capture thread at a switch, without a lock:
+/// the start estimates of its last [`CLOCK_WINDOW`] chunks and the samples
+/// it delivered.
+struct StreamClock {
+    base: Instant,
+    /// Nanoseconds after `base` (a start may precede it: signed), or
+    /// `i64::MAX` for an empty slot.
+    starts: [AtomicI64; CLOCK_WINDOW],
+    next: AtomicUsize,
+    samples: AtomicU64,
+}
+
+impl StreamClock {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            starts: std::array::from_fn(|_| AtomicI64::new(i64::MAX)),
+            next: AtomicUsize::new(0),
+            samples: AtomicU64::new(0),
+        }
+    }
+
+    /// A chunk of `len` samples arrived at `at`. Called by the one callback
+    /// of the current stream.
+    fn mark(&self, at: Instant, len: usize) {
+        let delivered = self.samples.fetch_add(len as u64, Ordering::AcqRel) + len as u64;
+        let start = earliest_start(at, delivered as usize);
+        let nanos = if start >= self.base {
+            i64::try_from(start.duration_since(self.base).as_nanos()).unwrap_or(i64::MAX - 1)
+        } else {
+            -i64::try_from(self.base.duration_since(start).as_nanos()).unwrap_or(i64::MAX)
+        };
+        let slot = self.next.fetch_add(1, Ordering::AcqRel) % CLOCK_WINDOW;
+        self.starts[slot].store(nanos, Ordering::Release);
+    }
+
+    /// Where the stream's audio ended: its start estimate plus the audio it
+    /// delivered. `None` before its first chunk.
+    fn audio_end(&self) -> Option<Instant> {
+        let start = self
+            .starts
+            .iter()
+            .map(|s| s.load(Ordering::Acquire))
+            .filter(|&n| n != i64::MAX)
+            .min()?;
+        let start = if start >= 0 {
+            self.base + Duration::from_nanos(start as u64)
+        } else {
+            self.base - Duration::from_nanos(start.unsigned_abs())
+        };
+        Some(start + samples_to_duration(self.samples.load(Ordering::Acquire) as usize))
+    }
+
+    /// Forget the stream that was just dropped, before the next one starts.
+    fn reset(&self) {
+        for start in &self.starts {
+            start.store(i64::MAX, Ordering::Release);
+        }
+        self.samples.store(0, Ordering::Release);
+    }
+}
+
+/// Zero samples that put audio beginning at `began` right after audio that
+/// ended at `resume_at`. An overlap (it began before the other ended) needs
+/// none.
+pub(crate) fn gap_fill(resume_at: Instant, began: Instant) -> usize {
+    let gap = began.saturating_duration_since(resume_at);
+    (gap.as_secs_f64() * f64::from(SAMPLE_RATE)).round() as usize
+}
+
+/// `samples` zeros, a second at a time.
+fn silence(samples: usize) -> Vec<AudioChunk> {
+    let second = SAMPLE_RATE as usize;
+    (0..samples.div_ceil(second))
+        .map(|i| vec![0; second.min(samples - i * second)])
+        .collect()
+}
+
+/// Joins a following capture's new stream onto its track: holds the new
+/// stream's first [`SPLICE_HOLD`] of audio, estimates where it began
+/// ([`earliest_start`]), and lets it out behind the zeros that fill the time
+/// since the old stream's audio ended ([`gap_fill`]), so the track keeps the
+/// wall-clock timeline.
+pub(crate) struct Splice {
+    resume_at: Instant,
+    held: Vec<AudioChunk>,
+    held_samples: usize,
+    began: Option<Instant>,
+}
+
+impl Splice {
+    pub(crate) fn new(resume_at: Instant) -> Self {
+        Self {
+            resume_at,
+            held: Vec::new(),
+            held_samples: 0,
+            began: None,
+        }
+    }
+
+    /// Take a chunk that arrived `at`. Once [`SPLICE_HOLD`] of audio is in,
+    /// returns the zeros and the held chunks to send, in order.
+    pub(crate) fn push(&mut self, chunk: AudioChunk, at: Instant) -> Option<Vec<AudioChunk>> {
+        self.held_samples += chunk.len();
+        let began = earliest_start(at, self.held_samples);
+        self.began = Some(self.began.map_or(began, |b| b.min(began)));
+        self.held.push(chunk);
+        (samples_to_duration(self.held_samples) >= SPLICE_HOLD).then(|| self.release())
+    }
+
+    /// The zeros and the held chunks, whatever was held so far.
+    pub(crate) fn release(&mut self) -> Vec<AudioChunk> {
+        let fill = self.began.map_or(0, |b| gap_fill(self.resume_at, b));
+        let mut out = silence(fill);
+        out.append(&mut self.held);
+        self.held_samples = 0;
+        out
+    }
+}
+
+/// Where a stream's callback sends its chunks: through a [`Splice`] first
+/// when the stream replaced another. A following capture shares it with its
+/// thread, which retires it before dropping the stream, at a switch and at
+/// the stop: cpal's PulseAudio host can still run the callback once after
+/// the drop, and a chunk sent then, after the stream's end was read, would
+/// put everything after it one chunk late. Retiring also lets out what the
+/// splice holds, so a stop right after a switch loses nothing.
+struct Feed {
+    tx: mpsc::UnboundedSender<AudioChunk>,
+    splice: Option<Splice>,
+    retired: bool,
+}
+
+type SharedFeed = Arc<std::sync::Mutex<Feed>>;
+
+fn lock_feed(feed: &SharedFeed) -> std::sync::MutexGuard<'_, Feed> {
+    feed.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Feed {
+    fn new(tx: mpsc::UnboundedSender<AudioChunk>, splice: Option<Splice>) -> Self {
+        Self {
+            tx,
+            splice,
+            retired: false,
+        }
+    }
+
+    /// Send a chunk that arrived `at` and mark it on `clock`, together, so
+    /// the capture thread never sees one without the other.
+    fn send_marked(&mut self, chunk: AudioChunk, at: Instant, clock: &StreamClock) {
+        if self.retired {
+            return;
+        }
+        let len = chunk.len();
+        self.send(chunk, at);
+        if len > 0 {
+            clock.mark(at, len);
+        }
+    }
+
+    /// Let out what the splice holds and ignore every later chunk.
+    fn retire(&mut self) {
+        if let Some(mut splice) = self.splice.take() {
+            for chunk in splice.release() {
+                let _ = self.tx.send(chunk);
+            }
+        }
+        self.retired = true;
+    }
+
+    fn send(&mut self, chunk: AudioChunk, at: Instant) {
+        match self.splice.as_mut() {
+            Some(splice) => {
+                if let Some(out) = splice.push(chunk, at) {
+                    self.splice = None;
+                    for chunk in out {
+                        // A closed channel means the capture is stopping.
+                        let _ = self.tx.send(chunk);
+                    }
+                }
+            }
+            None => {
+                let _ = self.tx.send(chunk);
+            }
+        }
+    }
+}
+
+/// What every stream of one capture shares with its callbacks.
+struct StreamHooks {
+    /// Non-empty chunks delivered so far.
+    chunks: Arc<AtomicU64>,
+    clock: Arc<StreamClock>,
+    /// Set by a stream's error callback, so a following capture reopens.
+    failed: Arc<AtomicBool>,
+}
 
 /// A handle to a running audio capture session.
 ///
@@ -90,7 +319,7 @@ impl AudioCaptureHandle {
         device: &str,
         level_tx: Option<tokio::sync::watch::Sender<f32>>,
     ) -> anyhow::Result<Self> {
-        Self::start(device, level_tx, CaptureMode::Dictation)
+        Self::start(device, level_tx, CaptureMode::Dictation, false)
     }
 
     /// Start capturing a recording track from `device`: a PulseAudio source
@@ -98,13 +327,25 @@ impl AudioCaptureHandle {
     /// `"default"`. Unlike [`Self::start_with_level_tx`] an unknown name is
     /// an error, never the default input, and no level is published.
     pub fn start_strict(device: &str) -> anyhow::Result<Self> {
-        Self::start(device, None, CaptureMode::Strict)
+        Self::start(device, None, CaptureMode::Strict, false)
+    }
+
+    /// Start capturing the system track from `monitor` (the monitor of the
+    /// default output, [`device::default_monitor_source`]) and follow the
+    /// default output: every [`FOLLOW_POLL`] the capture thread asks for the
+    /// default again, and when it changed, or the stream failed, it moves to
+    /// the new default's monitor. The time between the old stream's audio
+    /// and the new stream's is filled with zeros ([`Splice`]), so the track
+    /// stays aligned with the mic.
+    pub fn start_following_monitor(monitor: &str) -> anyhow::Result<Self> {
+        Self::start(monitor, None, CaptureMode::Strict, true)
     }
 
     fn start(
         device: &str,
         level_tx: Option<tokio::sync::watch::Sender<f32>>,
         mode: CaptureMode,
+        follow: bool,
     ) -> anyhow::Result<Self> {
         let device_name = device.to_string();
         let device = device_name.clone();
@@ -118,7 +359,7 @@ impl AudioCaptureHandle {
         let thread_handle = std::thread::Builder::new()
             .name("whisrs-audio".into())
             .spawn(move || {
-                run_capture(&device, tx, stop_clone, init_tx, level_tx, mode);
+                run_capture(&device, tx, stop_clone, init_tx, level_tx, mode, follow);
             })
             .context("failed to spawn audio capture thread")?;
 
@@ -238,11 +479,122 @@ fn run_capture(
     init_tx: std::sync::mpsc::Sender<anyhow::Result<()>>,
     level_tx: Option<tokio::sync::watch::Sender<f32>>,
     mode: CaptureMode,
+    follow: bool,
 ) {
-    let result = setup_and_run(device, tx, stop_signal, &init_tx, level_tx, mode);
+    let result = setup_and_run(device, tx, stop_signal, &init_tx, level_tx, mode, follow);
     if let Err(e) = result {
         // If init_tx hasn't been used yet, send the error.
         init_tx.send(Err(e)).ok();
+    }
+}
+
+/// Resolve `device_name` and start a stream on it; `resume_at` is where the
+/// capture's previous stream stopped, for the zero fill. A stale cached
+/// PulseAudio connection is replaced once.
+fn open_input(
+    device_name: &str,
+    tx: &mpsc::UnboundedSender<AudioChunk>,
+    level_tx: &Option<tokio::sync::watch::Sender<f32>>,
+    hooks: &StreamHooks,
+    mode: CaptureMode,
+    resume_at: Option<Instant>,
+) -> anyhow::Result<(cpal::Stream, String, InputSource, SharedFeed)> {
+    let resolved = mode.resolve(device_name)?;
+    let cached_pulse_host = resolved.cached_pulse_host;
+    match build_and_play(resolved, tx, level_tx, hooks, mode, resume_at) {
+        Ok(opened) => Ok(opened),
+        Err(e) if cached_pulse_host && device::is_host_level_error(&e) => {
+            // The cached PulseAudio connection is stale (the server
+            // restarted under it): reconnect once. A device-level error
+            // (busy, unsupported config, timeout) keeps the connection.
+            debug!(
+                "opening input on the cached PulseAudio connection failed ({e:#}), reconnecting"
+            );
+            device::invalidate_pulse_host();
+            let resolved = mode.resolve(device_name)?;
+            build_and_play(resolved, tx, level_tx, hooks, mode, resume_at)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A capture that follows the monitor of the default output.
+struct Follower {
+    /// The monitor being recorded (or, after a failed switch, the one last
+    /// recorded).
+    current: String,
+    last_poll: Instant,
+    /// Where the last stream's audio ended, kept across failed switches.
+    resume_at: Option<Instant>,
+    /// The current stream's feed, retired before the stream is dropped.
+    feed: Option<SharedFeed>,
+}
+
+impl Follower {
+    /// Retire the current stream's feed (see [`Feed`]).
+    fn retire(&mut self) {
+        if let Some(feed) = self.feed.take() {
+            lock_feed(&feed).retire();
+        }
+    }
+
+    /// Every [`FOLLOW_POLL`]: when the default output changed, or the stream
+    /// failed or is gone, move to the default's monitor. The old stream is
+    /// dropped first, so where its audio ended is final when the new stream
+    /// is spliced on. A switch that fails leaves no stream and is tried
+    /// again at the next poll; the fill then covers the whole outage.
+    fn poll(
+        &mut self,
+        stream: &mut Option<cpal::Stream>,
+        tx: &mpsc::UnboundedSender<AudioChunk>,
+        hooks: &StreamHooks,
+    ) {
+        if self.last_poll.elapsed() < FOLLOW_POLL {
+            return;
+        }
+        self.last_poll = Instant::now();
+        let target = match device::default_monitor_source() {
+            Ok(target) => target,
+            Err(e) => {
+                debug!("could not read the default output: {e:#}");
+                return;
+            }
+        };
+        let failed = hooks.failed.swap(false, Ordering::AcqRel);
+        if target == self.current && !failed && stream.is_some() {
+            return;
+        }
+        if target != self.current {
+            info!(
+                "the default output changed: recording the system audio from {target} \
+                 instead of {}",
+                self.current
+            );
+        } else {
+            info!("reopening the system audio from {target}");
+        }
+        self.retire();
+        if let Some(old) = stream.take() {
+            drop(old);
+            self.resume_at = hooks.clock.audio_end().or(self.resume_at);
+            hooks.clock.reset();
+        }
+        let resume_at = self.resume_at.unwrap_or_else(Instant::now);
+        match open_input(
+            &target,
+            tx,
+            &None,
+            hooks,
+            CaptureMode::Strict,
+            Some(resume_at),
+        ) {
+            Ok((opened, _, _, feed)) => {
+                *stream = Some(opened);
+                self.feed = Some(feed);
+                self.current = target;
+            }
+            Err(e) => warn!("could not record the system audio from {target}: {e:#}; retrying"),
+        }
     }
 }
 
@@ -253,26 +605,16 @@ fn setup_and_run(
     init_tx: &std::sync::mpsc::Sender<anyhow::Result<()>>,
     level_tx: Option<tokio::sync::watch::Sender<f32>>,
     mode: CaptureMode,
+    follow: bool,
 ) -> anyhow::Result<()> {
-    // Non-empty chunks delivered so far.
-    let chunks = Arc::new(AtomicU64::new(0));
-    let resolved = mode.resolve(device_name)?;
-    let cached_pulse_host = resolved.cached_pulse_host;
-    let (stream, device, source) = match build_and_play(resolved, &tx, &level_tx, &chunks, mode) {
-        Ok(opened) => opened,
-        Err(e) if cached_pulse_host && device::is_host_level_error(&e) => {
-            // The cached PulseAudio connection is stale (the server
-            // restarted under it): reconnect once. A device-level error
-            // (busy, unsupported config, timeout) keeps the connection.
-            debug!(
-                "opening input on the cached PulseAudio connection failed ({e:#}), reconnecting"
-            );
-            device::invalidate_pulse_host();
-            let resolved = mode.resolve(device_name)?;
-            build_and_play(resolved, &tx, &level_tx, &chunks, mode)?
-        }
-        Err(e) => return Err(e),
+    let hooks = StreamHooks {
+        chunks: Arc::new(AtomicU64::new(0)),
+        clock: Arc::new(StreamClock::new()),
+        failed: Arc::new(AtomicBool::new(false)),
     };
+    let chunks = Arc::clone(&hooks.chunks);
+    let (stream, device, source, feed) =
+        open_input(device_name, &tx, &level_tx, &hooks, mode, None)?;
     debug!("audio capture started at {SAMPLE_RATE}Hz mono i16");
 
     // Signal successful initialization. If the caller already gave up
@@ -284,9 +626,17 @@ fn setup_and_run(
         return Ok(());
     }
 
-    // Block until stop is signaled. Keep the stream alive.
+    // Block until stop is signaled. Keep the stream alive, and for a
+    // following capture move it when the default output changes.
     let started = Instant::now();
     let mut watchdog_armed = true;
+    let mut stream = Some(stream);
+    let mut follower = follow.then(|| Follower {
+        current: device_name.trim().to_string(),
+        last_poll: Instant::now(),
+        resume_at: None,
+        feed: Some(feed),
+    });
     while !stop_signal.load(Ordering::Acquire) {
         std::thread::sleep(std::time::Duration::from_millis(50));
         if watchdog_armed && started.elapsed() >= FIRST_CHUNK_TIMEOUT {
@@ -295,10 +645,18 @@ fn setup_and_run(
                 warn_no_audio(&device, &source, mode);
             }
         }
+        if let Some(follower) = follower.as_mut() {
+            follower.poll(&mut stream, &tx, &hooks);
+        }
     }
 
     debug!("audio capture stopping");
-    drain_after_stop(&chunks);
+    if stream.is_some() {
+        drain_after_stop(&chunks);
+    }
+    if let Some(follower) = follower.as_mut() {
+        follower.retire();
+    }
     if let Some(level_tx) = &level_tx {
         let _ = level_tx.send(0.0);
     }
@@ -325,14 +683,17 @@ fn warn_no_audio(device: &str, source: &InputSource, mode: CaptureMode) {
     }
 }
 
-/// Build and start the input stream for a resolved device.
+/// Build and start the input stream for a resolved device. With `resume_at`
+/// (a switch of a following capture) its audio is spliced on behind the
+/// zeros that keep the timeline ([`Splice`]).
 fn build_and_play(
     resolved: ResolvedInput,
     tx: &mpsc::UnboundedSender<AudioChunk>,
     level_tx: &Option<tokio::sync::watch::Sender<f32>>,
-    chunks: &Arc<AtomicU64>,
+    hooks: &StreamHooks,
     mode: CaptureMode,
-) -> anyhow::Result<(cpal::Stream, String, InputSource)> {
+    resume_at: Option<Instant>,
+) -> anyhow::Result<(cpal::Stream, String, InputSource, SharedFeed)> {
     let device = resolved.device;
     let device_label = device.to_string();
     info!(
@@ -364,32 +725,38 @@ fn build_and_play(
         );
     }
 
+    let feed: SharedFeed = Arc::new(std::sync::Mutex::new(Feed::new(
+        tx.clone(),
+        resume_at.map(Splice::new),
+    )));
     let build = |buffer_size: BufferSize| {
         let config = StreamConfig {
             channels: CHANNELS,
             sample_rate: SAMPLE_RATE,
             buffer_size,
         };
-        let tx = tx.clone();
+        let feed = Arc::clone(&feed);
         let callback_level_tx = level_tx.clone();
-        let chunks = Arc::clone(chunks);
+        let chunks = Arc::clone(&hooks.chunks);
+        let clock = Arc::clone(&hooks.clock);
+        let failed = Arc::clone(&hooks.failed);
         device.build_input_stream(
             config,
             move |data: &[i16], _info: &cpal::InputCallbackInfo| {
+                let now = Instant::now();
                 if let Some(level_tx) = &callback_level_tx {
                     let _ = level_tx.send(audio_level(data));
                 }
-                if tx.send(data.to_vec()).is_err() {
-                    // Channel closed — capture is stopping.
-                }
+                lock_feed(&feed).send_marked(data.to_vec(), now, &clock);
                 // Counted after the send, so a drain that sees the chunk
                 // knows it is already queued for the collector.
                 if !data.is_empty() {
                     chunks.fetch_add(1, Ordering::Release);
                 }
             },
-            |err: cpal::Error| {
+            move |err: cpal::Error| {
                 error!("audio stream error: {err}");
+                failed.store(true, Ordering::Release);
             },
             resolved.build_timeout,
         )
@@ -421,7 +788,7 @@ fn build_and_play(
     })?;
 
     stream.play().context("failed to start audio stream")?;
-    Ok((stream, device_label, resolved.source))
+    Ok((stream, device_label, resolved.source, feed))
 }
 
 /// Whether a failed open of an ALSA input should be retried with
@@ -499,6 +866,147 @@ mod tests {
         let msg = start_timeout_error("x.monitor", CaptureMode::Strict).to_string();
         assert!(msg.contains("[recording]"), "{msg}");
         assert!(!msg.contains("[audio]"), "{msg}");
+    }
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn gap_fill_counts_the_time_between_two_streams() {
+        let t0 = Instant::now();
+        assert_eq!(gap_fill(t0, t0 + 250 * MS), 4000);
+        assert_eq!(gap_fill(t0, t0), 0);
+        // The new audio began before the old one ended: nothing to fill.
+        assert_eq!(gap_fill(t0 + 100 * MS, t0), 0);
+        let zeros = silence(40_000);
+        assert_eq!(
+            zeros.iter().map(Vec::len).collect::<Vec<_>>(),
+            [16_000, 16_000, 8000]
+        );
+        assert!(zeros.iter().flatten().all(|&s| s == 0));
+        assert!(silence(0).is_empty());
+    }
+
+    /// The old stream's end comes from its least delayed recent chunk, not
+    /// its last one, and a reset forgets it.
+    #[test]
+    fn stream_clock_estimates_where_the_audio_ended() {
+        let clock = StreamClock::new();
+        let t0 = clock.base;
+        assert_eq!(clock.audio_end(), None);
+        // 40 chunks of 100 ms; audio began at t0, each arrives 30 ms late
+        // plus up to 15 ms of jitter, the least delayed one 30 ms late.
+        for k in 1..=40u64 {
+            let jitter = k * 7919 % 16;
+            clock.mark(t0 + Duration::from_millis(100 * k + 30 + jitter), 1600);
+        }
+        let end = clock.audio_end().unwrap();
+        assert_eq!(
+            end.duration_since(t0),
+            4030 * MS,
+            "4 s of audio plus the delay"
+        );
+        clock.reset();
+        assert_eq!(clock.audio_end(), None);
+        // A stream whose audio began before the clock was made.
+        let early = StreamClock::new();
+        early.mark(early.base + 50 * MS, 1600);
+        assert_eq!(early.audio_end(), Some(early.base + 50 * MS));
+    }
+
+    /// Feed `chunks` 100 ms chunks arriving at `arrivals` (ms after `t0`)
+    /// to `splice`; what it let out once it had [`SPLICE_HOLD`].
+    fn splice_out(splice: &mut Splice, t0: Instant, arrivals: &[u32]) -> Vec<AudioChunk> {
+        let mut out = None;
+        for (i, &at) in arrivals.iter().enumerate() {
+            assert!(out.is_none(), "let out before the hold was full");
+            out = splice.push(vec![i as i16 + 1; 1600], t0 + at * MS);
+        }
+        out.expect("not let out after the hold")
+    }
+
+    /// The splice holds its first 600 ms, then lets the zeros and the audio
+    /// out in order; a stream that starts with a burst of buffered chunks is
+    /// not over-filled.
+    #[test]
+    fn splice_places_the_new_audio_where_it_began() {
+        let t0 = Instant::now();
+        // Steady: the new audio began 250 ms after the old ended, each chunk
+        // arriving 30 ms after its audio, like the old stream's.
+        let mut steady = Splice::new(t0 + 30 * MS);
+        let out = splice_out(&mut steady, t0, &[380, 480, 580, 680, 780, 880]);
+        let zeros: usize = out.iter().take_while(|c| c[0] == 0).map(Vec::len).sum();
+        assert_eq!(zeros, 4000, "250 ms");
+        let audio: Vec<i16> = out.iter().skip(1).map(|c| c[0]).collect();
+        assert_eq!(audio, [1, 2, 3, 4, 5, 6], "every chunk, in order");
+
+        // Burst: the audio began 50 ms after the old ended, and its first
+        // three chunks were buffered and arrive at once. Judged by the first
+        // chunk alone it would begin 200 ms later than it did; the third
+        // chunk and the steady ones after it show where it began.
+        let mut burst = Splice::new(t0 + 30 * MS);
+        let out = splice_out(&mut burst, t0, &[380, 381, 382, 480, 580, 680]);
+        let zeros: usize = out.iter().filter(|c| c[0] == 0).map(Vec::len).sum();
+        assert_eq!(zeros, 800, "50 ms, not 250 ms");
+    }
+
+    /// A retired feed lets out what it held, behind its zeros (a stop right
+    /// after a switch), and ignores a callback that comes after its stream
+    /// was dropped, neither sending nor counting it.
+    #[test]
+    fn a_retired_feed_ignores_late_chunks() {
+        let t0 = Instant::now();
+        let clock = StreamClock::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut feed = Feed::new(tx, Some(Splice::new(t0)));
+        feed.send_marked(vec![5; 1600], t0 + 200 * MS, &clock);
+        let end = clock.audio_end();
+        assert!(rx.try_recv().is_err(), "held");
+        feed.retire();
+        assert_eq!(rx.try_recv().unwrap(), vec![0; 1600], "the zeros");
+        assert_eq!(rx.try_recv().unwrap(), vec![5; 1600], "the held chunk");
+        feed.send_marked(vec![6; 1600], t0 + 300 * MS, &clock);
+        assert!(rx.try_recv().is_err(), "a late chunk is not sent");
+        assert_eq!(clock.audio_end(), end, "nor counted");
+    }
+
+    /// End to end on synthetic timestamps: an old stream, a switch with an
+    /// outage and a bursty start, and the track holds every sample at its
+    /// place on the wall clock.
+    #[test]
+    fn a_switch_keeps_the_track_on_the_timeline() {
+        let clock = StreamClock::new();
+        let t0 = clock.base;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Old stream: audio from t0, 100 ms chunks arriving 40 ms late with
+        // jitter, for 3 s.
+        let mut old = Feed::new(tx.clone(), None);
+        for k in 1..=30u64 {
+            let at = t0 + Duration::from_millis(100 * k + 40 + k % 3 * 5);
+            old.send_marked(vec![1; 1600], at, &clock);
+        }
+        // Retired at the switch: a callback after the drop is ignored.
+        old.retire();
+        old.send_marked(vec![1; 1600], t0 + 3145 * MS, &clock);
+        let resume_at = clock.audio_end().unwrap();
+        clock.reset();
+        // The new stream's audio begins at 3.4 s (a 400 ms outage) and its
+        // first 200 ms come in one burst.
+        let mut new = Feed::new(tx, Some(Splice::new(resume_at)));
+        let arrivals = [3640, 3641, 3740, 3840, 3940];
+        for at in arrivals {
+            new.send(vec![2; 1600], t0 + at * MS);
+        }
+        // The stop comes before the splice let it out.
+        new.retire();
+        let mut track = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            track.extend(chunk);
+        }
+        let first_new = track.iter().position(|&s| s == 2).unwrap();
+        // 3.4 s into the track, as on the wall clock.
+        assert_eq!(first_new, 3400 * 16);
+        assert!(track[3000 * 16..first_new].iter().all(|&s| s == 0));
+        assert_eq!(track.len(), (3400 + 500) * 16);
     }
 
     #[test]

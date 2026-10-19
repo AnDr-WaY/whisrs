@@ -648,12 +648,18 @@ included, so long recordings do not fall into whisper's repetition loop.
 `flash_attn` applies to recordings as it does to dictation.
 
 **Devices.** `mic_device` defaults to `[audio] device`. `system_device`
-defaults to the monitor of your default output device, found when the
-recording starts, so it follows headphones you plug in before you start. Set
-it to `"none"` to record only your mic, or to a specific monitor source from
-`pactl list short sources` (names ending in `.monitor`). `whisrs config` lists
+defaults to the monitor of your default output device, and the recording
+follows it: when the default output changes while it runs (headphones plugged
+in or unplugged, another output picked), the system track moves to the new
+one within about 2 seconds, and the moment in between is filled with silence
+so the track stays in step with your mic. Set it to `"none"` to record only
+your mic, or to a specific monitor source from `pactl list short sources`
+(names ending in `.monitor`), which is never followed. `whisrs config` lists
 the monitors under "Recording". If the system audio cannot be opened, the
-recording takes your mic only and notes that in the transcript.
+recording takes your mic only and notes that in the transcript. With
+`mic_device` and `[audio] device` at `"default"`, the mic records the sound
+server's default input, which PipeWire moves to a new default (a headset
+plugged in, a USB mic unplugged) by itself.
 
 **Where recordings are saved.** Each recording gets its own folder under `dir`
 (default `~/.local/share/whisrs/recordings`), named after its start time and
