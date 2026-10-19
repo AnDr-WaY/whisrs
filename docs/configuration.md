@@ -734,14 +734,15 @@ does not resolve, a refused or dropped connection, a TLS error) is retried 5,
 recording is not failed: it waits for the network, shown as `waiting` by
 `whisrs recording list` and `whisrs recording status`, with one notification.
 The daemon tries it again when it starts and every 10 minutes while it runs,
-for up to 24 hours after the recording stopped (144 tries at most), and then
-marks it failed. These tries do not count towards the three interrupted
-attempts above. `whisrs recording retry` tries a waiting recording at once;
-a retry that finds no network more than 24 hours after the recording stopped
-fails at once instead of waiting. An `asr-sidecar` that is not running
-(connection refused) counts as no network, but one that takes a chunk and
-drops the connection crashed on it, so like its HTTP 500 that fails the
-recording without sending the chunk again. `local-whisper` never waits.
+for up to 24 hours from its first failed try (144 tries at most), however
+long ago the recording stopped, and then marks it failed. These tries do not
+count towards the three interrupted attempts above. `whisrs recording retry`
+tries a waiting recording at once, and a retry that finds no network starts
+a new 24 hours. An `asr-sidecar` that cannot be reached (not running, a
+network that is down, a request that times out) counts as no network, but
+one that takes a chunk and then closes the connection crashed on it, so like
+its HTTP 500 that fails the recording without sending the chunk again.
+`local-whisper` never waits.
 
 ## The vocabulary file
 

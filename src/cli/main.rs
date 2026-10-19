@@ -1078,6 +1078,7 @@ mod tests {
         meta.status = RecordingState::Waiting;
         meta.ended_at = Some(at(11, 0));
         meta.error = Some("could not reach the transcription service".into());
+        // The window runs from the first failed try (11:01), not the stop.
         meta.network_wait = Some(whisrs::recording::NetworkWait {
             since: at(11, 1),
             attempts: 0,
@@ -1086,7 +1087,7 @@ mod tests {
         assert_eq!(
             not_ready_message(&meta),
             "recording m1 is waiting for the network: could not reach the transcription \
-             service. whisrs tries again every 10 minutes until 2026-10-03 11:00; \
+             service. whisrs tries again every 10 minutes until 2026-10-03 11:01; \
              `whisrs recording retry m1` tries now."
         );
         assert!(format_recording_row(&meta, 2).contains("  waiting     "));

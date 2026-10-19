@@ -123,9 +123,20 @@ struct Devices {
     open_tracks: OpenTracksFn,
 }
 
-const REAL_DEVICES: Devices = Devices {
+/// The devices every [`RecordingRuntime`] starts with. In test builds these
+/// are stand-ins that panic, so no test context (this module's, the
+/// pipeline's, or one added later) can open the host's mic or ask its sound
+/// server through a start.
+#[cfg(not(test))]
+const DEVICES: Devices = Devices {
     resolve_system,
     open_tracks,
+};
+
+#[cfg(test)]
+const DEVICES: Devices = Devices {
+    resolve_system: |_| panic!("a test start looked up the system audio device"),
+    open_tracks: |_, _, _, _| panic!("a test start opened the audio devices"),
 };
 
 /// How often [`run_network_retries`] looks for a recording waiting for the
@@ -390,7 +401,7 @@ impl RecordingRuntime {
             worker: std::sync::Mutex::new(None),
             starting: std::sync::Mutex::new(None),
             free_space: store::free_space,
-            devices: REAL_DEVICES,
+            devices: DEVICES,
         };
         (runtime, status_rx, queue_rx)
     }
@@ -681,6 +692,8 @@ fn muted_mic_alarm(id: &str, notify: bool) -> SilenceAlarm {
 /// not skewed by the other device's start. The mic's writer raises
 /// `silence` when the mic is muted. Blocking: runs on the blocking pool,
 /// where the runtime handle is available for the writers.
+// Reached only through `DEVICES`, which test builds replace with stand-ins.
+#[cfg_attr(test, allow(dead_code))]
 fn open_tracks(
     dir: &Path,
     mic: &str,
@@ -1509,36 +1522,31 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
         }
         Err(e) => {
             let message = format!("{e:#}");
+            error!("recording {id} transcription failed: {message}");
             if let Err(write_err) = mark_failed(&dir, &message) {
                 error!("failed to record the failure of recording {id}: {write_err:#}");
             }
-            transcription_failed(context, &id, &message);
+            notify(
+                context,
+                &format!(
+                    "Recording transcription failed: {}. Retry with: whisrs recording retry {id}",
+                    truncate_preview(&message, NOTIFY_ERROR_MAX)
+                ),
+            );
         }
     }
     context.recording.update(|v| v.processing = None);
     sweep(context).await;
 }
 
-/// Log and notify that recording `id` failed with `message`.
-fn transcription_failed(context: &DaemonContext, id: &str, message: &str) {
-    error!("recording {id} transcription failed: {message}");
-    notify(
-        context,
-        &format!(
-            "Recording transcription failed: {}. Retry with: whisrs recording retry {id}",
-            truncate_preview(message, NOTIFY_ERROR_MAX)
-        ),
-    );
-}
-
 /// Mark recording `id` as waiting for the network after an attempt could
 /// not reach the backend, and show it so. Notified only when it starts
-/// waiting: the automatic attempts that fail after that stay quiet. Past
-/// its deadline already it fails instead, as a plain failure.
+/// waiting: the automatic attempts that fail after that stay quiet. One
+/// that ran past its deadline waits again, quietly, and the next tick of
+/// [`run_network_retries`] gives up on it ([`network_retry_due`]).
 async fn wait_for_network(context: &Arc<DaemonContext>, dir: &Path, id: &str, message: &str) {
     match mark_waiting(dir, message, Local::now()) {
-        Ok(NoNetwork::TooLate(error)) => transcription_failed(context, id, &error),
-        Ok(NoNetwork::Waiting { meta, started }) => {
+        Ok((meta, started)) => {
             warn!("recording {id} is waiting for the network: {message}");
             context
                 .recording
@@ -1614,26 +1622,15 @@ fn count_network_attempt(dir: &Path) -> Result<()> {
     store::write_meta(dir, &meta)
 }
 
-/// What became of a recording whose attempt found no network.
-#[derive(Debug)]
-enum NoNetwork {
-    /// Waiting for the network; `started` when the wait began with this
-    /// attempt, which is when it is notified.
-    Waiting {
-        meta: Box<RecordingMeta>,
-        started: bool,
-    },
-    /// Already past [`RecordingMeta::network_deadline`] (a manual retry more
-    /// than a day after the stop, or an automatic attempt that ran past it):
-    /// failed with this error instead of promising tries that never come.
-    TooLate(String),
-}
-
 /// Mark a recording as waiting for the network after an attempt failed for
-/// lack of it at `now`, starting its [`NetworkWait`] if it has none, or as
-/// failed when its deadline has passed.
-fn mark_waiting(dir: &Path, message: &str, now: DateTime<Local>) -> Result<NoNetwork> {
+/// lack of it at `now`, starting its [`NetworkWait`] (and with it the
+/// [`NETWORK_RETRY_FOR`] window) if it has none: a recording's first failed
+/// try, or one after a manual retry, which clears the old wait. The flag is
+/// true when the wait started here, which is when it is notified.
+fn mark_waiting(dir: &Path, message: &str, now: DateTime<Local>) -> Result<(RecordingMeta, bool)> {
     let mut meta = store::read_meta(dir)?;
+    meta.status = RecordingState::Waiting;
+    meta.error = Some(message.to_string());
     let started = meta.network_wait.is_none();
     let wait = meta.network_wait.get_or_insert(NetworkWait {
         since: now,
@@ -1641,30 +1638,8 @@ fn mark_waiting(dir: &Path, message: &str, now: DateTime<Local>) -> Result<NoNet
         last_attempt_at: now,
     });
     wait.last_attempt_at = now;
-    if meta
-        .network_deadline()
-        .is_some_and(|deadline| now >= deadline)
-    {
-        let error = format!(
-            "no network, and recordings are retried automatically only for {} hours \
-             after they stop: {message}",
-            NETWORK_RETRY_FOR.as_secs() / 3600
-        );
-        if started {
-            meta.network_wait = None;
-        }
-        meta.status = RecordingState::Failed;
-        meta.error = Some(error.clone());
-        store::write_meta(dir, &meta)?;
-        return Ok(NoNetwork::TooLate(error));
-    }
-    meta.status = RecordingState::Waiting;
-    meta.error = Some(message.to_string());
     store::write_meta(dir, &meta)?;
-    Ok(NoNetwork::Waiting {
-        meta: Box::new(meta),
-        started,
-    })
+    Ok((meta, started))
 }
 
 /// End a recording's wait for the network: `failed`, with `why` before the
@@ -1677,6 +1652,16 @@ fn fail_wait(dir: &Path, why: &str) -> Result<()> {
         None => why.to_string(),
     });
     store::write_meta(dir, &meta)
+}
+
+/// Why a recording stopped waiting for the network at its deadline, the one
+/// sentence for it: stored as "{why}: {last error}" and notified as
+/// "Recording {why}." ([`stopped_waiting`]).
+fn network_window_over() -> String {
+    format!(
+        "gave up waiting for the network {} hours after its first failed try",
+        NETWORK_RETRY_FOR.as_secs() / 3600
+    )
 }
 
 /// What [`retry_waiting`] does with a recording waiting for the network.
@@ -1702,10 +1687,7 @@ fn network_retry_due(meta: &RecordingMeta, now: DateTime<Local>, startup: bool) 
         .network_deadline()
         .is_some_and(|deadline| now >= deadline)
     {
-        return NetworkRetry::GiveUp(format!(
-            "gave up waiting for the network {} hours after the recording stopped",
-            NETWORK_RETRY_FOR.as_secs() / 3600
-        ));
+        return NetworkRetry::GiveUp(network_window_over());
     }
     if wait.attempts >= NETWORK_RETRY_MAX {
         return NetworkRetry::GiveUp(format!(
@@ -2392,12 +2374,17 @@ mod tests {
         build_context(root, backend, extra, store::free_space)
     }
 
-    /// The devices of every test context: a start that gets this far panics
-    /// instead of opening the host's mic or asking its sound server.
-    const NO_DEVICES: Devices = Devices {
-        resolve_system: |_| panic!("a test start looked up the system audio device"),
-        open_tracks: |_, _, _, _| panic!("a test start opened the audio devices"),
-    };
+    /// Every runtime a test builds, the pipeline's `RecordingRuntime::new()`
+    /// included, has the panicking stand-ins for devices ([`DEVICES`]). The
+    /// lookup of `Off` touches nothing even on the real devices, so this
+    /// check is safe to run against a build that lost them.
+    #[test]
+    fn test_runtimes_never_reach_the_real_devices() {
+        let (runtime, _, _) = RecordingRuntime::new();
+        let lookup = runtime.devices.resolve_system;
+        let reached = std::panic::catch_unwind(|| lookup(SystemSource::Off));
+        assert!(reached.is_err(), "a test runtime has the real devices");
+    }
 
     fn build_context(
         root: &Path,
@@ -2412,7 +2399,6 @@ mod tests {
         .unwrap();
         let (mut recording, _status_rx, queue_rx) = RecordingRuntime::new();
         recording.free_space = free_space;
-        recording.devices = NO_DEVICES;
         let context = DaemonContext {
             config,
             window_tracker: Arc::new(whisrs::window::NoopTracker),
@@ -3587,7 +3573,7 @@ mod tests {
 
     /// A start on a nearly full disk is refused before it creates a folder
     /// or opens a device; one whose free space cannot be read goes ahead.
-    /// Test contexts have no devices ([`NO_DEVICES`]): a start that got past
+    /// Test contexts have no devices ([`DEVICES`]): a start that got past
     /// a broken check would fail on that, never open the host's mic.
     #[tokio::test]
     async fn a_start_without_disk_space_is_refused() {
@@ -3944,20 +3930,18 @@ mod tests {
         assert_eq!(status.phase, RecordingPhase::Idle);
         assert_eq!(status.waiting, vec![id]);
         // The next attempt finds the wait already started: no new notice.
-        let next = mark_waiting(&dir, "still down", Local::now()).unwrap();
-        assert!(
-            matches!(next, NoNetwork::Waiting { started: false, .. }),
-            "{next:?}"
-        );
+        let (_, started) = mark_waiting(&dir, "still down", Local::now()).unwrap();
+        assert!(!started);
     }
 
     #[test]
     fn network_retry_schedule() {
         let now = Local::now();
         let minutes = chrono::Duration::minutes;
-        let mut meta = RecordingMeta::new("m".into(), None, now - minutes(90));
+        let mut meta = RecordingMeta::new("m".into(), None, now - minutes(600));
         meta.status = RecordingState::Waiting;
-        meta.ended_at = Some(now - minutes(60));
+        // Stopped hours before its first failed try: the stop does not count.
+        meta.ended_at = Some(now - minutes(500));
         assert_eq!(network_retry_due(&meta, now, false), NetworkRetry::Due);
         meta.network_wait = Some(NetworkWait {
             since: now - minutes(60),
@@ -3976,16 +3960,21 @@ mod tests {
             "ten minutes after the last attempt"
         );
 
-        // A day after the stop, or out of attempts: give up, at startup too.
+        // A day after the first failed try, or out of attempts: give up, at
+        // startup too.
         let deadline = meta.network_deadline().unwrap();
         assert_eq!(deadline, now - minutes(60) + chrono::Duration::hours(24));
+        assert_eq!(
+            network_retry_due(&meta, deadline - minutes(1), false),
+            NetworkRetry::Due
+        );
         for startup in [false, true] {
             let NetworkRetry::GiveUp(why) = network_retry_due(&meta, deadline, startup) else {
                 panic!("not given up at the deadline");
             };
-            assert!(
-                why.contains("24 hours after the recording stopped"),
-                "{why}"
+            assert_eq!(
+                why,
+                "gave up waiting for the network 24 hours after its first failed try"
             );
         }
         meta.network_wait.as_mut().unwrap().attempts = NETWORK_RETRY_MAX;
@@ -4049,8 +4038,9 @@ mod tests {
         assert_eq!(context.recording.status(), RecordingStatus::default());
     }
 
-    /// A day after the stop, or after [`NETWORK_RETRY_MAX`] attempts, a
-    /// waiting recording becomes a plain failure that a retry reruns.
+    /// A day after its first failed try, or after [`NETWORK_RETRY_MAX`]
+    /// attempts, a waiting recording becomes a plain failure that a retry
+    /// reruns.
     #[tokio::test]
     async fn waiting_ends_in_failed_after_a_day_or_the_cap() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4066,7 +4056,7 @@ mod tests {
         let error = meta.error.unwrap();
         assert!(
             error.starts_with(
-                "gave up waiting for the network 24 hours after the recording stopped: "
+                "gave up waiting for the network 24 hours after its first failed try: "
             ) && error.contains("could not reach the transcription service"),
             "{error}"
         );
@@ -4124,47 +4114,76 @@ mod tests {
         assert_eq!(store::read_meta(&dir).unwrap().status, RecordingState::Done);
     }
 
-    /// A retry more than a day after the stop that finds no network fails at
-    /// once with one reason, instead of promising tries every 10 minutes
-    /// that the next tick gives up on.
+    /// The day of automatic tries counts from the first failed try, not the
+    /// stop: a recording stopped days ago (a laptop shut before it was
+    /// transcribed) whose first try finds no network still waits, and
+    /// finishes once the network is back.
     #[tokio::test]
-    async fn no_network_past_the_deadline_fails_at_once() {
+    async fn the_network_window_starts_at_the_first_failed_try() {
         let tmp = tempfile::tempdir().unwrap();
-        let (context, mut queue) = test_context(tmp.path(), FlakyNetwork::new(DOWN));
-        let (dir, _) = waiting_recording(&context, &mut queue, tmp.path()).await;
+        let backend = FlakyNetwork::new(DOWN);
+        let (context, mut queue) = test_context(tmp.path(), backend.clone());
+        let dir = crashed_recording(tmp.path());
         let mut meta = store::read_meta(&dir).unwrap();
-        meta.ended_at = Some(Local::now() - chrono::Duration::hours(25));
+        meta.ended_at = Some(Local::now() - chrono::Duration::days(3));
         store::write_meta(&dir, &meta).unwrap();
-        retry_waiting(&context, Local::now(), false).await;
-        assert_eq!(
-            store::read_meta(&dir).unwrap().status,
-            RecordingState::Failed
-        );
-
-        // Retried by hand, still offline.
-        retry(&context, "last", &RecordingOptions::default())
-            .await
-            .unwrap();
+        recover_on_startup(Arc::clone(&context)).await;
         process_one(&context, queue.try_recv().unwrap()).await;
+
         let meta = store::read_meta(&dir).unwrap();
-        assert_eq!(meta.status, RecordingState::Failed);
-        assert_eq!(meta.network_wait, None);
-        let error = meta.error.unwrap();
-        assert!(
-            error.starts_with(
-                "no network, and recordings are retried automatically only for 24 hours \
-                 after they stop: "
-            ) && error.contains("could not reach the transcription service"),
-            "{error}"
+        assert_eq!(meta.status, RecordingState::Waiting);
+        let since = meta.network_wait.as_ref().unwrap().since;
+        assert_eq!(
+            meta.network_deadline(),
+            Some(since + chrono::Duration::hours(24))
         );
-        assert_eq!(context.recording.status(), RecordingStatus::default());
         retry_waiting(
             &context,
             Local::now() + chrono::Duration::minutes(11),
             false,
         )
         .await;
-        assert!(queue.try_recv().is_err(), "no automatic try follows");
+        let item = queue.try_recv().expect("tried again, not given up");
+        backend.set(UP);
+        process_one(&context, item).await;
+        assert_eq!(store::read_meta(&dir).unwrap().status, RecordingState::Done);
+    }
+
+    /// A manual retry that finds no network starts a new day of tries, even
+    /// when the old wait was about to end.
+    #[tokio::test]
+    async fn a_manual_retry_starts_a_new_network_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) = test_context(tmp.path(), FlakyNetwork::new(DOWN));
+        let (dir, _) = waiting_recording(&context, &mut queue, tmp.path()).await;
+        let mut meta = store::read_meta(&dir).unwrap();
+        let old = Local::now() - chrono::Duration::hours(23) - chrono::Duration::minutes(55);
+        meta.network_wait = Some(NetworkWait {
+            since: old,
+            attempts: 100,
+            last_attempt_at: old,
+        });
+        store::write_meta(&dir, &meta).unwrap();
+
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
+        process_one(&context, queue.try_recv().unwrap()).await;
+        let meta = store::read_meta(&dir).unwrap();
+        assert_eq!(meta.status, RecordingState::Waiting);
+        let wait = meta.network_wait.clone().unwrap();
+        assert!(
+            wait.since > old + chrono::Duration::hours(23),
+            "a new window"
+        );
+        assert_eq!(wait.attempts, 0);
+        retry_waiting(
+            &context,
+            Local::now() + chrono::Duration::minutes(11),
+            false,
+        )
+        .await;
+        assert!(queue.try_recv().is_ok(), "tried again, not given up");
     }
 
     /// `cancel` acts on the recording in progress only: with none, it is the

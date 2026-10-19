@@ -102,17 +102,18 @@ fn is_transport(e: &reqwest::Error) -> bool {
         || (e.is_decode() && broke_off(e))
 }
 
-/// The error of a request to a server the user runs (the `asr-sidecar`,
-/// usually on this machine). Only a failed connect stays a transport error
-/// ([`is_transport_error`]), so a recording waits for a server that is not
-/// running (yet). A connection that broke after the request went out means
-/// the server died handling it (out of memory, a crash in the model), and
-/// the same audio would take it down again: that is final, like the
-/// sidecar's HTTP 500, and no longer carries the reqwest error a retry
-/// layer would act on. The cloud backends post to fixed hosts and keep
-/// [`is_transport_error`] as it is.
-pub fn local_server_error(err: reqwest::Error, server: &str) -> anyhow::Error {
-    if err.is_connect() || !is_transport(&err) {
+/// The error of a request to a transcription server the user runs (the
+/// `asr-sidecar`: on this machine, or a gateway such as LiteLLM or Speaches
+/// elsewhere). When the server took the request and then closed the
+/// connection ([`closed_by_peer`]), it died handling it (out of memory, a
+/// crash in the model), and the same audio would take it down again: that
+/// is final, like the sidecar's HTTP 500, and no longer carries the reqwest
+/// error a retry layer would act on. Everything else stays as it was: a
+/// refused connection (not running yet), a timeout or an unreachable host
+/// (the network) are waited out like any transport error. The cloud
+/// backends post to fixed hosts and keep [`is_transport_error`] as it is.
+pub fn final_if_crashed(err: reqwest::Error, server: &str) -> anyhow::Error {
+    if err.is_connect() || !is_transport(&err) || !closed_by_peer(&err) {
         return err.into();
     }
     anyhow::anyhow!(
@@ -120,6 +121,36 @@ pub fn local_server_error(err: reqwest::Error, server: &str) -> anyhow::Error {
          on this audio; not sent again: {:#}",
         anyhow::Error::from(err)
     )
+}
+
+/// What hyper says when the server closed the connection before its answer
+/// was complete. That error carries no I/O error to read the kind from;
+/// `a_sidecar_that_is_down_is_waited_out_but_a_crash_is_final` pins the text.
+const INCOMPLETE_MESSAGE: &str = "connection closed before message completed";
+
+/// Whether `err` or a cause under it is the other end closing the
+/// connection: reset, broken pipe, an end of file in the middle of the
+/// answer, or hyper's [`INCOMPLETE_MESSAGE`]. A timeout, an unreachable host
+/// or network, and a refused connection are not.
+fn closed_by_peer(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(err);
+    while let Some(e) = cause {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+        if e.to_string() == INCOMPLETE_MESSAGE {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
 }
 
 /// Whether a reqwest decode error is the answer breaking off, an I/O error
@@ -623,6 +654,48 @@ mod tests {
             assert!(!is_transport(err), "HTTP {status}");
         }
         assert!(!is_transport(anyhow::anyhow!("401 unauthorized")));
+    }
+
+    /// Only the other end closing the connection counts as a crash: a
+    /// timeout or an unreachable host is the network, and a refused
+    /// connection a server that is not up yet.
+    #[test]
+    fn only_a_peer_close_is_a_crash() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(closed_by_peer(&Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::NetworkDown,
+            ErrorKind::ConnectionRefused,
+        ] {
+            assert!(!closed_by_peer(&Error::from(kind)), "{kind:?}");
+        }
+
+        /// Shaped like reqwest's chain: an outer error over the cause.
+        #[derive(Debug)]
+        struct Outer(Box<dyn std::error::Error + 'static>);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&*self.0)
+            }
+        }
+        let reset = Outer(Box::new(Error::from(ErrorKind::ConnectionReset)));
+        assert!(closed_by_peer(&reset), "found under the outer error");
+        let quiet = Outer(Box::new(Error::from(ErrorKind::TimedOut)));
+        assert!(!closed_by_peer(&quiet));
     }
 
     /// Short stand-ins for the network waits, so these tests talk to a

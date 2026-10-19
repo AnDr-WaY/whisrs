@@ -62,8 +62,15 @@ pub(crate) async fn serve_responses(
 /// Accept one connection, read the whole request, and close the connection
 /// without an answer: a server that crashed handling the request.
 pub(crate) async fn crash_after_request(listener: &TcpListener) -> Request {
+    accept_request(listener).await.1
+}
+
+/// Accept one connection and read the whole request, leaving the
+/// connection open and unanswered for the caller to hold or drop.
+pub(crate) async fn accept_request(listener: &TcpListener) -> (tokio::net::TcpStream, Request) {
     let (mut stream, _) = listener.accept().await.unwrap();
-    read_request(&mut stream).await
+    let request = read_request(&mut stream).await;
+    (stream, request)
 }
 
 /// Read one request and answer it with `status` and `body`, closing the

@@ -109,10 +109,10 @@ impl AsrSidecarBackend {
         if let Some(key) = &self.api_key {
             request = request.header("Authorization", format!("Bearer {key}"));
         }
-        // A sidecar that is not running refuses the connection, which a
-        // recording waits out; one that took the request and then dropped
-        // the connection crashed on it, which is final (see
-        // `local_server_error`).
+        // A sidecar that is not running refuses the connection, and a
+        // network that went down times out or finds no route: a recording
+        // waits those out. One that took the request and then closed the
+        // connection crashed on it, which is final (`final_if_crashed`).
         let response = request
             .multipart(form)
             .send()
@@ -142,7 +142,7 @@ impl AsrSidecarBackend {
 }
 
 fn sidecar_error(err: reqwest::Error) -> anyhow::Error {
-    super::retry::local_server_error(err, "the ASR sidecar")
+    super::retry::final_if_crashed(err, "the ASR sidecar")
 }
 
 /// Longest chunk sent to the sidecar in one request.
@@ -303,7 +303,9 @@ mod tests {
         is_network_unavailable, is_transport_error, retry_transient, retry_with_backoff,
         RATE_LIMIT_BUDGET,
     };
-    use crate::transcription::test_server::{crash_after_request, serve_once, serve_responses};
+    use crate::transcription::test_server::{
+        accept_request, crash_after_request, serve_once, serve_responses,
+    };
     use tokio::net::TcpListener;
 
     fn test_config() -> TranscriptionConfig {
@@ -696,6 +698,47 @@ mod tests {
                  likely crashed on this audio; not sent again: "
             ),
             "{err:#}"
+        );
+    }
+
+    /// A request that times out after it was sent (a hosted gateway behind a
+    /// network that went quiet) is the network, not a crash: retried on the
+    /// network schedule, then waited out.
+    #[tokio::test]
+    async fn a_sidecar_timeout_after_the_request_is_waited_out() {
+        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
+        let config = test_config();
+        let quick = [std::time::Duration::from_millis(1); 4];
+
+        // Takes each request and never answers, holding the connection.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                held.push(accept_request(&listener).await.0);
+            }
+        });
+        let backend = AsrSidecarBackend {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(200))
+                .build()
+                .unwrap(),
+            ..AsrSidecarBackend::new(format!("http://{addr}/transcribe"), None)
+        };
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let err = retry_with_backoff(RATE_LIMIT_BUDGET, &[], &quick, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap_err();
+        server.abort();
+        assert!(is_network_unavailable(&err), "{err:#}");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            5,
+            "tried once and retried 4 times"
         );
     }
 }

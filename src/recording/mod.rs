@@ -153,8 +153,10 @@ pub enum RecordingState {
 /// How often the daemon tries a recording waiting for the network again.
 pub const NETWORK_RETRY_EVERY: Duration = Duration::from_secs(10 * 60);
 
-/// How long after its stop a recording keeps waiting for the network
-/// before it becomes a plain failure.
+/// How long after its first failed try a recording keeps waiting for the
+/// network before it becomes a plain failure. Counted from the try, not the
+/// stop: a recording left untranscribed over a weekend still gets its day.
+/// A manual retry that finds no network starts a new one.
 pub const NETWORK_RETRY_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Most automatic attempts one recording gets: one every
@@ -353,13 +355,13 @@ impl RecordingMeta {
     }
 
     /// When a recording waiting for the network gives up:
-    /// [`NETWORK_RETRY_FOR`] after it stopped (or, with no stop time, after
-    /// it began waiting). `None` when it is not waiting.
+    /// [`NETWORK_RETRY_FOR`] after its first failed try
+    /// ([`NetworkWait::since`]), however long ago it stopped. `None` when it
+    /// is not waiting.
     pub fn network_deadline(&self) -> Option<DateTime<Local>> {
         let wait = self.network_wait.as_ref()?;
-        let from = self.ended_at.unwrap_or(wait.since);
         let span = chrono::Duration::from_std(NETWORK_RETRY_FOR).ok()?;
-        Some(from + span)
+        Some(wait.since + span)
     }
 
     /// The stored language of track `kind`.
@@ -458,28 +460,24 @@ mod tests {
         assert_eq!(meta.network_deadline(), None);
     }
 
-    /// A waiting recording gives up a day after its stop, or after it began
-    /// waiting when it has no stop time.
+    /// A waiting recording gives up a day after its first failed try,
+    /// however long before that it stopped.
     #[test]
-    fn network_deadline_counts_from_the_stop() {
-        let started = Local::now() - chrono::Duration::hours(3);
+    fn network_deadline_counts_from_the_first_failed_try() {
+        let started = Local::now() - chrono::Duration::days(4);
         let mut meta = RecordingMeta::new("m".into(), None, started);
-        let since = started + chrono::Duration::hours(2);
+        let since = Local::now() - chrono::Duration::hours(2);
         meta.network_wait = Some(NetworkWait {
             since,
             attempts: 0,
             last_attempt_at: since,
         });
-        assert_eq!(
-            meta.network_deadline(),
-            Some(since + chrono::Duration::hours(24))
-        );
-        let stopped = started + chrono::Duration::hours(1);
-        meta.ended_at = Some(stopped);
-        assert_eq!(
-            meta.network_deadline(),
-            Some(stopped + chrono::Duration::hours(24))
-        );
+        let day_after_the_try = Some(since + chrono::Duration::hours(24));
+        assert_eq!(meta.network_deadline(), day_after_the_try);
+        // Stopped three days before its first try (a laptop shut over a
+        // weekend): the stop does not shorten the wait.
+        meta.ended_at = Some(started + chrono::Duration::hours(1));
+        assert_eq!(meta.network_deadline(), day_after_the_try);
     }
 
     #[test]
