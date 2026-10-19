@@ -10,7 +10,8 @@
 //! 200 {"segments": [{"start": 1.20, "end": 4.85, "speaker": "SPEAKER_00"}]}
 //! ```
 //!
-//! Times are seconds into the WAV; `speaker` is a string or a number, and
+//! Times are seconds into the WAV; `speaker` is a string or an integer
+//! (NeMo-Speech.cpp's `nemo-speech serve` numbers its voices 1, 2, ...), and
 //! only has to be consistent within one request. A track goes in one request
 //! (its labels must hold across the whole track), as its speech only,
 //! condensed the way transcript chunks are ([`super::speech`]); the caller
@@ -210,9 +211,11 @@ pub fn parse_turns(body: &str) -> anyhow::Result<Vec<Turn>> {
         .segments
         .into_iter()
         .map(|t| {
-            let speaker = match t.speaker {
+            let speaker = match &t.speaker {
                 serde_json::Value::String(s) if !s.trim().is_empty() => s.trim().to_string(),
-                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Number(n) => integer_label(n).ok_or_else(|| {
+                    anyhow::anyhow!("the diarization sidecar sent a speaker that is not an id: {n}")
+                })?,
                 other => {
                     anyhow::bail!("the diarization sidecar sent a turn without a speaker: {other}")
                 }
@@ -227,6 +230,18 @@ pub fn parse_turns(body: &str) -> anyhow::Result<Vec<Turn>> {
         .collect::<anyhow::Result<Vec<Turn>>>()?;
     turns.sort_by_key(|t| (t.start_ms, t.end_ms));
     Ok(turns)
+}
+
+/// A numeric speaker id as a label: any JSON integer as written (`1`, `-1`),
+/// and a float that holds one (`2.0`, as a sidecar built on numpy can send)
+/// as that integer, so `2` and `2.0` are one voice. A fraction is not an id.
+fn integer_label(n: &serde_json::Number) -> Option<String> {
+    if n.is_i64() || n.is_u64() {
+        return Some(n.to_string());
+    }
+    let f = n.as_f64()?;
+    // Below 2^53 every integer is exact in an f64, and the cast is lossless.
+    (f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0).then(|| (f as i64).to_string())
 }
 
 #[cfg(test)]
@@ -285,6 +300,68 @@ mod tests {
             r#"{"segments": [{"start": 0, "end": 1, "speaker": null}]}"#,
         ] {
             assert!(parse_turns(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The first six turns `nemo-speech serve` (NeMo-Speech.cpp 0.2.0,
+    /// Nemotron-3-Diarization) answered for an AMI meeting, verbatim: voices
+    /// as 1-based integers, times with float noise, keys in its own order.
+    const NEMO_SPEECH_SERVE: &str = r#"{"segments":[{"end":11.508999744519592,"speaker":1,"start":10.720999755248428},{"end":15.358999658465386,"speaker":1,"start":11.900999728873373},{"end":18.268999593421817,"speaker":2,"start":17.650999600350858},{"end":20.358999546706677,"speaker":1,"start":18.660999577775598},{"end":23.828999469146133,"speaker":1,"start":22.120999500438572},{"end":26.618999406784773,"speaker":3,"start":24.920999437853695}]}"#;
+
+    #[test]
+    fn nemo_speech_serve_answers_parse_with_integer_voices() {
+        let turns = parse_turns(NEMO_SPEECH_SERVE).unwrap();
+        let got: Vec<(u64, u64, &str)> = turns
+            .iter()
+            .map(|t| (t.start_ms, t.end_ms, t.speaker.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (10_721, 11_509, "1"),
+                (11_901, 15_359, "1"),
+                (17_651, 18_269, "2"),
+                (18_661, 20_359, "1"),
+                (22_121, 23_829, "1"),
+                (24_921, 26_619, "3"),
+            ]
+        );
+    }
+
+    /// The whole client against a server answering as `nemo-speech serve`
+    /// does: three voices come back, labelled by their numbers.
+    #[tokio::test]
+    async fn a_nemo_speech_serve_answer_comes_back_as_turns() {
+        let (listener, sidecar) = local().await;
+        let server = tokio::spawn(serve_once(listener, NEMO_SPEECH_SERVE));
+        let turns = sidecar.diarize(wav(1), 0).await.unwrap();
+        server.await.unwrap();
+        let mut voices: Vec<&str> = turns.iter().map(|t| t.speaker.as_str()).collect();
+        voices.dedup();
+        assert_eq!(voices, ["1", "2", "1", "3"]);
+    }
+
+    /// Any JSON integer is a voice id, and a float holding one is the same
+    /// voice; a fraction is no id, and the answer is refused.
+    #[test]
+    fn numeric_voices_are_integers() {
+        let label = |speaker: &str| {
+            parse_turns(&format!(
+                r#"{{"segments": [{{"start": 0, "end": 1, "speaker": {speaker}}}]}}"#
+            ))
+            .map(|turns| turns[0].speaker.clone())
+        };
+        assert_eq!(label("0").unwrap(), "0");
+        assert_eq!(label("-1").unwrap(), "-1");
+        assert_eq!(
+            label("18446744073709551615").unwrap(),
+            "18446744073709551615"
+        );
+        assert_eq!(label("2.0").unwrap(), "2", "2.0 is voice 2");
+        assert_eq!(label("1e1").unwrap(), "10");
+        for bad in ["1.5", "1e300"] {
+            let err = label(bad).unwrap_err();
+            assert!(format!("{err:#}").contains("not an id"), "{bad}: {err:#}");
         }
     }
 

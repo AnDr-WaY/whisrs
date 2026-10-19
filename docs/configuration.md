@@ -724,8 +724,8 @@ POST {diarization_url}   multipart form: file = the track's speech as a 16 kHz m
 200 {"segments": [{"start": 1.20, "end": 4.85, "speaker": "SPEAKER_00"}]}
 ```
 
-`start` and `end` are seconds into the WAV, and `speaker` is a string or a
-number that only has to be consistent within one request. `num_speakers`
+`start` and `end` are seconds into the WAV, and `speaker` is a string or an
+integer that only has to be consistent within one request. `num_speakers`
 (or `--num-speakers N` on `start`, `toggle` and `retry`, 0 to 20) tells the
 sidecar how many voices the system audio holds, or your mic when the
 recording has no system audio; 0, the default, lets the sidecar decide. A
