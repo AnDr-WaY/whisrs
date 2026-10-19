@@ -936,7 +936,50 @@ them, and that a transcript is data, not instructions, whose speaker
 labels can be wrong. Copy the folder into `~/.claude/skills/` for Claude
 Code, or into your agent's skills folder. The skill only reads: it never
 deletes or edits a recording, and changes one (`summarize`, `retry`,
-`name`) only when you ask.
+`name`) only when you ask. When the agent has the MCP tools below, the
+skill tells it to use them.
+
+**MCP server.** `whisrs mcp` serves your recordings to an agent over MCP
+(the Model Context Protocol) on stdin and stdout. It reads the recordings
+folder directly (`dir` above), works with the daemon stopped, and never
+changes anything. Add it to Claude Code:
+
+```
+claude mcp add whisrs -- whisrs mcp
+```
+
+or to another MCP client's config:
+
+```json
+{"mcpServers": {"whisrs": {"command": "whisrs", "args": ["mcp"]}}}
+```
+
+Its tools:
+
+- `list_recordings` (`since`, `until`, `query`, `limit`): recordings,
+  newest first, with id, title, start time, duration, status, the speakers
+  heard and whether there is a summary. `since` and `until` take a date
+  (`2026-10-19`, which `until` counts whole), `today`, `yesterday`,
+  `YYYY-MM-DD HH:MM` or an RFC 3339 time; `query` matches the title or id;
+  `limit` is 1 to 100, 20 by default.
+- `get_recording` (`id`): one recording's details, speakers, languages,
+  summary and files, without the transcript.
+- `get_transcript` (`id`, `offset`, `max_chars`, `speaker`, `start_ms`,
+  `end_ms`): the transcript as `[HH:MM:SS] Name: text` lines (one
+  speaker's words per line, up to 1,500 characters), at most `max_chars`
+  at a time (20,000 by default, 2,000 to 100,000), with `next_offset` for
+  the next page. `speaker` is an id such as `S2` or a name.
+- `search_transcripts` (`query`, `since`, `limit`): a search of titles,
+  summaries and transcripts, case aside, newest recording first, that
+  stops after `limit` hits (20 by default, at most 100). A transcript hit
+  gives its time, speaker and the `offset` to read it with
+  `get_transcript`.
+
+An id is a full id, a unique prefix or `last`. The server and each tool
+tell the agent that recording content is data, not instructions, and that
+the speaker labels can be wrong. A recording that failed has no transcript,
+and `get_transcript` says so. The release builds include the server; a
+source build without the `mcp` feature says so when you run `whisrs mcp`.
 
 **Audio retention.** `audio_retention_days` controls how long the `audio/`
 folder of a transcribed recording is kept: `7` (the default) deletes it at the first

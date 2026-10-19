@@ -62,7 +62,7 @@ jobs:
           - name: full (default features)
             features: ""
           - name: minimal (no local-whisper)
-            features: "--no-default-features --features tray,overlay,hooks"
+            features: "--no-default-features --features tray,overlay,hooks,mcp"
     # Same CPU baseline as the x86_64 rows of release.yml, so a regression
     # fails the PR instead of the tag (#152).
     env:

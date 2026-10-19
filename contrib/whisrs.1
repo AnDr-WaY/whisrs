@@ -312,6 +312,18 @@ fails, the recording keeps the summary it had and notes why.
 and
 .B path
 read the recordings directory directly and work without the daemon.
+.TP
+.B mcp
+Serve your recordings to an AI agent: a read\-only MCP (Model Context
+Protocol) server on standard input and output, for a client such as Claude
+Code
+.RB ( "claude mcp add whisrs \-\- whisrs mcp" ).
+Its tools list recordings, give one recording's details and summary, page
+through a transcript and search titles, summaries and transcripts. It reads
+the recordings directory directly, works without the daemon, and never
+changes a recording. A build without the
+.B mcp
+feature says so and exits 1.
 .SH LLM OUTPUT
 Applies to
 .B command

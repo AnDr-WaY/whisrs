@@ -61,7 +61,7 @@ Each tagged release publishes tarballs on [GitHub Releases](https://github.com/y
 ARCH=x86_64   # or aarch64
 curl -sSL -o whisrs.tar.gz https://github.com/y0sif/whisrs/releases/latest/download/whisrs-linux-${ARCH}.tar.gz
 
-# Or the minimal build (cloud backends only, no whisper.cpp; keeps tray + overlay):
+# Or the minimal build (cloud backends only, no whisper.cpp; keeps tray, overlay and MCP):
 # curl -sSL -o whisrs.tar.gz https://github.com/y0sif/whisrs/releases/latest/download/whisrs-linux-${ARCH}-minimal.tar.gz
 
 tar xzf whisrs.tar.gz
@@ -240,6 +240,7 @@ whisrs speak     # Read the selected text aloud (alias: whisrs read; press again
 whisrs recording start -t "Standup"   # Record mic + system audio; stop | toggle | cancel | status
 whisrs recording show last            # Print the latest recording's transcript (list | path | copy | retry)
 whisrs recording summarize last       # Summarize a transcript with the [llm] (or [recording] summary = true for each)
+whisrs mcp                            # Read-only MCP server (stdio) for agents: claude mcp add whisrs -- whisrs mcp
 whisrs log       # Show recent transcription history
 whisrs log -n 5  # Show last 5 entries
 whisrs log --clear  # Clear all history

@@ -29,7 +29,7 @@ jobs:
             arch: x86_64
             runner: ubuntu-latest
             artifact: whisrs-linux-x86_64-minimal
-            features: "--no-default-features --features tray,overlay,hooks"
+            features: "--no-default-features --features tray,overlay,hooks,mcp"
           - name: Linux aarch64
             arch: aarch64
             runner: ubuntu-24.04-arm
@@ -39,7 +39,7 @@ jobs:
             arch: aarch64
             runner: ubuntu-24.04-arm
             artifact: whisrs-linux-aarch64-minimal
-            features: "--no-default-features --features tray,overlay,hooks"
+            features: "--no-default-features --features tray,overlay,hooks,mcp"
 
     steps:
       - uses: actions/checkout@v4

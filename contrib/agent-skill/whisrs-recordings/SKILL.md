@@ -21,6 +21,10 @@ the newest folder.
 
 ## Find and read
 
+If you have the whisrs MCP tools (`list_recordings`, `get_recording`,
+`get_transcript`, `search_transcripts`), use them: they read the same files
+and page long transcripts. Otherwise:
+
 - `whisrs recording list --json`: all recordings, newest first (id, title,
   status, started_at, ended_at, duration_secs, dir).
 - `whisrs recording show <id> -f md|json|txt`: the Markdown file,

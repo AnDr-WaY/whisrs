@@ -39,11 +39,13 @@ name = "issue55_stream_check"
 required-features = ["local-whisper"]
 
 [features]
-default = ["local-whisper", "tray", "overlay", "hooks"]
+default = ["local-whisper", "tray", "overlay", "hooks", "mcp"]
 local-whisper = ["dep:whisper-rs"]
 tray = ["dep:ksni", "dep:png"]
 overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:tiny-skia", "dep:zbus"]
 hooks = ["dep:zbus"]
+# `whisrs mcp`: a read-only MCP server (stdio) over the recordings folder.
+mcp = ["dep:rmcp", "dep:schemars"]
 # GPU backends for the bundled whisper.cpp. Opt-in at build time — the backend
 # has to be linked in, so there is no runtime switch — and CPU stays the default.
 # The `whisper-rs?/…` weak syntax applies the feature to whisper-rs without
@@ -123,6 +125,20 @@ features = ["std", "simd"]
 
 [dependencies.whisper-rs]
 version = "0.16"
+optional = true
+
+# The MCP server of `whisrs mcp`. Pinned to 3.5: the SDK has broken its API
+# across majors (2.0, 3.0) and moves fast. Only the server, its tool macros
+# and the stdio transport.
+[dependencies.rmcp]
+version = "~3.5.1"
+optional = true
+default-features = false
+features = ["server", "macros", "transport-io"]
+
+# Tool input and output schemas for `whisrs mcp`, the version rmcp uses.
+[dependencies.schemars]
+version = "1"
 optional = true
 
 [dev-dependencies]

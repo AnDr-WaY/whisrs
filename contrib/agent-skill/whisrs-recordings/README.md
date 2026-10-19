@@ -15,3 +15,7 @@ cp -r contrib/agent-skill/whisrs-recordings ~/.claude/skills/
 For another agent that reads `SKILL.md` skills, copy the folder into its
 skills folder. Then ask it about a recording, for example "what did we decide
 in the call yesterday?".
+
+The skill works on its own through the `whisrs recording` commands. With the
+MCP server added as well (`claude mcp add whisrs -- whisrs mcp`), the agent
+uses its tools instead.

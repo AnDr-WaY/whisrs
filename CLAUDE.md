@@ -42,6 +42,7 @@ whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sar
 whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id> [--with "..."]
 whisrs recording name <id> <S2|"Speaker 2"|current name> <name>   # "" clears; rewrites the .md at once
 whisrs recording summarize <id>   # [llm] summary (+ title if untitled) via the queue; [recording] summary = true does it after each transcript
+whisrs mcp       # read-only MCP server on stdio over the recordings folder (feature `mcp`; no daemon needed)
 
 # Dev loop: rebuild this checkout and restart the daemon
 ./scripts/dev-install.sh             # build + install to ~/.cargo/bin + restart
@@ -64,6 +65,7 @@ src/
 │                           #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ├── history.rs              # Dictation history (whisrs log)
 ├── llm.rs                  # LLM calls for command mode
+├── mcp.rs                  # whisrs mcp (feature mcp): read-only rmcp server, 4 tools over the recordings folder
 ├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and recording text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
@@ -183,20 +185,24 @@ docs" in an untracked file changes nothing for users and shows up in no PR. Chec
 
 ## Feature Flags
 
-- `default = ["local-whisper", "tray", "overlay", "hooks"]`
+- `default = ["local-whisper", "tray", "overlay", "hooks", "mcp"]`
 - `local-whisper` — whisper-rs (whisper.cpp) for offline transcription. Requires a C++ toolchain and libclang.
 - `tray` — tray icon via `ksni`
 - `overlay` — recording overlay via `smithay-client-toolkit` + `wayland-client` + `tiny-skia`
 - `hooks` — recording-lifecycle hooks + MPRIS media pause via `zbus` (no new system dep; `overlay` already pulls `zbus`)
+- `mcp`: `whisrs mcp`, a read-only MCP server on stdio (`src/mcp.rs`) via `rmcp` (pinned `~3.5.1`: server, macros,
+  transport-io) + `schemars` 1. Without it the `mcp` subcommand still exists and exits 1 with a "built without the mcp
+  feature" error, so it is never silently missing
 - `vulkan` / `cuda` / `hipblas` — GPU backends for the bundled whisper.cpp, passed
   through to `whisper-rs`. Each implies `local-whisper`. Off by default and never built
   by CI or the release workflow, so they are source-build-only (`cargo install whisrs
   --features vulkan`). Enabling one turns on whisper-rs's `_gpu`, which is what flips
   `WhisperContextParameters::default().use_gpu` to true — there is no whisrs-side wiring.
 
-The **minimal** release build is `--no-default-features --features tray,overlay,hooks`:
-it drops only whisper.cpp. Keep `tray`, `overlay` and `hooks` in it (that omission was
-issue #51). A feature left out of that list is silently ignored at runtime rather than
+The **minimal** release build is `--no-default-features --features tray,overlay,hooks,mcp`:
+it drops only whisper.cpp. Keep `tray`, `overlay`, `hooks` and `mcp` in it (that omission was
+issue #51). The list is in `.github/workflows/ci.yml`, `.github/workflows/release.yml`,
+`CONTRIBUTING.md` and here; `flake.nix` builds the default features. A feature left out of that list is silently ignored at runtime rather than
 diagnosed: `Config` is not feature-gated, so the key still parses as known and the
 unknown-key warning stays quiet.
 
@@ -245,6 +251,8 @@ Adding a command means a new `Command` variant plus a daemon handler. Never put 
 `src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording
 list/show/path` read the recordings folder directly, which keeps transcript bodies off IPC
 (as does the speaker list `whisrs recording name` prints after the daemon renamed one).
+`whisrs mcp` reads it too, but its logic is in the library (`src/mcp.rs`); the CLI only
+starts it with `store::configured_recordings_dir()`.
 
 ## Configuration
 

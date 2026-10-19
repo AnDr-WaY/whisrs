@@ -46,6 +46,28 @@ pub fn recordings_dir_from(cfg_dir: Option<&str>) -> PathBuf {
         .join("recordings")
 }
 
+/// The recordings root `config.toml` gives ([`recordings_dir_from`]),
+/// reading only `[recording] dir`, so a config the daemon would refuse for
+/// an unrelated reason still finds the recordings. For the readers that
+/// work without the daemon: `whisrs recording list/show/path` and
+/// `whisrs mcp`.
+pub fn configured_recordings_dir() -> PathBuf {
+    let dir = fs::read_to_string(crate::config_path())
+        .ok()
+        .and_then(|text| recording_dir_from_toml(&text));
+    recordings_dir_from(dir.as_deref())
+}
+
+/// `[recording] dir` from config.toml text, if set.
+pub fn recording_dir_from_toml(text: &str) -> Option<String> {
+    let table: toml::Table = text.parse().ok()?;
+    table
+        .get("recording")?
+        .get("dir")?
+        .as_str()
+        .map(str::to_string)
+}
+
 fn expand_tilde(dir: &str) -> PathBuf {
     if let Some(home) = dirs::home_dir() {
         if dir == "~" {
@@ -719,6 +741,19 @@ mod tests {
         assert_eq!(recordings_dir_from(Some("/srv/m")), PathBuf::from("/srv/m"));
         assert!(recordings_dir_from(None).ends_with("whisrs/recordings"));
         assert_eq!(recordings_dir_from(Some("  ")), recordings_dir());
+    }
+
+    #[test]
+    fn recording_dir_comes_from_the_recording_section_only() {
+        assert_eq!(
+            recording_dir_from_toml("[recording]\ndir = \"~/notes/recordings\"\n").as_deref(),
+            Some("~/notes/recordings")
+        );
+        assert_eq!(
+            recording_dir_from_toml("[general]\nbackend = \"groq\"\n"),
+            None
+        );
+        assert_eq!(recording_dir_from_toml("not toml ["), None);
     }
 
     #[test]

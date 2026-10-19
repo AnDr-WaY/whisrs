@@ -13,7 +13,7 @@
 # Environment:
 #   WHISRS_VERSION=v0.1.11   Pin to a specific tag (default: latest)
 #   WHISRS_MINIMAL=1         Use the minimal build (cloud-only, no whisper.cpp;
-#                            still includes the tray icon and overlay)
+#                            still includes the tray icon, overlay and MCP server)
 
 set -euo pipefail
 

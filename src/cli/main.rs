@@ -99,6 +99,10 @@ enum SubCmd {
     /// Record your mic and the system audio, then turn them into a transcript
     #[command(subcommand)]
     Recording(RecordingCmd),
+    /// Serve your recordings to an AI agent: a read-only MCP server on stdin
+    /// and stdout (add it to an MCP client, e.g. `claude mcp add whisrs --
+    /// whisrs mcp`)
+    Mcp,
 }
 
 /// The transcription languages of a recording (`start`, `toggle`, `retry`).
@@ -365,9 +369,27 @@ async fn main() -> anyhow::Result<()> {
         SubCmd::Recording(cmd) => {
             cmd_recording(cmd).await?;
         }
+        SubCmd::Mcp => cmd_mcp().await?,
     }
 
     Ok(())
+}
+
+/// `whisrs mcp`: the MCP server lives in the library ([`whisrs::mcp`]) and
+/// reads the recordings folder itself, so it works with the daemon stopped.
+#[cfg(feature = "mcp")]
+async fn cmd_mcp() -> anyhow::Result<()> {
+    whisrs::mcp::serve_stdio(recordings_root()).await
+}
+
+/// What `whisrs mcp` says in a build without the `mcp` feature.
+#[cfg(not(feature = "mcp"))]
+const MCP_MISSING: &str = "this whisrs was built without the mcp feature, so `whisrs mcp` is \
+     not available. Use a release build, or rebuild with `cargo install whisrs --features mcp`.";
+
+#[cfg(not(feature = "mcp"))]
+async fn cmd_mcp() -> anyhow::Result<()> {
+    exit_with_error(MCP_MISSING)
 }
 
 /// Restart the whisrs daemon.
@@ -604,25 +626,10 @@ async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The recordings root: `[recording] dir` from config.toml, else the default.
-///
-/// Reads only that one key, so a config the daemon would reject for an
-/// unrelated reason still lets you browse recordings.
+/// The recordings root: `[recording] dir` from config.toml, else the default
+/// ([`store::configured_recordings_dir`], which reads only that key).
 fn recordings_root() -> std::path::PathBuf {
-    let dir = std::fs::read_to_string(whisrs::config_path())
-        .ok()
-        .and_then(|text| recording_dir_from_toml(&text));
-    store::recordings_dir_from(dir.as_deref())
-}
-
-/// `[recording] dir` from config.toml text, if set.
-fn recording_dir_from_toml(text: &str) -> Option<String> {
-    let table: toml::Table = text.parse().ok()?;
-    table
-        .get("recording")?
-        .get("dir")?
-        .as_str()
-        .map(str::to_string)
+    store::configured_recordings_dir()
 }
 
 /// Resolve `<id|last>` to a recording folder, or print the error and exit 1.
@@ -1180,6 +1187,22 @@ mod tests {
         );
     }
 
+    /// `whisrs mcp` exists in every build, so a build without the feature
+    /// says so instead of an unknown subcommand.
+    #[test]
+    fn mcp_is_a_subcommand_in_every_build() {
+        let cli = Cli::try_parse_from(["whisrs", "mcp"]).unwrap();
+        assert!(matches!(cli.command, SubCmd::Mcp));
+        assert!(Cli::try_parse_from(["whisrs", "mcp", "extra"]).is_err());
+    }
+
+    #[cfg(not(feature = "mcp"))]
+    #[test]
+    fn mcp_without_the_feature_says_how_to_get_it() {
+        assert!(MCP_MISSING.contains("built without the mcp feature"));
+        assert!(MCP_MISSING.contains("--features mcp"));
+    }
+
     #[test]
     fn recording_plain_actions_parse() {
         assert!(matches!(parse_recording(&["stop"]), RecordingCmd::Stop));
@@ -1415,19 +1438,6 @@ mod tests {
             format_recording_status(&status, false),
             "Idle  (2 waiting for the network: a, b)"
         );
-    }
-
-    #[test]
-    fn recording_dir_read_from_config_toml() {
-        assert_eq!(
-            recording_dir_from_toml("[recording]\ndir = \"~/notes/recordings\"\n").as_deref(),
-            Some("~/notes/recordings")
-        );
-        assert_eq!(
-            recording_dir_from_toml("[general]\nbackend = \"groq\"\n"),
-            None
-        );
-        assert_eq!(recording_dir_from_toml("not toml ["), None);
     }
 
     /// Issue #84: `llm-command` and `llm-command-set` existed in the clap CLI

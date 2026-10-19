@@ -8,6 +8,8 @@ pub mod hooks;
 pub mod hotkey;
 pub mod ipc;
 pub mod llm;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 #[cfg(feature = "hooks")]
 pub mod mpris;
 pub mod overlay;
