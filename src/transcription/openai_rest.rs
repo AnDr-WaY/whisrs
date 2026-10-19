@@ -1,6 +1,6 @@
 //! OpenAI REST API transcription backend (non-streaming).
 //!
-//! Sends WAV audio (FLAC for whisper-1 meeting chunks) to OpenAI's
+//! Sends WAV audio (FLAC for whisper-1 recording chunks) to OpenAI's
 //! `/v1/audio/transcriptions` endpoint via multipart HTTP POST. Same pattern
 //! as the Groq backend.
 
@@ -9,7 +9,7 @@ use reqwest::multipart;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::flac::{meeting_upload, UploadFormat};
+use super::flac::{recording_upload, UploadFormat};
 use super::verbose_json::parse_verbose_segments;
 use super::{
     segments_by_phrase, Transcript, TranscriptionBackend, TranscriptionConfig, UPLOAD_CHUNK_SECS,
@@ -132,7 +132,7 @@ fn check_audio_size(audio: &[u8]) -> anyhow::Result<()> {
 /// Only the Whisper models accept `verbose_json` with
 /// `timestamp_granularities[]`. The gpt-4o family (`gpt-4o-transcribe`,
 /// `gpt-4o-mini-transcribe`, `gpt-transcribe`, and the `-diarize` variant
-/// until #175 wires its diarized format) answer plain `json`, so meetings on
+/// until #175 wires its diarized format) answer plain `json`, so recordings on
 /// those go through the phrase fallback.
 pub fn model_has_timestamps(model: &str) -> bool {
     model.starts_with("whisper")
@@ -211,7 +211,7 @@ impl TranscriptionBackend for OpenAIRestBackend {
             check_audio_size(audio)?;
             return segments_by_phrase(self, audio, config).await;
         }
-        let upload = meeting_upload(audio).await;
+        let upload = recording_upload(audio).await;
         check_audio_size(&upload.bytes)?;
         debug!(
             "sending {} bytes ({}, WAV was {}) to OpenAI API for segments (model={})",
@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whisper_meeting_chunks_upload_as_flac_and_dictation_as_wav() {
+    async fn whisper_recording_chunks_upload_as_flac_and_dictation_as_wav() {
         let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -384,7 +384,7 @@ mod tests {
         assert!(headers.contains("filename=\"audio.wav\""), "{headers}");
         assert!(data.starts_with(b"RIFF"));
     }
-    /// A Cloudflare origin timeout (524) on a meeting chunk is retried on the
+    /// A Cloudflare origin timeout (524) on a recording chunk is retried on the
     /// server-error schedule, here with short stand-ins for its waits.
     #[tokio::test]
     async fn a_524_is_retried_until_the_chunk_goes_through() {

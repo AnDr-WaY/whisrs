@@ -63,20 +63,20 @@ pub struct Config {
     #[serde(default)]
     pub llm_commands: Vec<llm::LlmCommandConfig>,
     /// Word/phrase replacements applied to every dictation before it is
-    /// typed, and to every line of a meeting transcript:
+    /// typed, and to every line of a recording's transcript:
     /// `"package build" = "PKGBUILD"`. Matching rules are in
     /// [`crate::replacements`]. Empty by default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub replacements: BTreeMap<String, String>,
-    /// Meeting mode: record mic + system audio, transcribe into a transcript.
+    /// The recording feature: record mic + system audio, then transcribe it.
     #[serde(default)]
-    pub meeting: Option<MeetingConfig>,
+    pub recording: Option<RecordingConfig>,
 }
 
-/// Meeting mode configuration (`[meeting]`).
+/// Recording feature configuration (`[recording]`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MeetingConfig {
-    /// Transcription backend for meetings. `None` uses `general.backend`.
+pub struct RecordingConfig {
+    /// Transcription backend for recordings. `None` uses `general.backend`.
     #[serde(default)]
     pub backend: Option<String>,
     /// Name used for the "me" speaker. `None` uses the passwd full name, else `$USER`.
@@ -89,59 +89,59 @@ pub struct MeetingConfig {
     #[serde(default)]
     pub system_device: Option<String>,
     /// Recording stops automatically after this many minutes.
-    #[serde(default = "default_meeting_max_duration_minutes")]
+    #[serde(default = "default_recording_max_duration_minutes")]
     pub max_duration_minutes: u32,
-    /// Days to keep audio of processed meetings (0 = delete right away, negative = keep forever).
-    #[serde(default = "default_meeting_audio_retention_days")]
+    /// Days to keep audio of processed recordings (0 = delete right away, negative = keep forever).
+    #[serde(default = "default_recording_audio_retention_days")]
     pub audio_retention_days: i64,
-    /// Meetings directory. `None` = `$XDG_DATA_HOME/whisrs/meetings`.
+    /// Recordings directory. `None` = `$XDG_DATA_HOME/whisrs/recordings`.
     #[serde(default)]
     pub dir: Option<String>,
 }
 
-fn default_meeting_max_duration_minutes() -> u32 {
+fn default_recording_max_duration_minutes() -> u32 {
     180
 }
 
-fn default_meeting_audio_retention_days() -> i64 {
+fn default_recording_audio_retention_days() -> i64 {
     7
 }
 
-impl Default for MeetingConfig {
+impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
             backend: None,
             user_name: None,
             mic_device: None,
             system_device: None,
-            max_duration_minutes: default_meeting_max_duration_minutes(),
-            audio_retention_days: default_meeting_audio_retention_days(),
+            max_duration_minutes: default_recording_max_duration_minutes(),
+            audio_retention_days: default_recording_audio_retention_days(),
             dir: None,
         }
     }
 }
 
-impl MeetingConfig {
-    /// The effective meeting config: `[meeting]` if present, else defaults.
-    pub fn effective(config: &Config) -> MeetingConfig {
-        config.meeting.clone().unwrap_or_default()
+impl RecordingConfig {
+    /// The effective recording config: `[recording]` if present, else defaults.
+    pub fn effective(config: &Config) -> RecordingConfig {
+        config.recording.clone().unwrap_or_default()
     }
 }
 
 /// Global hotkey configuration — key combos that trigger actions.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HotkeyConfig {
-    /// Hotkey to toggle recording (e.g. "Super+Shift+D").
+    /// Hotkey to toggle dictation (e.g. "Super+Shift+D").
     pub toggle: Option<String>,
-    /// Hotkey to cancel recording (e.g. "Super+Shift+Escape").
+    /// Hotkey to cancel dictation (e.g. "Super+Shift+Escape").
     pub cancel: Option<String>,
     /// Hotkey to start command mode (e.g. "Super+Shift+C").
     pub command: Option<String>,
     /// Hotkey to read the selected text aloud (e.g. "Super+Shift+R").
     #[serde(alias = "read")]
     pub speak: Option<String>,
-    /// Hotkey to start or stop a meeting recording (e.g. "Super+Shift+M").
-    pub meeting: Option<String>,
+    /// Hotkey to start or stop a recording of mic + system audio (e.g. "Super+Shift+M").
+    pub recording: Option<String>,
 }
 
 /// Recording-lifecycle hooks. `media_auto_pause` pauses the MPRIS players
@@ -1541,12 +1541,12 @@ const BACKEND_NAMES: &[BackendName] = &[
     },
 ];
 
-/// Upper bound for `[meeting] max_duration_minutes`: 36 hours, under the
+/// Upper bound for `[recording] max_duration_minutes`: 36 hours, under the
 /// ~37 h a 16 kHz mono 16-bit WAV can hold before its u32 size field wraps.
-pub const MAX_MEETING_DURATION_MINUTES: u32 = 2160;
+pub const MAX_RECORDING_DURATION_MINUTES: u32 = 2160;
 
-/// The backends meeting mode can transcribe with, as named in messages.
-const MEETING_BATCH_BACKENDS: &str = "groq, openai, deepgram, asr-sidecar, local-whisper";
+/// The backends the recording feature can transcribe with, as named in messages.
+const RECORDING_BATCH_BACKENDS: &str = "groq, openai, deepgram, asr-sidecar, local-whisper";
 
 /// Backends that only stream live audio and cannot transcribe a recording.
 fn is_realtime_backend(backend: &str) -> bool {
@@ -2004,7 +2004,7 @@ impl Config {
             }
         }
 
-        warnings.extend(self.validate_meeting()?);
+        warnings.extend(self.validate_recording()?);
 
         // Duplicate-binding detection across [hotkeys] and llm_commands. The
         // listener dispatches every action whose binding matches, with no
@@ -2019,7 +2019,7 @@ impl Config {
                 ("[hotkeys] cancel", &hotkeys.cancel),
                 ("[hotkeys] command", &hotkeys.command),
                 ("[hotkeys] speak", &hotkeys.speak),
-                ("[hotkeys] meeting", &hotkeys.meeting),
+                ("[hotkeys] recording", &hotkeys.recording),
             ] {
                 if let Some(spec) = value {
                     binding_sources.push((label.to_string(), spec.as_str()));
@@ -2088,7 +2088,7 @@ impl Config {
         if let Err(e) = crate::replacements::Replacer::new(&self.replacements) {
             warnings.push(ConfigWarning {
                 message: format!(
-                    "[replacements] could not be compiled, so dictation and meeting \
+                    "[replacements] could not be compiled, so dictation and recording \
                      transcription will fail: {e}"
                 ),
             });
@@ -2123,63 +2123,63 @@ impl Config {
         warnings
     }
 
-    /// Checks for meeting mode (`[meeting]` and `[hotkeys] meeting`).
+    /// Checks for the recording feature (`[recording]` and `[hotkeys] recording`).
     ///
-    /// Skipped entirely when neither is set: meeting mode is opt-in, so a
+    /// Skipped entirely when neither is set: the recording feature is opt-in, so a
     /// dictation-only config must not get warnings about a feature it never
     /// uses (an `openai-realtime` dictation user would otherwise be told on
-    /// every start that meetings cannot use their backend). When it is in
+    /// every start that recordings cannot use their backend). When it is in
     /// use, only values the user wrote are errors; a problem inherited from
     /// `[general] backend` is a warning, because dictation with that backend
-    /// is fine and must keep starting. The meeting itself then fails at
-    /// processing time with the audio kept for `whisrs meeting retry`.
-    fn validate_meeting(&self) -> Result<Vec<ConfigWarning>, WhisrsError> {
+    /// is fine and must keep starting. The recording itself then fails at
+    /// processing time with the audio kept for `whisrs recording retry`.
+    fn validate_recording(&self) -> Result<Vec<ConfigWarning>, WhisrsError> {
         let mut warnings = Vec::new();
         let hotkey_set = self
             .hotkeys
             .as_ref()
-            .and_then(|h| h.meeting.as_deref())
+            .and_then(|h| h.recording.as_deref())
             .is_some_and(|s| !s.trim().is_empty());
-        if self.meeting.is_none() && !hotkey_set {
+        if self.recording.is_none() && !hotkey_set {
             return Ok(warnings);
         }
-        let meeting = MeetingConfig::effective(self);
+        let recording = RecordingConfig::effective(self);
 
         // The WAV header stores the data size as a u32, which caps a 16 kHz
         // mono 16-bit track at about 37 hours. 2160 minutes (36 h) stays
         // under that with room to spare.
-        if !(1..=MAX_MEETING_DURATION_MINUTES).contains(&meeting.max_duration_minutes) {
+        if !(1..=MAX_RECORDING_DURATION_MINUTES).contains(&recording.max_duration_minutes) {
             return Err(WhisrsError::Config(format!(
-                "[meeting] max_duration_minutes = {} is out of range: use 1 to \
-                 {MAX_MEETING_DURATION_MINUTES} (36 hours, the most a WAV track can hold).",
-                meeting.max_duration_minutes
+                "[recording] max_duration_minutes = {} is out of range: use 1 to \
+                 {MAX_RECORDING_DURATION_MINUTES} (36 hours, the most a WAV track can hold).",
+                recording.max_duration_minutes
             )));
         }
 
-        match meeting.backend.as_deref().map(str::trim) {
+        match recording.backend.as_deref().map(str::trim) {
             Some(backend) => {
                 let Some(entry) = BACKEND_NAMES.iter().find(|b| b.name == backend) else {
                     return Err(WhisrsError::Config(format!(
-                        "[meeting] backend = \"{backend}\" is not a backend. Use one of: \
-                         {MEETING_BATCH_BACKENDS}, or remove the key to use [general] backend."
+                        "[recording] backend = \"{backend}\" is not a backend. Use one of: \
+                         {RECORDING_BATCH_BACKENDS}, or remove the key to use [general] backend."
                     )));
                 };
                 if entry.kind == BackendNameKind::Stub {
                     return Err(WhisrsError::Config(format!(
-                        "[meeting] backend = \"{backend}\" is not implemented yet. Use one \
-                         of: {MEETING_BATCH_BACKENDS}."
+                        "[recording] backend = \"{backend}\" is not implemented yet. Use one \
+                         of: {RECORDING_BATCH_BACKENDS}."
                     )));
                 }
                 if is_realtime_backend(backend) {
                     return Err(WhisrsError::Config(format!(
-                        "[meeting] backend = \"{backend}\" cannot transcribe meetings: \
-                         realtime backends only stream live audio, and a meeting is \
-                         transcribed from its recording after it ends. Use a batch backend: \
-                         {MEETING_BATCH_BACKENDS} (deepgram-streaming also works and uses \
-                         Deepgram's REST API for meetings)."
+                        "[recording] backend = \"{backend}\" cannot transcribe recordings: \
+                         realtime backends only stream live audio, and a recording is \
+                         transcribed from its audio files after it ends. Use a batch backend: \
+                         {RECORDING_BATCH_BACKENDS} (deepgram-streaming also works and uses \
+                         Deepgram's REST API for recordings)."
                     )));
                 }
-                if let Some(message) = self.meeting_backend_credential_gap(backend) {
+                if let Some(message) = self.recording_backend_credential_gap(backend) {
                     warnings.push(ConfigWarning { message });
                 }
             }
@@ -2188,12 +2188,12 @@ impl Config {
                 if is_realtime_backend(backend) {
                     warnings.push(ConfigWarning {
                         message: format!(
-                            "Meeting mode uses [general] backend = \"{backend}\", which \
-                             cannot transcribe meetings (realtime backends only stream live \
-                             audio). Meetings still record, but processing fails until you set \
-                             [meeting] backend to a batch backend: {MEETING_BATCH_BACKENDS}. \
-                             Failed meetings keep their audio, so `whisrs meeting retry` works \
-                             after the fix."
+                            "The recording feature uses [general] backend = \"{backend}\", \
+                             which cannot transcribe recordings (realtime backends only stream \
+                             live audio). Recordings still capture audio, but processing fails \
+                             until you set [recording] backend to a batch backend: \
+                             {RECORDING_BATCH_BACKENDS}. Failed recordings keep their audio, so \
+                             `whisrs recording retry` works after the fix."
                         ),
                     });
                 }
@@ -2202,17 +2202,17 @@ impl Config {
 
         // Device sanity. Only an explicit system source can be wrong here:
         // unset or "default" resolves to the default sink's monitor at start.
-        let mic = meeting
+        let mic = recording
             .mic_device
             .as_deref()
             .unwrap_or(self.audio.device.as_str())
             .trim();
-        if let Some(system) = meeting.system_device.as_deref().map(str::trim) {
+        if let Some(system) = recording.system_device.as_deref().map(str::trim) {
             let is_preset = system.is_empty() || system == "default" || system == "none";
             if !is_preset && system == mic {
                 warnings.push(ConfigWarning {
                     message: format!(
-                        "[meeting] system_device and the meeting microphone are both \
+                        "[recording] system_device and the recording microphone are both \
                          \"{system}\": both tracks would record the same source, so every \
                          line would appear twice. Point system_device at a monitor source \
                          (or remove it to use the default monitor)."
@@ -2221,7 +2221,7 @@ impl Config {
             } else if !is_preset && !system.ends_with(".monitor") {
                 warnings.push(ConfigWarning {
                     message: format!(
-                        "[meeting] system_device = \"{system}\" does not end in \
+                        "[recording] system_device = \"{system}\" does not end in \
                          \".monitor\", so it is probably a microphone rather than the audio \
                          you hear. Run `pactl list short sources` to find the monitor of your \
                          output device, or remove the key to use the default monitor."
@@ -2233,10 +2233,10 @@ impl Config {
         Ok(warnings)
     }
 
-    /// Why an explicit `[meeting] backend` will fail for lack of credentials,
+    /// Why an explicit `[recording] backend` will fail for lack of credentials,
     /// if it will. Only checked when it differs from `[general] backend`,
     /// whose own credentials `validate` already requires.
-    fn meeting_backend_credential_gap(&self, backend: &str) -> Option<String> {
+    fn recording_backend_credential_gap(&self, backend: &str) -> Option<String> {
         if backend == self.general.backend {
             return None;
         }
@@ -2278,8 +2278,8 @@ impl Config {
             _ => None,
         }?;
         Some(format!(
-            "[meeting] backend = \"{backend}\" needs {missing}; meetings will record but \
-             fail to transcribe until it is set."
+            "[recording] backend = \"{backend}\" needs {missing}; recordings will capture audio \
+             but fail to transcribe until it is set."
         ))
     }
 
@@ -3635,7 +3635,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
         };
         let err = config.validate().unwrap_err();
@@ -3752,7 +3752,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
         };
         let err = config.validate().unwrap_err();
@@ -3785,7 +3785,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
         };
         let result = config.validate();
@@ -3821,7 +3821,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
         };
         let warnings = config.validate().unwrap();
@@ -3865,7 +3865,7 @@ mod tests {
                 hooks: None,
                 llm_commands: Vec::new(),
                 replacements: BTreeMap::new(),
-                meeting: None,
+                recording: None,
                 overlay: None,
             };
             let warnings = config.validate().unwrap();
@@ -3945,7 +3945,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
         }
     }
@@ -4170,7 +4170,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
         };
 
@@ -4434,7 +4434,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
         };
         let warnings = config.validate().unwrap();
@@ -4492,7 +4492,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4528,7 +4528,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4565,7 +4565,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4602,7 +4602,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4639,7 +4639,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4673,7 +4673,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4749,7 +4749,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4791,7 +4791,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4835,7 +4835,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4904,7 +4904,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4961,7 +4961,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         }
@@ -4984,7 +4984,7 @@ mod tests {
             cancel: None,
             command: None,
             speak: None,
-            meeting: None,
+            recording: None,
         });
         config
             .llm_commands
@@ -5045,7 +5045,7 @@ mod tests {
             cancel: None,
             command: None,
             speak: Some("Meta+D".to_string()),
-            meeting: None,
+            recording: None,
         });
 
         let warnings = config.validate().unwrap();
@@ -5065,51 +5065,52 @@ mod tests {
         );
     }
 
-    fn meeting_config(edit: impl FnOnce(&mut MeetingConfig)) -> Option<MeetingConfig> {
-        let mut meeting = MeetingConfig::default();
-        edit(&mut meeting);
-        Some(meeting)
+    fn recording_config(edit: impl FnOnce(&mut RecordingConfig)) -> Option<RecordingConfig> {
+        let mut recording = RecordingConfig::default();
+        edit(&mut recording);
+        Some(recording)
     }
 
-    fn meeting_warnings(config: &Config) -> Vec<String> {
+    fn recording_warnings(config: &Config) -> Vec<String> {
         config
             .validate()
             .expect("config validates")
             .into_iter()
             .map(|w| w.message)
-            .filter(|m| m.contains("eeting"))
+            // The feature's own warnings, and a collision on its hotkey.
+            .filter(|m| m.contains("[recording]") || m.contains("[hotkeys] recording"))
             .collect()
     }
 
     #[test]
-    fn meeting_checks_are_skipped_when_meeting_mode_is_unused() {
-        // A realtime dictation user who never touched meetings gets no
-        // meeting warning on every start.
+    fn recording_checks_are_skipped_when_the_feature_is_unused() {
+        // A realtime dictation user who never touched recordings gets no
+        // recording warning on every start.
         let config = validatable_config("openai-realtime");
-        assert!(meeting_warnings(&config).is_empty());
+        assert!(recording_warnings(&config).is_empty());
     }
 
     #[test]
-    fn meeting_max_duration_out_of_range_is_an_error() {
-        for minutes in [0, MAX_MEETING_DURATION_MINUTES + 1] {
+    fn recording_max_duration_out_of_range_is_an_error() {
+        for minutes in [0, MAX_RECORDING_DURATION_MINUTES + 1] {
             let mut config = validatable_config("groq");
-            config.meeting = meeting_config(|m| m.max_duration_minutes = minutes);
+            config.recording = recording_config(|m| m.max_duration_minutes = minutes);
             let err = config.validate().expect_err("out-of-range duration");
             assert!(err.to_string().contains("max_duration_minutes"), "{err}");
         }
-        for minutes in [1, MAX_MEETING_DURATION_MINUTES] {
+        for minutes in [1, MAX_RECORDING_DURATION_MINUTES] {
             let mut config = validatable_config("groq");
-            config.meeting = meeting_config(|m| m.max_duration_minutes = minutes);
+            config.recording = recording_config(|m| m.max_duration_minutes = minutes);
             config.validate().expect("in-range duration");
         }
     }
 
     #[test]
-    fn explicit_realtime_meeting_backend_is_an_error() {
+    fn explicit_realtime_recording_backend_is_an_error() {
         for backend in ["openai-realtime", "openai-compatible-realtime"] {
             let mut config = validatable_config("groq");
-            config.meeting = meeting_config(|m| m.backend = Some(backend.to_string()));
-            let err = config.validate().expect_err("realtime meeting backend");
+            config.recording = recording_config(|m| m.backend = Some(backend.to_string()));
+            let err = config.validate().expect_err("realtime recording backend");
             let msg = err.to_string();
             assert!(
                 msg.contains(backend) && msg.contains("groq, openai, deepgram"),
@@ -5119,54 +5120,54 @@ mod tests {
     }
 
     #[test]
-    fn unknown_or_stub_meeting_backend_is_an_error() {
+    fn unknown_or_stub_recording_backend_is_an_error() {
         for backend in ["nope", "local-vosk"] {
             let mut config = validatable_config("groq");
-            config.meeting = meeting_config(|m| m.backend = Some(backend.to_string()));
+            config.recording = recording_config(|m| m.backend = Some(backend.to_string()));
             assert!(config.validate().is_err(), "{backend} must be rejected");
         }
     }
 
     #[test]
-    fn batch_meeting_backends_are_accepted() {
+    fn batch_recording_backends_are_accepted() {
         for backend in ["groq", "openai", "deepgram", "deepgram-streaming"] {
             let mut config = validatable_config("openai-realtime");
-            config.meeting = meeting_config(|m| m.backend = Some(backend.to_string()));
+            config.recording = recording_config(|m| m.backend = Some(backend.to_string()));
             assert!(
-                meeting_warnings(&config).is_empty(),
+                recording_warnings(&config).is_empty(),
                 "{backend}: {:?}",
-                meeting_warnings(&config)
+                recording_warnings(&config)
             );
         }
     }
 
     #[test]
     fn inherited_realtime_backend_is_a_warning_not_an_error() {
-        // Via the hotkey alone, no [meeting] section.
+        // Via the hotkey alone, no [recording] section.
         let mut config = validatable_config("openai-realtime");
         config.hotkeys = Some(HotkeyConfig {
-            meeting: Some("Super+Shift+M".to_string()),
+            recording: Some("Super+Shift+M".to_string()),
             ..Default::default()
         });
-        let warnings = meeting_warnings(&config);
+        let warnings = recording_warnings(&config);
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("openai-realtime") && w.contains("[meeting] backend")),
+                .any(|w| w.contains("openai-realtime") && w.contains("[recording] backend")),
             "{warnings:?}"
         );
 
-        // Via a [meeting] section that leaves the backend unset.
+        // Via a [recording] section that leaves the backend unset.
         let mut config = validatable_config("openai-compatible-realtime");
-        config.meeting = meeting_config(|_| {});
-        assert!(!meeting_warnings(&config).is_empty());
+        config.recording = recording_config(|_| {});
+        assert!(!recording_warnings(&config).is_empty());
     }
 
     #[test]
-    fn meeting_backend_without_credentials_warns() {
+    fn recording_backend_without_credentials_warns() {
         let mut config = validatable_config("groq");
-        config.meeting = meeting_config(|m| m.backend = Some("asr-sidecar".to_string()));
-        let warnings = meeting_warnings(&config);
+        config.recording = recording_config(|m| m.backend = Some("asr-sidecar".to_string()));
+        let warnings = recording_warnings(&config);
         assert!(
             warnings.iter().any(|w| w.contains("[asr-sidecar] url")),
             "{warnings:?}"
@@ -5174,22 +5175,22 @@ mod tests {
     }
 
     #[test]
-    fn meeting_system_device_equal_to_mic_warns() {
+    fn recording_system_device_equal_to_mic_warns() {
         let mut config = validatable_config("groq");
         config.audio.device = "alsa_input.usb-mic".to_string();
-        config.meeting =
-            meeting_config(|m| m.system_device = Some("alsa_input.usb-mic".to_string()));
-        let warnings = meeting_warnings(&config);
+        config.recording =
+            recording_config(|m| m.system_device = Some("alsa_input.usb-mic".to_string()));
+        let warnings = recording_warnings(&config);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("same source"), "{warnings:?}");
     }
 
     #[test]
-    fn meeting_system_device_that_is_not_a_monitor_warns() {
+    fn recording_system_device_that_is_not_a_monitor_warns() {
         let mut config = validatable_config("groq");
-        config.meeting =
-            meeting_config(|m| m.system_device = Some("alsa_input.webcam".to_string()));
-        let warnings = meeting_warnings(&config);
+        config.recording =
+            recording_config(|m| m.system_device = Some("alsa_input.webcam".to_string()));
+        let warnings = recording_warnings(&config);
         assert!(
             warnings.iter().any(|w| w.contains(".monitor")),
             "{warnings:?}"
@@ -5197,35 +5198,35 @@ mod tests {
     }
 
     #[test]
-    fn meeting_system_device_presets_and_monitors_do_not_warn() {
+    fn recording_system_device_presets_and_monitors_do_not_warn() {
         for system in [
             "default",
             "none",
             "alsa_output.pci-0000.analog-stereo.monitor",
         ] {
             let mut config = validatable_config("groq");
-            config.meeting = meeting_config(|m| m.system_device = Some(system.to_string()));
+            config.recording = recording_config(|m| m.system_device = Some(system.to_string()));
             assert!(
-                meeting_warnings(&config).is_empty(),
+                recording_warnings(&config).is_empty(),
                 "{system}: {:?}",
-                meeting_warnings(&config)
+                recording_warnings(&config)
             );
         }
     }
 
     #[test]
-    fn meeting_hotkey_collision_is_reported() {
+    fn recording_hotkey_collision_is_reported() {
         let mut config = validatable_config("groq");
         config.hotkeys = Some(HotkeyConfig {
             toggle: Some("Super+Shift+M".to_string()),
-            meeting: Some("shift+super+m".to_string()),
+            recording: Some("shift+super+m".to_string()),
             ..Default::default()
         });
         let warnings = config.validate().unwrap();
         assert!(
             warnings
                 .iter()
-                .any(|w| w.message.contains("[hotkeys] meeting")),
+                .any(|w| w.message.contains("[hotkeys] recording")),
             "{warnings:?}"
         );
     }
@@ -5238,7 +5239,7 @@ mod tests {
             cancel: Some("Super+Shift+Escape".to_string()),
             command: Some("Super+Shift+C".to_string()),
             speak: Some("Super+Shift+R".to_string()),
-            meeting: Some("Super+Shift+M".to_string()),
+            recording: Some("Super+Shift+M".to_string()),
         });
         config
             .llm_commands

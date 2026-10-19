@@ -68,7 +68,7 @@ cpal = { version = "0.18", features = ["pulseaudio"] }
 dialoguer = "0.11"
 dirs = "6"
 evdev = { version = "0.12", features = ["tokio"] }
-# Meeting uploads to cloud backends (lossless, less than half the WAV size).
+# Recording uploads to cloud backends (lossless, less than half the WAV size).
 # Default features off: no `par` thread pool, no serde, no log.
 flacenc = { version = "0.5.1", default-features = false }
 futures-util = "0.3"
@@ -123,7 +123,7 @@ version = "0.16"
 optional = true
 
 [dev-dependencies]
-# Decodes the FLAC meeting uploads back to samples in tests.
+# Decodes the FLAC recording uploads back to samples in tests.
 claxon = "0.4"
 tempfile = "3"
 # start_paused tests need tokio's paused clock ("test-util" is not in "full").

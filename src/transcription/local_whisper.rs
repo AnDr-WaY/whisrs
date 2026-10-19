@@ -357,20 +357,20 @@ impl LocalWhisperBackend {
         Ok(())
     }
 
-    /// Cut a meeting chunk into phrases of at most ~28 s with the same
+    /// Cut a recording chunk into phrases of at most ~28 s with the same
     /// splitter as silence-mode dictation.
     ///
     /// `segmentation` is not consulted: it picks how dictation streams, and
     /// `"none"` would hand whisper.cpp a whole chunk (up to ten minutes) in one
     /// `full()` call, where it carries text across its 30 s windows even with
     /// `no_context(true)`: the repetition loop of #55. `phrase_silence_ms` is
-    /// capped ([`super::meeting_phrase_silence_ms`]), so every join between
+    /// capped ([`super::recording_phrase_silence_ms`]), so every join between
     /// the chunk's speech regions ends a phrase.
-    fn meeting_phrases(&self, samples: &[i16]) -> Vec<super::phrase_split::Phrase> {
+    fn recording_phrases(&self, samples: &[i16]) -> Vec<super::phrase_split::Phrase> {
         let mut splitter = PhraseSplitter::new(
             SAMPLE_RATE,
             SILENCE_THRESHOLD,
-            super::meeting_phrase_silence_ms(self.phrase_silence_ms),
+            super::recording_phrase_silence_ms(self.phrase_silence_ms),
         );
         let mut phrases = splitter.feed(samples);
         phrases.extend(splitter.flush());
@@ -510,7 +510,7 @@ fn run_whisper_inference(
     Ok(text.trim().to_string())
 }
 
-/// Decode parameters shared by every whisper call, dictation and meetings
+/// Decode parameters shared by every whisper call, dictation and recordings
 /// alike, so the invariants below cannot drift between the two.
 fn full_params<'a>(language: &'a str, prompt: Option<&str>) -> whisper_rs::FullParams<'a, 'a> {
     use whisper_rs::{FullParams, SamplingStrategy};
@@ -566,7 +566,7 @@ struct RawSegment {
     avg_logprob: Option<f64>,
 }
 
-/// Decode a meeting window and return whisper's own segments with their
+/// Decode a recording window and return whisper's own segments with their
 /// timing and confidence. Dictation's parameters ([`full_params`]), with one
 /// change: `n_max_text_ctx` 0.
 ///
@@ -576,8 +576,8 @@ struct RawSegment {
 /// (`no_context` clears the carried text only when the call starts). That
 /// is the carried context of the #55 repetition loop. With `n_max_text_ctx`
 /// 0 no pass takes any prompt; in this whisper.cpp that includes the
-/// initial prompt, so meetings send local whisper none (see
-/// `crate::transcription::factory::meeting_transcription_config`).
+/// initial prompt, so recordings send local whisper none (see
+/// `crate::transcription::factory::recording_transcription_config`).
 fn run_whisper_segments(
     state: &mut whisper_rs::WhisperState,
     audio: &[f32],
@@ -657,7 +657,7 @@ fn place_window_segments(raw: Vec<RawSegment>, window: &DecodeWindow) -> Vec<Seg
     out
 }
 
-/// Decode a meeting chunk window by window on one reused state, one
+/// Decode a recording chunk window by window on one reused state, one
 /// `full()` call per [`DecodeWindow`].
 ///
 /// Windows group the phrases of the same [`PhraseSplitter`] as streaming
@@ -665,7 +665,7 @@ fn place_window_segments(raw: Vec<RawSegment>, window: &DecodeWindow) -> Vec<Seg
 /// call never decodes on into a second one. Passes inside a window take no
 /// carried text ([`run_whisper_segments`]). Whisper's own segments are
 /// kept, placed by [`place_window_segments`].
-fn decode_meeting_windows(
+fn decode_recording_windows(
     ctx: &whisper_rs::WhisperContext,
     samples: &[i16],
     windows: &[DecodeWindow],
@@ -687,7 +687,7 @@ fn decode_meeting_windows(
         match run_whisper_segments(&mut state, &i16_to_f32(&buf), language, prompt) {
             Ok(raw) => segments.extend(place_window_segments(raw, window)),
             Err(e) => {
-                warn!("whisper meeting window at {window_start_ms} ms failed: {e}");
+                warn!("whisper recording window at {window_start_ms} ms failed: {e}");
                 failures += 1;
                 // Same recovery as streaming: free the failed state first.
                 drop(state);
@@ -769,8 +769,8 @@ impl TranscriptionBackend for LocalWhisperBackend {
     }
 
     // Native timestamps from whisper's segments, decoded a window of phrases
-    // at a time (see `decode_meeting_windows` for why never a whole chunk at
-    // once, and `meeting_phrases` for why `segmentation` does not apply).
+    // at a time (see `decode_recording_windows` for why never a whole chunk at
+    // once, and `recording_phrases` for why `segmentation` does not apply).
     async fn transcribe_segments(
         &self,
         audio: &[u8],
@@ -784,11 +784,11 @@ impl TranscriptionBackend for LocalWhisperBackend {
         })?;
 
         let samples = decode_wav_samples(audio)?;
-        let phrases = self.meeting_phrases(&samples);
+        let phrases = self.recording_phrases(&samples);
         let windows = decode_windows(&samples, &phrases, SAMPLE_RATE);
         debug!(
             "local whisper: {} phrase(s) in {} decode window(s) (whisper full() calls) \
-             for a {:.1}s meeting chunk",
+             for a {:.1}s recording chunk",
             phrases.len(),
             windows.len(),
             samples.len() as f64 / SAMPLE_RATE as f64
@@ -799,7 +799,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
         let language = config.language.clone();
         let prompt = config.prompt.clone().filter(|p| !p.is_empty());
         let segments = tokio::task::spawn_blocking(move || {
-            decode_meeting_windows(&ctx, &samples, &windows, &language, prompt.as_deref())
+            decode_recording_windows(&ctx, &samples, &windows, &language, prompt.as_deref())
         })
         .await??;
         Ok(Transcript { segments })
@@ -905,18 +905,18 @@ mod tests {
         assert_eq!(SegmentationMode::default(), SegmentationMode::Silence);
     }
 
-    /// Meetings decode in short phrases on every segmentation mode, `"none"`
+    /// Recordings decode in short phrases on every segmentation mode, `"none"`
     /// included: 70 s of unbroken speech (no pause to cut at) still comes out
     /// as phrases no longer than the splitter's hard cap.
     #[test]
-    fn meeting_phrases_stay_short_whatever_the_segmentation() {
+    fn recording_phrases_stay_short_whatever_the_segmentation() {
         let speech: Vec<i16> = (0..70 * SAMPLE_RATE)
             .map(|i| if i % 2 == 0 { 8000 } else { -8000 })
             .collect();
         for mode in ["none", "silence", "window"] {
             let backend = LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
                 .with_segmentation(mode, 400);
-            let phrases = backend.meeting_phrases(&speech);
+            let phrases = backend.recording_phrases(&speech);
             assert!(phrases.len() >= 3, "{mode}: {} phrase(s)", phrases.len());
             for phrase in &phrases {
                 assert!(
@@ -982,14 +982,14 @@ mod tests {
         assert_eq!(placed[0].text, "Yes.");
     }
 
-    /// Two speech regions a second of silence apart, as a meeting chunk
+    /// Two speech regions a second of silence apart, as a recording chunk
     /// joins them, are two phrases however long `phrase_silence_ms` is.
     #[test]
-    fn meeting_phrases_break_at_every_join() {
+    fn recording_phrases_break_at_every_join() {
         let region: Vec<i16> = (0..16 * SAMPLE_RATE / 10)
             .map(|i| if i % 8 < 4 { 8000 } else { -8000 })
             .collect();
-        let join = crate::meeting::speech::JOIN_GAP;
+        let join = crate::recording::speech::JOIN_GAP;
         let chunk: Vec<i16> = region
             .iter()
             .copied()
@@ -999,12 +999,12 @@ mod tests {
         for silence_ms in [400, 900, 1000, 5000] {
             let backend = LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
                 .with_segmentation("silence", silence_ms);
-            let phrases = backend.meeting_phrases(&chunk);
+            let phrases = backend.recording_phrases(&chunk);
             assert_eq!(phrases.len(), 2, "phrase_silence_ms = {silence_ms}");
             assert!(phrases[1].start_sample as usize >= region.len() + join / 2);
         }
         assert!(
-            super::super::MEETING_PHRASE_SILENCE_MAX_MS < (join * 1000 / SAMPLE_RATE) as u64,
+            super::super::RECORDING_PHRASE_SILENCE_MAX_MS < (join * 1000 / SAMPLE_RATE) as u64,
             "the cap must stay under the join"
         );
     }

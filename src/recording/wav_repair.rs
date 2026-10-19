@@ -41,7 +41,7 @@ fn write_u32_at(file: &mut File, offset: u64, value: u32) -> anyhow::Result<bool
 /// Fix the RIFF and `data` sizes of `path` to match its real length.
 ///
 /// The `data` chunk is assumed to be the last chunk (true for files written
-/// by `hound` and by the meeting recorder): everything after its header up
+/// by `hound` and by the track recorder): everything after its header up
 /// to the last whole frame is counted as samples, and a trailing partial
 /// frame is truncated. A file whose header is complete but has no sample
 /// bytes repairs to `samples: 0`. A file cut inside the header, or that is

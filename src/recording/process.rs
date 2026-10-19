@@ -1,14 +1,14 @@
-//! Meeting post-processing: transcribe both tracks and build the transcript.
+//! Recording post-processing: transcribe both tracks and build the transcript.
 //!
-//! [`process_meeting`] runs once a recording has stopped (and its WAVs have
+//! [`process_recording`] runs once a recording has stopped (and its WAVs have
 //! been repaired by the caller). The speakers' echo is first taken out of
 //! the mic track ([`super::echo`]). Only the speech in each track is sent
 //! ([`super::speech`]): its active stretches are packed into condensed,
 //! backend-sized chunks, each chunk is transcribed into timed segments, and
-//! the segments are mapped back, filtered and moved onto the meeting
+//! the segments are mapped back, filtered and moved onto the recording
 //! timeline. Mic segments that still echo the system track are dropped, and
 //! the two channels are labelled and merged. The result lands in
-//! `meeting.json` and `<id>.md`.
+//! `recording.json` and `<id>.md`.
 
 use std::ffi::CStr;
 use std::fs;
@@ -30,18 +30,18 @@ use super::render::render_markdown;
 use super::speech::{self, TimeMap};
 use super::split::frame_len;
 use super::store::{self, CACHE_DIR};
-use super::{MeetingMeta, MeetingState, Segment, Speaker, TrackKind, TranscriptSegment};
+use super::{RecordingMeta, RecordingState, Segment, Speaker, TrackKind, TranscriptSegment};
 use crate::audio::wav::encode_wav;
 use crate::replacements::Replacer;
 use crate::transcription::factory::{
-    backend_identity, canonical_backend_name, create_backend_named, meeting_backend_name,
-    meeting_model_label, meeting_transcription_config,
+    backend_identity, canonical_backend_name, create_backend_named, recording_backend_name,
+    recording_model_label, recording_transcription_config,
 };
 use crate::transcription::retry::{retry_rate_limited, RateLimitExhausted, RATE_LIMIT_BUDGET};
 use crate::transcription::{TranscriptionBackend, TranscriptionConfig};
-use crate::{Config, MeetingConfig};
+use crate::{Config, RecordingConfig};
 
-/// Meeting tracks are recorded at this rate (and `encode_wav` writes it).
+/// Recording tracks are recorded at this rate (and `encode_wav` writes it).
 const SAMPLE_RATE: u32 = super::SAMPLE_RATE;
 
 /// How far apart a mic segment and the system audio it echoes may be.
@@ -54,25 +54,25 @@ const ECHO_CANCELLED_MIC: &str = "mic-echo-cancelled.wav";
 /// Its near-end mask ([`speech::encode_mask`]), beside it in the cache.
 const ECHO_CANCELLED_MASK: &str = "mic-echo-cancelled.mask";
 
-/// Transcribe a stopped meeting and write its transcript.
+/// Transcribe a stopped recording and write its transcript.
 ///
-/// Marks the meeting `processing`, transcribes every recorded track with the
-/// meeting backend ([`meeting_backend_name`]), and on success writes
-/// `meeting.json` with status `done` plus `<id>.md`, returning the new meta.
-/// `dictation_backend` is reused when the meeting backend is the dictation
+/// Marks the recording `processing`, transcribes every recorded track with the
+/// recording backend ([`recording_backend_name`]), and on success writes
+/// `recording.json` with status `done` plus `<id>.md`, returning the new meta.
+/// `dictation_backend` is reused when the recording backend is the dictation
 /// one, so a loaded whisper model is not loaded twice. On error the meta is
 /// left as `processing`; the caller marks it failed.
-pub async fn process_meeting(
+pub async fn process_recording(
     dir: &Path,
     config: &Config,
     dictation_backend: Option<Arc<dyn TranscriptionBackend>>,
-) -> anyhow::Result<MeetingMeta> {
+) -> anyhow::Result<RecordingMeta> {
     let mut meta = store::read_meta(dir)?;
-    meta.status = MeetingState::Processing;
+    meta.status = RecordingState::Processing;
     meta.error = None;
     store::write_meta(dir, &meta)?;
 
-    let name = meeting_backend_name(config)?;
+    let name = recording_backend_name(config)?;
     let backend = match dictation_backend {
         // `local` and `local-whisper` are one backend: reuse its loaded model.
         Some(backend)
@@ -89,11 +89,11 @@ pub async fn process_meeting(
                 .context("backend construction panicked")?
         }
     };
-    let tcfg = meeting_transcription_config(&name, config);
+    let tcfg = recording_transcription_config(&name, config);
     info!(
-        "processing meeting {} with {name} (model {})",
+        "processing recording {} with {name} (model {})",
         meta.id,
-        meeting_model_label(&name, config, &tcfg)
+        recording_model_label(&name, config, &tcfg)
     );
 
     let filler = if config.general.remove_filler_words {
@@ -128,7 +128,7 @@ pub async fn process_meeting(
         let path = dir.join(&track.file);
         if !path.exists() {
             let note = format!("{} audio missing: {}", track.kind.file_stem(), track.file);
-            warn!("meeting {}: {note}", meta.id);
+            warn!("recording {}: {note}", meta.id);
             if !meta.errors.contains(&note) {
                 meta.errors.push(note);
             }
@@ -156,7 +156,7 @@ pub async fn process_meeting(
                 format!("failed to transcribe the {} track", track.kind.file_stem())
             })?;
         info!(
-            "meeting {}: {} track gave {} segment(s)",
+            "recording {}: {} track gave {} segment(s)",
             meta.id,
             track.kind.file_stem(),
             segments.len()
@@ -167,14 +167,14 @@ pub async fn process_meeting(
         }
     }
     if readable_tracks == 0 {
-        bail!("no recorded audio found for meeting {}", meta.id);
+        bail!("no recorded audio found for recording {}", meta.id);
     }
 
     let before = mic.len();
     let mic = drop_echo_segments(mic, &system, ECHO_TOLERANCE_MS);
     if mic.len() < before {
         info!(
-            "meeting {}: dropped {} mic segment(s) echoing the system audio",
+            "recording {}: dropped {} mic segment(s) echoing the system audio",
             meta.id,
             before - mic.len()
         );
@@ -183,7 +183,7 @@ pub async fn process_meeting(
     meta.speakers = speakers_for(&meta, config);
     meta.segments = merge_channels(mic, system);
     meta.backend = Some(name);
-    meta.status = MeetingState::Done;
+    meta.status = RecordingState::Done;
     meta.error = None;
 
     write_private(
@@ -205,9 +205,9 @@ struct CancelledMic {
 /// The mic track with the speakers' echo removed ([`cancel_echo`]), or
 /// `None` to transcribe the mic as recorded: with no system track, when the
 /// system track is silent or the mic does not pick it up, and on any error,
-/// which is logged rather than failing the meeting. `audio/mic.wav` itself
+/// which is logged rather than failing the recording. `audio/mic.wav` itself
 /// is never modified.
-async fn echo_cancelled_mic(dir: &Path, meta: &MeetingMeta) -> Option<CancelledMic> {
+async fn echo_cancelled_mic(dir: &Path, meta: &RecordingMeta) -> Option<CancelledMic> {
     let track = |kind| meta.tracks.iter().find(|t| t.kind == kind);
     let (mic, system) = (track(TrackKind::Mic)?, track(TrackKind::System)?);
     let mic_path = dir.join(&mic.file);
@@ -230,7 +230,7 @@ async fn echo_cancelled_mic(dir: &Path, meta: &MeetingMeta) -> Option<CancelledM
     let id = &meta.id;
     match step {
         Ok(EchoStep::Reused(near_end)) => {
-            info!("meeting {id}: reusing the echo-cancelled mic track");
+            info!("recording {id}: reusing the echo-cancelled mic track");
             Some(CancelledMic {
                 path: out,
                 near_end,
@@ -240,7 +240,7 @@ async fn echo_cancelled_mic(dir: &Path, meta: &MeetingMeta) -> Option<CancelledM
             let report = &done.report;
             let ms = |samples: i64| samples * 1000 / i64::from(SAMPLE_RATE);
             info!(
-                "meeting {id}: removed the speaker echo from the mic track \
+                "recording {id}: removed the speaker echo from the mic track \
                  (lag {} ms, drift {} ms over {} block(s), echo path {:.1} dB)",
                 ms(report.lag),
                 ms(report.lag_drift),
@@ -253,12 +253,12 @@ async fn echo_cancelled_mic(dir: &Path, meta: &MeetingMeta) -> Option<CancelledM
             })
         }
         Ok(EchoStep::Ran(EchoOutcome::Skipped(reason))) => {
-            info!("meeting {id}: no speaker echo to remove: {reason}");
+            info!("recording {id}: no speaker echo to remove: {reason}");
             None
         }
         Err(e) => {
             warn!(
-                "meeting {id}: echo cancellation failed, transcribing the mic as recorded: {e:#}"
+                "recording {id}: echo cancellation failed, transcribing the mic as recorded: {e:#}"
             );
             None
         }
@@ -347,7 +347,7 @@ impl SegmentFilters {
         }
         if let Some(prompt) = &self.prompt {
             if is_prompt_echo(text, prompt) {
-                debug!("dropping meeting segment as a prompt echo: {text:?}");
+                debug!("dropping recording segment as a prompt echo: {text:?}");
                 return None;
             }
         }
@@ -495,7 +495,7 @@ struct TrackJob<'a> {
 }
 
 /// Transcribe the speech in one track into filtered segments on the
-/// meeting timeline.
+/// recording timeline.
 ///
 /// Peak memory is one chunk: the track is scanned once for its frame
 /// energies, its speech found ([`speech::regions`]) and packed into
@@ -649,11 +649,11 @@ struct CachedChunk {
     segments: Vec<Segment>,
 }
 
-/// Cache of finished chunks for one meeting and backend. Entries hold the
+/// Cache of finished chunks for one recording and backend. Entries hold the
 /// backend's segments before filtering, relative to the chunk, so a config
 /// change to the filters still applies on reuse. An entry is reused only
 /// when its fingerprint matches exactly: another backend, model file,
-/// language or vocabulary ignores it (meetings send no other prompt).
+/// language or vocabulary ignores it (recordings send no other prompt).
 struct ChunkCache {
     dir: PathBuf,
     fingerprint: String,
@@ -762,13 +762,13 @@ fn speaker_id(kind: TrackKind) -> &'static str {
 }
 
 /// One speaker per recorded channel.
-fn speakers_for(meta: &MeetingMeta, config: &Config) -> Vec<Speaker> {
+fn speakers_for(meta: &RecordingMeta, config: &Config) -> Vec<Speaker> {
     let has = |kind| meta.tracks.iter().any(|t| t.kind == kind);
     let mut speakers = Vec::new();
     if has(TrackKind::Mic) {
         speakers.push(Speaker {
             id: speaker_id(TrackKind::Mic).into(),
-            name: user_name(&MeetingConfig::effective(config)),
+            name: user_name(&RecordingConfig::effective(config)),
             source: "self".into(),
         });
     }
@@ -782,10 +782,10 @@ fn speakers_for(meta: &MeetingMeta, config: &Config) -> Vec<Speaker> {
     speakers
 }
 
-/// Name for the "me" speaker: `[meeting] user_name`, else the passwd full
+/// Name for the "me" speaker: `[recording] user_name`, else the passwd full
 /// name, else `$USER`, else "Me".
-fn user_name(meeting: &MeetingConfig) -> String {
-    meeting
+fn user_name(recording: &RecordingConfig) -> String {
+    recording
         .user_name
         .as_deref()
         .map(str::trim)
@@ -830,7 +830,7 @@ fn gecos_full_name(gecos: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Write a file atomically with mode 0600, like `meeting.json`.
+/// Write a file atomically with mode 0600, like `recording.json`.
 fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
@@ -853,9 +853,9 @@ fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meeting::echo::fixtures;
-    use crate::meeting::split::split_by_energies;
-    use crate::meeting::TrackMeta;
+    use crate::recording::echo::fixtures;
+    use crate::recording::split::split_by_energies;
+    use crate::recording::TrackMeta;
     use crate::transcription::{RetryableHttpError, Transcript};
     use audio_silence_gate::SILENCE_RMS_THRESHOLD;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -907,7 +907,7 @@ mod tests {
             _audio: &[u8],
             _config: &TranscriptionConfig,
         ) -> anyhow::Result<String> {
-            unreachable!("meetings ask for segments")
+            unreachable!("recordings ask for segments")
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
@@ -987,10 +987,12 @@ mod tests {
         fs::write(path, encode_wav(samples).unwrap()).unwrap();
     }
 
-    /// A stopped meeting in a temp dir with the given tracks.
-    fn meeting(tracks: &[(TrackKind, i64, Option<Vec<i16>>)]) -> (tempfile::TempDir, MeetingMeta) {
+    /// A stopped recording in a temp dir with the given tracks.
+    fn recording(
+        tracks: &[(TrackKind, i64, Option<Vec<i16>>)],
+    ) -> (tempfile::TempDir, RecordingMeta) {
         let tmp = tempfile::tempdir().unwrap();
-        let mut meta = MeetingMeta::new("2026-10-02_1400".into(), None, chrono::Local::now());
+        let mut meta = RecordingMeta::new("2026-10-02_1400".into(), None, chrono::Local::now());
         for (kind, offset_ms, samples) in tracks {
             let file = format!("audio/{}.wav", kind.file_stem());
             if let Some(samples) = samples {
@@ -1011,13 +1013,13 @@ mod tests {
     fn config() -> Config {
         toml::from_str(
             "[general]\nbackend = \"groq\"\nremove_filler_words = true\n\
-             [meeting]\nuser_name = \"Tester\"\n",
+             [recording]\nuser_name = \"Tester\"\n",
         )
         .unwrap()
     }
 
-    async fn run(dir: &Path, backend: Arc<FakeBackend>) -> MeetingMeta {
-        process_meeting(
+    async fn run(dir: &Path, backend: Arc<FakeBackend>) -> RecordingMeta {
+        process_recording(
             dir,
             &config(),
             Some(backend as Arc<dyn TranscriptionBackend>),
@@ -1032,7 +1034,7 @@ mod tests {
             &[(3000, "um, hello from me"), (6000, "hello from them")],
             None,
         );
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (
                 TrackKind::Mic,
                 0,
@@ -1046,7 +1048,7 @@ mod tests {
         ]);
         let meta = run(tmp.path(), backend).await;
 
-        assert_eq!(meta.status, MeetingState::Done);
+        assert_eq!(meta.status, RecordingState::Done);
         assert_eq!(meta.backend.as_deref(), Some("groq"));
         let lines: Vec<_> = meta
             .segments
@@ -1072,7 +1074,7 @@ mod tests {
         assert_eq!(store::read_meta(tmp.path()).unwrap(), meta);
     }
 
-    /// `[replacements]` reach meeting transcripts, after filler removal like
+    /// `[replacements]` reach recording transcripts, after filler removal like
     /// dictation: the key below only matches once "uh" is gone, and a segment
     /// a replacement empties is dropped rather than kept as a blank line.
     #[tokio::test]
@@ -1084,7 +1086,7 @@ mod tests {
             ],
             None,
         );
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)]))),
             (TrackKind::System, 0, Some(track(4.0, &[(2.5, 1.0, 6000)]))),
         ]);
@@ -1094,7 +1096,7 @@ mod tests {
             ("drop me".to_string(), String::new()),
         ]
         .into();
-        let meta = process_meeting(
+        let meta = process_recording(
             tmp.path(),
             &cfg,
             Some(backend as Arc<dyn TranscriptionBackend>),
@@ -1119,7 +1121,7 @@ mod tests {
             &[(3000, "first"), (4000, "second"), (5000, "third")],
             Some(3),
         );
-        let (tmp, _) = meeting(&[(
+        let (tmp, _) = recording(&[(
             TrackKind::Mic,
             500,
             Some(track(
@@ -1155,7 +1157,7 @@ mod tests {
             &[(2000, line), (6000, line), (3000, "sounds good to me")],
             None,
         );
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (
                 TrackKind::Mic,
                 0,
@@ -1176,7 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn silent_and_missing_tracks_are_skipped() {
         let backend = FakeBackend::new(&[(3000, "only me")], None);
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)]))),
             (TrackKind::System, 0, Some(vec![0; RATE * 4])),
         ]);
@@ -1188,7 +1190,7 @@ mod tests {
             "the silent system track never reaches the backend"
         );
 
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)]))),
             (TrackKind::System, 0, None),
         ]);
@@ -1204,7 +1206,7 @@ mod tests {
         let samples = track(120.0, &[(50.0, 1.0, 300)]);
         assert!(rms_energy(&samples) < SILENCE_RMS_THRESHOLD);
         let backend = FakeBackend::new(&[(300, "just one question")], Some(60));
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(samples))]);
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(samples))]);
         let meta = run(tmp.path(), backend.clone()).await;
         let texts: Vec<_> = meta.segments.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["just one question"]);
@@ -1216,7 +1218,7 @@ mod tests {
 
         // A 200 ms click is still below the gate.
         let backend = FakeBackend::new(&[(300, "click")], None);
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(track(120.0, &[(50.0, 0.2, 300)])))]);
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(track(120.0, &[(50.0, 0.2, 300)])))]);
         let meta = run(tmp.path(), backend.clone()).await;
         assert!(meta.segments.is_empty());
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
@@ -1224,8 +1226,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_audio_at_all_is_an_error() {
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, None)]);
-        let err = process_meeting(
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, None)]);
+        let err = process_recording(
             tmp.path(),
             &config(),
             Some(FakeBackend::new(&[], None) as Arc<dyn TranscriptionBackend>),
@@ -1236,18 +1238,18 @@ mod tests {
         // Left as processing for the caller to mark failed.
         assert_eq!(
             store::read_meta(tmp.path()).unwrap().status,
-            MeetingState::Processing
+            RecordingState::Processing
         );
     }
 
     #[tokio::test]
-    async fn realtime_meeting_backend_is_refused_before_transcribing() {
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(track(2.0, &[(0.5, 1.0, 3000)])))]);
+    async fn realtime_recording_backend_is_refused_before_transcribing() {
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(track(2.0, &[(0.5, 1.0, 3000)])))]);
         let mut cfg = config();
         cfg.general.backend = "openai-realtime".into();
-        cfg.meeting = None;
+        cfg.recording = None;
         let backend = FakeBackend::new(&[], None);
-        let err = process_meeting(
+        let err = process_recording(
             tmp.path(),
             &cfg,
             Some(backend.clone() as Arc<dyn TranscriptionBackend>),
@@ -1265,12 +1267,12 @@ mod tests {
             27.0,
             &[(2.0, 1.0, 3000), (12.0, 1.0, 4000), (22.0, 1.0, 5000)],
         );
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(samples))]);
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(samples))]);
 
         // One chunk per burst at a 3 s cap. The third chunk's request fails:
         // the first two are cached.
         let failing = FakeBackend::with_failures(&texts, Some(3), Some(2), 0);
-        let err = process_meeting(
+        let err = process_recording(
             tmp.path(),
             &config(),
             Some(failing.clone() as Arc<dyn TranscriptionBackend>),
@@ -1310,7 +1312,7 @@ mod tests {
             _audio: &[u8],
             _config: &TranscriptionConfig,
         ) -> anyhow::Result<String> {
-            unreachable!("meetings ask for segments")
+            unreachable!("recordings ask for segments")
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
@@ -1337,9 +1339,9 @@ mod tests {
     async fn run_recording(
         dir: &Path,
         backend: &Arc<RecordingBackend>,
-    ) -> anyhow::Result<MeetingMeta> {
+    ) -> anyhow::Result<RecordingMeta> {
         let backend = backend.clone() as Arc<dyn TranscriptionBackend>;
-        process_meeting(dir, &config(), Some(backend)).await
+        process_recording(dir, &config(), Some(backend)).await
     }
 
     /// A chunk of `(original start, len)` pieces, packed as
@@ -1371,8 +1373,8 @@ mod tests {
         read_condensed(path, &chunks[0]).unwrap()
     }
 
-    /// Cancel the meeting's mic into `expected.wav` beside it, as
-    /// `process_meeting` should have, and return what that left to send.
+    /// Cancel the recording's mic into `expected.wav` beside it, as
+    /// `process_recording` should have, and return what that left to send.
     fn expected_mic(dir: &Path, timeline_lag: i64) -> Vec<i16> {
         let expected = dir.join("expected.wav");
         let outcome = cancel_echo(
@@ -1394,7 +1396,7 @@ mod tests {
     #[tokio::test]
     async fn the_echo_cancelled_mic_is_sent_when_both_tracks_exist() {
         let (mic, system) = speaker_call();
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(mic.clone())),
             (TrackKind::System, 0, Some(system.clone())),
         ]);
@@ -1433,7 +1435,7 @@ mod tests {
     #[tokio::test]
     async fn the_raw_mic_is_sent_without_system_audio() {
         let (mic, _) = speaker_call();
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(mic.clone()))]);
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(mic.clone()))]);
         let mic_path = store::audio_path(tmp.path(), TrackKind::Mic);
         let backend = Arc::new(RecordingBackend::default());
         run_recording(tmp.path(), &backend).await.unwrap();
@@ -1443,7 +1445,7 @@ mod tests {
             "no system track"
         );
 
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(mic.clone())),
             (TrackKind::System, 0, Some(vec![0; mic.len()])),
         ]);
@@ -1462,7 +1464,7 @@ mod tests {
     async fn only_the_speech_is_sent() {
         let backend = FakeBackend::new(&[(3000, "first"), (4000, "second")], Some(600));
         let samples = track(120.0, &[(30.0, 1.0, 3000), (90.0, 1.0, 4000)]);
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 250, Some(samples))]);
+        let (tmp, _) = recording(&[(TrackKind::Mic, 250, Some(samples))]);
         let meta = run(tmp.path(), backend.clone()).await;
 
         // Each second of speech padded by 0.3 s a side, 1 s apart.
@@ -1487,9 +1489,9 @@ mod tests {
         for (i, s) in quiet.iter_mut().enumerate() {
             *s = [20, -20, 15, -15][i % 4];
         }
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(quiet))]);
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(quiet))]);
         let meta = run(tmp.path(), backend.clone()).await;
-        assert_eq!(meta.status, MeetingState::Done);
+        assert_eq!(meta.status, RecordingState::Done);
         assert!(meta.segments.is_empty());
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
     }
@@ -1505,7 +1507,7 @@ mod tests {
         let mut mic = fixtures::mix(&fixtures::echo(&system, 1000, 33), &near);
         fixtures::add_noise(&mut mic, 0.002, 34);
         fixtures::add_noise(&mut system, 1e-4, 35);
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(fixtures::quantize(&mic))),
             (TrackKind::System, 0, Some(fixtures::quantize(&system))),
         ]);
@@ -1533,7 +1535,7 @@ mod tests {
             _audio: &[u8],
             _config: &TranscriptionConfig,
         ) -> anyhow::Result<String> {
-            unreachable!("meetings ask for segments")
+            unreachable!("recordings ask for segments")
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
@@ -1556,7 +1558,7 @@ mod tests {
                 words: Some(
                     parts
                         .iter()
-                        .map(|s| crate::meeting::Word {
+                        .map(|s| crate::recording::Word {
                             start_ms: s.start_ms,
                             end_ms: s.end_ms,
                             text: s.text.clone(),
@@ -1580,8 +1582,8 @@ mod tests {
     async fn a_sentence_across_a_join_is_split_by_its_words() {
         let fake = FakeBackend::new(&[(3000, "First."), (4000, "Second.")], Some(600));
         let samples = track(120.0, &[(30.0, 1.0, 3000), (90.0, 1.0, 4000)]);
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 250, Some(samples))]);
-        let meta = process_meeting(
+        let (tmp, _) = recording(&[(TrackKind::Mic, 250, Some(samples))]);
+        let meta = process_recording(
             tmp.path(),
             &config(),
             Some(Arc::new(OneSentence(fake.clone())) as Arc<dyn TranscriptionBackend>),
@@ -1605,7 +1607,7 @@ mod tests {
     #[tokio::test]
     async fn the_system_track_is_condensed_by_energy() {
         let system = track(120.0, &[(10.0, 2.0, 6000), (100.0, 1.0, 6000)]);
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(vec![0; 120 * RATE])),
             (TrackKind::System, 0, Some(system)),
         ]);
@@ -1624,7 +1626,7 @@ mod tests {
     #[tokio::test]
     async fn a_retry_reuses_the_cancelled_mic() {
         let (mic, system) = speaker_call();
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(mic.clone())),
             (TrackKind::System, 0, Some(system)),
         ]);
@@ -1665,7 +1667,7 @@ mod tests {
     #[tokio::test]
     async fn a_cached_track_without_its_mask_is_redone() {
         let (mic, system) = speaker_call();
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(mic.clone())),
             (TrackKind::System, 0, Some(system)),
         ]);
@@ -1701,7 +1703,7 @@ mod tests {
         fixtures::add_noise(&mut mic, 3e-4, 4);
         fixtures::add_noise(&mut system, 1e-4, 5);
         let (mic, system) = (fixtures::quantize(&mic), fixtures::quantize(&system));
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(mic.clone())),
             (TrackKind::System, 400, Some(system)),
         ]);
@@ -1731,20 +1733,20 @@ mod tests {
         );
     }
 
-    /// The echo step never fails a meeting: with `.cache` a plain file it
-    /// cannot write the cancelled track (nor cache chunks), and the meeting
+    /// The echo step never fails a recording: with `.cache` a plain file it
+    /// cannot write the cancelled track (nor cache chunks), and the recording
     /// still finishes from the mic as recorded.
     #[tokio::test]
     async fn a_failed_echo_step_falls_back_to_the_raw_mic() {
         let (mic, system) = speaker_call();
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(mic.clone())),
             (TrackKind::System, 0, Some(system)),
         ]);
         fs::write(tmp.path().join(CACHE_DIR), "not a directory").unwrap();
         let backend = Arc::new(RecordingBackend::default());
         let meta = run_recording(tmp.path(), &backend).await.unwrap();
-        assert_eq!(meta.status, MeetingState::Done);
+        assert_eq!(meta.status, RecordingState::Done);
         let raw = condensed(&store::audio_path(tmp.path(), TrackKind::Mic), None);
         assert!(backend.sent.lock().unwrap()[0] == raw, "raw mic not sent");
     }
@@ -1754,7 +1756,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_rename_leaves_no_temporary() {
         let (mic, system) = speaker_call();
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(mic)),
             (TrackKind::System, 0, Some(system)),
         ]);
@@ -1776,12 +1778,12 @@ mod tests {
         assert!(!mask.exists(), "a mask without its track");
     }
 
-    /// A system track listed in `meeting.json` but missing on disk is not an
+    /// A system track listed in `recording.json` but missing on disk is not an
     /// echo failure: the step is skipped before it touches the cache.
     #[tokio::test]
     async fn a_missing_system_file_skips_the_echo_step() {
         let (mic, _) = speaker_call();
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(mic)), (TrackKind::System, 0, None)]);
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(mic)), (TrackKind::System, 0, None)]);
         // Fail the mic request, so nothing else creates the cache dir.
         let failing = Arc::new(RecordingBackend {
             fail_from: Some(0),
@@ -1796,7 +1798,7 @@ mod tests {
     #[tokio::test]
     async fn a_cached_track_of_the_wrong_length_is_redone() {
         let (mic, system) = speaker_call();
-        let (tmp, _) = meeting(&[
+        let (tmp, _) = recording(&[
             (TrackKind::Mic, 0, Some(mic.clone())),
             (TrackKind::System, 0, Some(system)),
         ]);
@@ -1866,13 +1868,13 @@ mod tests {
     }
 
     /// Real-data check of what gets sent, run by hand on copies of a
-    /// recorded meeting (never in the meeting folder itself):
+    /// real recording (never in the recording folder itself):
     ///
     /// ```text
     /// WHISRS_ECHO_MIC=mic.wav WHISRS_ECHO_SYSTEM=system.wav \
     /// WHISRS_ECHO_OUT=cancelled.wav WHISRS_ECHO_LAG=<(system - mic offset_ms) * 16> \
     /// WHISRS_SPEECH_LABELS=deepgram.json \
-    /// cargo test --release --lib speech_on_a_recorded_meeting -- --ignored --nocapture
+    /// cargo test --release --lib speech_on_a_real_recording -- --ignored --nocapture
     /// ```
     ///
     /// The labels are a Deepgram response for the cancelled mic: the words
@@ -1882,8 +1884,8 @@ mod tests {
     /// padded near-end mask alone and for the final regions, and how long
     /// each track is once condensed.
     #[test]
-    #[ignore = "needs a recorded meeting, see the doc comment"]
-    fn speech_on_a_recorded_meeting() {
+    #[ignore = "needs a real recording, see the doc comment"]
+    fn speech_on_a_real_recording() {
         let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
         let (mic, system, out) = (
             PathBuf::from(var("WHISRS_ECHO_MIC")),
@@ -2009,8 +2011,8 @@ mod tests {
 
     fn fingerprint_of(toml_text: &str) -> String {
         let config: Config = toml::from_str(toml_text).unwrap();
-        let name = meeting_backend_name(&config).unwrap();
-        let tcfg = meeting_transcription_config(&name, &config);
+        let name = recording_backend_name(&config).unwrap();
+        let tcfg = recording_transcription_config(&name, &config);
         cache_fingerprint(&name, &config, &tcfg)
     }
 
@@ -2034,7 +2036,7 @@ mod tests {
             fingerprint_of(&base.replace("base.en.bin", "small.en.bin"))
         );
         // So does the vocabulary. The dictation prompt is not sent with a
-        // meeting, so it does not.
+        // recording, so it does not.
         let vocab = base.replace("language", "vocabulary = [\"whisrs\"]\nlanguage");
         assert_ne!(fp, fingerprint_of(&vocab));
         let prompted = base.replace("language", "prompt = \"Standup\"\nlanguage");
@@ -2042,14 +2044,14 @@ mod tests {
         // Phrase cuts and flash attention change what whisper decodes.
         let silence = format!("{base}phrase_silence_ms = 900\n");
         assert_ne!(fp, fingerprint_of(&silence));
-        // Meetings cap the phrase cut at 900 ms, so longer ones decode alike.
+        // Recordings cap the phrase cut at 900 ms, so longer ones decode alike.
         for longer in [1200, 5000] {
             let cut = format!("{base}phrase_silence_ms = {longer}\n");
             assert_eq!(fingerprint_of(&silence), fingerprint_of(&cut), "{longer}");
         }
         let flash = format!("{base}flash_attn = true\n");
         assert_ne!(fp, fingerprint_of(&flash));
-        // Segmentation does not: meetings always decode phrase by phrase.
+        // Segmentation does not: recordings always decode phrase by phrase.
         for mode in ["none", "window", "silence"] {
             let segmented = format!("{base}segmentation = \"{mode}\"\n");
             assert_eq!(fp, fingerprint_of(&segmented), "segmentation = {mode}");
@@ -2072,10 +2074,10 @@ mod tests {
     async fn a_language_change_retranscribes_cached_chunks() {
         let texts = [(3000, "first"), (4000, "second")];
         let samples = track(17.0, &[(2.0, 1.0, 3000), (12.0, 1.0, 4000)]);
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(samples))]);
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(samples))]);
         // The second chunk fails: the first is cached under English.
         let failing = FakeBackend::with_failures(&texts, Some(3), Some(1), 0);
-        process_meeting(
+        process_recording(
             tmp.path(),
             &config(),
             Some(failing as Arc<dyn TranscriptionBackend>),
@@ -2087,7 +2089,7 @@ mod tests {
         let mut german = config();
         german.general.language = "de".into();
         let working = FakeBackend::new(&texts, Some(3));
-        process_meeting(
+        process_recording(
             tmp.path(),
             &german,
             Some(working.clone() as Arc<dyn TranscriptionBackend>),
@@ -2138,9 +2140,9 @@ mod tests {
         let backend = Arc::new(LimitedPhrases {
             calls: AtomicUsize::new(0),
         });
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
         let started = tokio::time::Instant::now();
-        let err = process_meeting(
+        let err = process_recording(
             tmp.path(),
             &config(),
             Some(backend.clone() as Arc<dyn TranscriptionBackend>),
@@ -2165,7 +2167,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn rate_limits_are_waited_out() {
         let backend = FakeBackend::with_failures(&[(3000, "patience")], None, None, 2);
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
         let started = tokio::time::Instant::now();
         let meta = run(tmp.path(), backend.clone()).await;
         assert_eq!(backend.calls.load(Ordering::Relaxed), 3);
@@ -2177,8 +2179,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn endless_rate_limits_fail_with_a_clear_error() {
         let backend = FakeBackend::with_failures(&[(3000, "never")], None, None, usize::MAX);
-        let (tmp, _) = meeting(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
-        let err = process_meeting(
+        let (tmp, _) = recording(&[(TrackKind::Mic, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
+        let err = process_recording(
             tmp.path(),
             &config(),
             Some(backend as Arc<dyn TranscriptionBackend>),
@@ -2214,8 +2216,12 @@ mod tests {
         assert_eq!(scan.energies.len(), speech::frame_count(samples.len()));
         assert_eq!(scan.energies.last(), Some(&rms_energy(&[9i16; 123])));
         for cap in [10, 25, 60] {
-            let expected =
-                crate::meeting::split::split_at_silence(&samples, RATE, cap, SILENCE_RMS_THRESHOLD);
+            let expected = crate::recording::split::split_at_silence(
+                &samples,
+                RATE,
+                cap,
+                SILENCE_RMS_THRESHOLD,
+            );
             let ranges =
                 split_by_energies(&scan.energies, scan.len, RATE, cap, SILENCE_RMS_THRESHOLD);
             assert_eq!(ranges, expected, "cap {cap}");
@@ -2279,12 +2285,12 @@ mod tests {
 
     #[test]
     fn configured_user_name_wins() {
-        let meeting = MeetingConfig {
+        let recording = RecordingConfig {
             user_name: Some(" Ada ".into()),
             ..Default::default()
         };
-        assert_eq!(user_name(&meeting), "Ada");
+        assert_eq!(user_name(&recording), "Ada");
         // Without one, something non-empty is always found.
-        assert!(!user_name(&MeetingConfig::default()).is_empty());
+        assert!(!user_name(&RecordingConfig::default()).is_empty());
     }
 }

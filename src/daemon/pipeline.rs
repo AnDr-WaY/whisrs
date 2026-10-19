@@ -1857,8 +1857,8 @@ mod tests {
             self.sends_prompt
         }
 
-        // The batch path never asks for segments; meetings have their own
-        // fakes in `whisrs::meeting::process`.
+        // The batch path never asks for segments; recordings have their own
+        // fakes in `whisrs::recording::process`.
         async fn transcribe_segments(
             &self,
             _audio: &[u8],
@@ -1893,7 +1893,7 @@ mod tests {
             state_tx: tokio::sync::watch::channel(State::Idle).0,
             overlay_level_tx: None,
             overlay_enabled: false,
-            meeting: crate::meeting::MeetingRuntime::new().0,
+            recording: crate::recording::RecordingRuntime::new().0,
         }
     }
 

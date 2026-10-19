@@ -1,7 +1,7 @@
 //! Deepgram transcription backend (REST + streaming WebSocket).
 //!
 //! Supports two modes:
-//! - **REST**: POST WAV audio (FLAC for meeting chunks) to `/v1/listen`
+//! - **REST**: POST WAV audio (FLAC for recording chunks) to `/v1/listen`
 //!   (non-streaming, simple).
 //! - **Streaming**: WebSocket to `wss://api.deepgram.com/v1/listen` with raw
 //!   PCM binary frames and real-time transcription results.
@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioChunk;
 
-use super::flac::{meeting_upload, UploadFormat};
+use super::flac::{recording_upload, UploadFormat};
 use super::{secs_to_ms, Segment, Transcript, TranscriptionBackend, TranscriptionConfig, Word};
 
 /// Deepgram REST API endpoint for pre-recorded audio.
@@ -330,7 +330,7 @@ struct StreamingChannel {
 
 /// Deepgram REST transcription backend.
 ///
-/// Sends the full WAV file (FLAC for a meeting chunk) to `/v1/listen` and
+/// Sends the full WAV file (FLAC for a recording chunk) to `/v1/listen` and
 /// returns the complete transcript.
 pub struct DeepgramRestBackend {
     client: reqwest::Client,
@@ -393,7 +393,7 @@ impl DeepgramRestBackend {
     }
 }
 
-/// Extra query params for a meeting request: `utterances=true` makes Deepgram
+/// Extra query params for a recording request: `utterances=true` makes Deepgram
 /// group words into timed utterances at pauses.
 const SEGMENT_QUERY_EXTRA: &[(&str, &str)] = &[("utterances", "true")];
 
@@ -567,7 +567,7 @@ impl TranscriptionBackend for DeepgramRestBackend {
         if audio.is_empty() {
             anyhow::bail!("cannot transcribe empty audio");
         }
-        let upload = meeting_upload(audio).await;
+        let upload = recording_upload(audio).await;
         debug!(
             "sending {} bytes ({}, WAV was {}) to Deepgram REST API for utterances (model={})",
             upload.bytes.len(),
@@ -784,7 +784,7 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
         false
     }
 
-    // A recorded meeting has no use for the live socket: same key and model,
+    // A recording has no use for the live socket: same key and model,
     // sent to the REST endpoint.
     async fn transcribe_segments(
         &self,
@@ -1390,14 +1390,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meeting_chunks_upload_as_flac_and_dictation_as_wav() {
+    async fn recording_chunks_upload_as_flac_and_dictation_as_wav() {
         let config = query_config("nova-3", &[]);
         let samples: Vec<i16> = (0..20_000)
             .map(|i| ((i as f64 * 0.17).sin() * 6000.0) as i16)
             .collect();
         let wav = crate::audio::wav::encode_wav(&samples).unwrap();
 
-        // The streaming backend hands meetings to this REST path in one line.
+        // The streaming backend hands recordings to this REST path in one line.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = local_backend(&listener);
         let server = tokio::spawn(serve_once(
@@ -1428,7 +1428,7 @@ mod tests {
         assert_eq!(request.header("content-type"), Some("audio/wav"));
         assert_eq!(request.body, wav);
     }
-    /// A Cloudflare origin timeout (524) on a meeting chunk is retried on the
+    /// A Cloudflare origin timeout (524) on a recording chunk is retried on the
     /// server-error schedule, here with short stand-ins for its waits.
     #[tokio::test]
     async fn a_524_is_retried_until_the_chunk_goes_through() {

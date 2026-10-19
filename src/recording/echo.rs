@@ -1,4 +1,4 @@
-//! Speaker echo removal for the meeting mic track.
+//! Speaker echo removal for the recording mic track.
 //!
 //! Without headphones the far side of a call plays through the speakers and
 //! the mic records it a second time. [`cancel_echo`] takes that echo out of
@@ -11,7 +11,7 @@
 //! the bins the echo covers.
 //!
 //! The tracks are read from disk in four passes, so memory stays at one
-//! block of audio however long the meeting is:
+//! block of audio however long the recording is:
 //!
 //! 1. [`estimate_lags`]: how far the mic lags the system track, by GCC-PHAT
 //!    over [`LAG_BLOCK`] blocks where the far side is active. Tracks from two
@@ -76,7 +76,7 @@ const MAX_DELAY: usize = RATE / 2;
 
 /// A correlation peak is an echo when it stands this many standard
 /// deviations above the correlation at the other lags. Measured on a real
-/// meeting: blocks without far-end speech peak at 4 to 8, blocks with it at
+/// recording: blocks without far-end speech peak at 4 to 8, blocks with it at
 /// 15 to 39.
 const MIN_PEAK_Z: f64 = 12.0;
 
@@ -108,7 +108,7 @@ const NEAR_END_MARGIN_DB: f64 = 10.0;
 const NEAR_END_FLOOR_DB: f64 = -60.0;
 
 /// A system frame quieter than this mean square is not far-end speech
-/// whatever its rank, so a meeting where the far side rarely talks does not
+/// whatever its rank, so a recording where the far side rarely talks does not
 /// learn the echo path from its noise floor (and the user's voice over it).
 const ACTIVE_POWER: f64 = SILENCE_RMS_THRESHOLD * SILENCE_RMS_THRESHOLD;
 
@@ -171,7 +171,7 @@ impl fmt::Display for SkipReason {
 pub struct EchoReport {
     /// Median lag of the mic behind the system track, in samples.
     pub lag: i64,
-    /// How far the lag moved over the meeting (clock drift), in samples.
+    /// How far the lag moved over the recording (clock drift), in samples.
     pub lag_drift: i64,
     /// Blocks whose lag was measured.
     pub aligned_blocks: usize,
@@ -251,13 +251,13 @@ impl Pair<'_> {
     }
 }
 
-/// The lag of the mic behind the system track through the meeting: mic
+/// The lag of the mic behind the system track through the recording: mic
 /// sample `u` holds the echo of system sample `u - lag`.
 #[derive(Debug, Clone, PartialEq)]
 struct LagTrack {
     /// `(mic sample, lag)` at the centre of every block with a confident
     /// peak, median-smoothed, in order. Two numbers per block, so a
-    /// three-hour meeting holds about a thousand.
+    /// three-hour recording holds about a thousand.
     points: Vec<(f64, f64)>,
 }
 
@@ -823,7 +823,7 @@ fn to_i16(sample: f32) -> i16 {
     (sample * 32768.0).round().clamp(-32768.0, 32767.0) as i16
 }
 
-/// The format of every meeting track: 16 kHz mono 16-bit PCM.
+/// The format of every recording track: 16 kHz mono 16-bit PCM.
 fn track_spec() -> hound::WavSpec {
     hound::WavSpec {
         channels: 1,
@@ -847,7 +847,7 @@ fn create_private(path: &Path) -> anyhow::Result<File> {
     Ok(file)
 }
 
-/// Synthetic meeting audio for the tests here and in `process`.
+/// Synthetic recording audio for the tests here and in `process`.
 #[cfg(test)]
 pub(super) mod fixtures {
     use super::RATE;
@@ -1399,12 +1399,12 @@ mod tests {
         assert!(Histogram::new(0.0, 1.0, 0.5).quantile(0.5).is_none());
     }
 
-    /// Real-data check, run by hand on copies of a recorded meeting:
+    /// Real-data check, run by hand on copies of a real recording:
     ///
     /// ```text
     /// WHISRS_ECHO_MIC=mic.wav WHISRS_ECHO_SYSTEM=system.wav \
     /// WHISRS_ECHO_OUT=out.wav WHISRS_ECHO_LAG=<(system - mic offset_ms) * 16> \
-    /// cargo test --release --lib echo_on_a_recorded_meeting -- --ignored --nocapture
+    /// cargo test --release --lib echo_on_a_real_recording -- --ignored --nocapture
     /// ```
     ///
     /// Prints the energy metrics of the Python prototype: the median 10 ms
@@ -1412,8 +1412,8 @@ mod tests {
     /// track is loud (above -30 dB) and where it is silent (below -60 dB)
     /// while the mic is not (above -45 dB).
     #[test]
-    #[ignore = "needs a recorded meeting, see the doc comment"]
-    fn echo_on_a_recorded_meeting() {
+    #[ignore = "needs a real recording, see the doc comment"]
+    fn echo_on_a_real_recording() {
         let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
         let (mic, system, out) = (
             PathBuf::from(var("WHISRS_ECHO_MIC")),

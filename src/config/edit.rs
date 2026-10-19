@@ -16,7 +16,7 @@ use dialoguer::{Confirm, Editor, Input, Select};
 
 use crate::config::{setup, vocabulary};
 use crate::service::ServiceManager;
-use crate::{Config, HotkeyConfig, MeetingConfig, RestartOutcome};
+use crate::{Config, HotkeyConfig, RecordingConfig, RestartOutcome};
 
 use setup::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
@@ -108,7 +108,7 @@ pub fn run_config_menu() -> Result<()> {
             "Recording hooks",
             "Command mode (LLM)",
             "Custom LLM commands",
-            "Meeting mode",
+            "Recording",
             "Show full config (masked)",
             "Open in $EDITOR",
             "─────────",
@@ -138,7 +138,7 @@ pub fn run_config_menu() -> Result<()> {
             11 => edit_media_hooks(&mut config)?,
             12 => edit_llm(&mut config)?,
             13 => edit_llm_commands(&mut config)?,
-            14 => edit_meeting(&mut config)?,
+            14 => edit_recording(&mut config)?,
             15 => show_config(&config),
             16 => {
                 if open_in_editor(&mut config)? {
@@ -188,7 +188,7 @@ fn default_config() -> Config {
         overlay: None,
         llm_commands: Vec::new(),
         replacements: Default::default(),
-        meeting: None,
+        recording: None,
     }
 }
 
@@ -531,58 +531,59 @@ fn select_input_device(
     })
 }
 
-/// Batch backends meeting mode can transcribe with. The realtime backends
-/// are left out on purpose: they only stream, and a meeting is transcribed
+/// Batch backends the recording feature can transcribe with. The realtime backends
+/// are left out on purpose: they only stream, and a recording is transcribed
 /// from files after it ends. `deepgram-streaming` is left out because a
-/// meeting uses Deepgram's REST API either way.
-const MEETING_BACKENDS: [&str; 5] = ["groq", "openai", "deepgram", "asr-sidecar", "local-whisper"];
+/// recording uses Deepgram's REST API either way.
+const RECORDING_BACKENDS: [&str; 5] =
+    ["groq", "openai", "deepgram", "asr-sidecar", "local-whisper"];
 
-fn edit_meeting(config: &mut Config) -> Result<()> {
+fn edit_recording(config: &mut Config) -> Result<()> {
     use crate::audio::device::list_input_devices;
 
-    println!("\n  {BOLD}Meeting mode{RESET}");
+    println!("\n  {BOLD}Recording{RESET}");
     println!(
         "  {DIM}Records your mic and the system audio as separate tracks, then\n   \
-         transcribes them after the meeting. Start and stop it with\n   \
-         `whisrs meeting` or the [hotkeys] meeting binding.{RESET}"
+         transcribes them after you stop. Start and stop it with\n   \
+         `whisrs recording` or the [hotkeys] recording binding.{RESET}"
     );
 
-    let mut meeting = MeetingConfig::effective(config);
+    let mut recording = RecordingConfig::effective(config);
 
     // Backend.
     let mut backend_items = vec![format!("Same as dictation ({})", config.general.backend)];
-    backend_items.extend(MEETING_BACKENDS.iter().map(|b| b.to_string()));
-    let backend_default = match meeting.backend.as_deref() {
+    backend_items.extend(RECORDING_BACKENDS.iter().map(|b| b.to_string()));
+    let backend_default = match recording.backend.as_deref() {
         None => 0,
-        Some(b) => MEETING_BACKENDS
+        Some(b) => RECORDING_BACKENDS
             .iter()
             .position(|m| *m == b)
             .map(|i| i + 1)
             .unwrap_or(0),
     };
     let choice = Select::new()
-        .with_prompt("Transcription backend for meetings (batch backends only)")
+        .with_prompt("Transcription backend for recordings (batch backends only)")
         .items(&backend_items)
         .default(backend_default)
         .interact()
-        .context("failed to read meeting backend")?;
-    meeting.backend = if choice == 0 {
+        .context("failed to read recording backend")?;
+    recording.backend = if choice == 0 {
         None
     } else {
-        Some(MEETING_BACKENDS[choice - 1].to_string())
+        Some(RECORDING_BACKENDS[choice - 1].to_string())
     };
 
     // Speaker name.
-    meeting.user_name = prompt_optional_string(
+    recording.user_name = prompt_optional_string(
         "Your name in transcripts, defaults to your login name",
-        &meeting.user_name,
+        &recording.user_name,
     )?;
 
     // Devices.
     let devices = list_input_devices();
     let (monitors, mics): (Vec<_>, Vec<_>) = devices.into_iter().partition(|d| d.is_monitor());
 
-    meeting.mic_device = select_input_device(
+    recording.mic_device = select_input_device(
         "Microphone",
         &[
             (
@@ -592,17 +593,17 @@ fn edit_meeting(config: &mut Config) -> Result<()> {
             ("System default".to_string(), Some("default".to_string())),
         ],
         &mics,
-        meeting.mic_device.as_deref(),
+        recording.mic_device.as_deref(),
         "Microphone device name",
     )?;
 
     // `"default"` is stored as unset: both mean the default monitor.
-    let system_current = match meeting.system_device.as_deref() {
+    let system_current = match recording.system_device.as_deref() {
         Some("default") => None,
         other => other,
     };
-    meeting.system_device = select_input_device(
-        "System audio (what the other side says)",
+    recording.system_device = select_input_device(
+        "System audio (what your computer plays)",
         &[
             ("Default monitor (what you hear)".to_string(), None),
             ("None (mic only)".to_string(), Some("none".to_string())),
@@ -613,9 +614,9 @@ fn edit_meeting(config: &mut Config) -> Result<()> {
     )?;
 
     // Limits and storage.
-    meeting.max_duration_minutes = Input::new()
+    recording.max_duration_minutes = Input::new()
         .with_prompt("Stop recording automatically after (minutes, 1-2160)")
-        .default(meeting.max_duration_minutes)
+        .default(recording.max_duration_minutes)
         .validate_with(|v: &u32| {
             if (1..=2160).contains(v) {
                 Ok(())
@@ -626,30 +627,30 @@ fn edit_meeting(config: &mut Config) -> Result<()> {
         .interact_text()
         .context("failed to read max duration")?;
 
-    meeting.audio_retention_days = Input::new()
-        .with_prompt("Keep meeting audio for (days; 0 = delete once transcribed, -1 = forever)")
-        .default(meeting.audio_retention_days)
+    recording.audio_retention_days = Input::new()
+        .with_prompt("Keep recording audio for (days; 0 = delete once transcribed, -1 = forever)")
+        .default(recording.audio_retention_days)
         .interact_text()
         .context("failed to read audio retention")?;
 
-    meeting.dir = prompt_optional_string(
-        "Meetings folder, defaults to ~/.local/share/whisrs/meetings",
-        &meeting.dir,
+    recording.dir = prompt_optional_string(
+        "Recordings folder, defaults to ~/.local/share/whisrs/recordings",
+        &recording.dir,
     )?;
 
-    config.meeting = apply_meeting_edit(config.meeting.take(), meeting);
+    config.recording = apply_recording_edit(config.recording.take(), recording);
     Ok(())
 }
 
-/// Decide what to store after the meeting editor ran. An existing
-/// `[meeting]` section is always kept (even if every value is back at its
+/// Decide what to store after the recording editor ran. An existing
+/// `[recording]` section is always kept (even if every value is back at its
 /// default); a config without one only gains it when the user changed
 /// something, so walking through the editor does not add an empty section.
-fn apply_meeting_edit(
-    current: Option<MeetingConfig>,
-    edited: MeetingConfig,
-) -> Option<MeetingConfig> {
-    if current.is_some() || edited != MeetingConfig::default() {
+fn apply_recording_edit(
+    current: Option<RecordingConfig>,
+    edited: RecordingConfig,
+) -> Option<RecordingConfig> {
+    if current.is_some() || edited != RecordingConfig::default() {
         Some(edited)
     } else {
         None
@@ -746,7 +747,9 @@ fn edit_hotkeys(config: &mut Config) -> Result<()> {
     hotkeys.cancel = prompt_optional_string("Cancel hotkey", &hotkeys.cancel)?;
     hotkeys.command = prompt_optional_string("Command-mode hotkey", &hotkeys.command)?;
     hotkeys.speak = prompt_optional_string("Read-aloud hotkey", &hotkeys.speak)?;
-    hotkeys.meeting = prompt_optional_string("Meeting hotkey", &hotkeys.meeting)?;
+    // Named apart from dictation, whose hotkey is `toggle`.
+    let recording_prompt = "Recording hotkey (mic + system audio)";
+    hotkeys.recording = prompt_optional_string(recording_prompt, &hotkeys.recording)?;
 
     // Drop the whole section if every field is empty — keeps the TOML clean.
     config.hotkeys = if any_hotkey_set(&hotkeys) {
@@ -767,13 +770,13 @@ fn any_hotkey_set(hotkeys: &HotkeyConfig) -> bool {
         cancel,
         command,
         speak,
-        meeting,
+        recording,
     } = hotkeys;
     toggle.is_some()
         || cancel.is_some()
         || command.is_some()
         || speak.is_some()
-        || meeting.is_some()
+        || recording.is_some()
 }
 
 /// Prompt for a value that may be unset, seeded with the current one.
@@ -1469,7 +1472,7 @@ mod tests {
             cancel: Some("b".into()),
             command: Some("c".into()),
             speak: Some("d".into()),
-            meeting: Some("e".into()),
+            recording: Some("e".into()),
         };
         let json = serde_json::to_value(&all_set).expect("HotkeyConfig serializes");
         json.as_object()
@@ -1479,28 +1482,28 @@ mod tests {
             .collect()
     }
 
-    /// Walking through the meeting editor without changing anything must not
-    /// add a `[meeting]` section; any change, or an existing section, keeps it.
+    /// Walking through the recording editor without changing anything must not
+    /// add a `[recording]` section; any change, or an existing section, keeps it.
     #[test]
-    fn meeting_section_is_written_only_when_used() {
-        assert_eq!(apply_meeting_edit(None, MeetingConfig::default()), None);
+    fn recording_section_is_written_only_when_used() {
+        assert_eq!(apply_recording_edit(None, RecordingConfig::default()), None);
 
-        let changed = MeetingConfig {
+        let changed = RecordingConfig {
             user_name: Some("Ada".into()),
             ..Default::default()
         };
-        assert_eq!(apply_meeting_edit(None, changed.clone()), Some(changed));
+        assert_eq!(apply_recording_edit(None, changed.clone()), Some(changed));
 
         assert_eq!(
-            apply_meeting_edit(Some(MeetingConfig::default()), MeetingConfig::default()),
-            Some(MeetingConfig::default())
+            apply_recording_edit(Some(RecordingConfig::default()), RecordingConfig::default()),
+            Some(RecordingConfig::default())
         );
     }
 
     /// The menu labels and the `match selection` arms are two hand-kept lists;
-    /// pin that the meeting row lands on its own handler.
+    /// pin that the recording row lands on its own handler.
     #[test]
-    fn meeting_menu_row_dispatches_to_edit_meeting() {
+    fn recording_menu_row_dispatches_to_edit_recording() {
         let source = include_str!("edit.rs");
         let body = source
             .split("pub fn run_config_menu(")
@@ -1522,11 +1525,11 @@ mod tests {
             .collect();
         let index = labels
             .iter()
-            .position(|l| *l == "Meeting mode")
-            .expect("menu has a Meeting mode row");
+            .position(|l| *l == "Recording")
+            .expect("menu has a Recording row");
         assert!(
-            body.contains(&format!("{index} => edit_meeting(&mut config)?")),
-            "Meeting mode is row {index} but that arm does not call edit_meeting"
+            body.contains(&format!("{index} => edit_recording(&mut config)?")),
+            "Recording is row {index} but that arm does not call edit_recording"
         );
         let last = labels.len() - 1;
         assert!(
@@ -2111,7 +2114,7 @@ mod tests {
                 "cancel" => hotkeys.cancel = Some("Super+Shift+Escape".into()),
                 "command" => hotkeys.command = Some("Super+Shift+C".into()),
                 "speak" => hotkeys.speak = Some("Super+Shift+R".into()),
-                "meeting" => hotkeys.meeting = Some("Super+Shift+M".into()),
+                "recording" => hotkeys.recording = Some("Super+Shift+M".into()),
                 other => panic!("unhandled hotkey field `{other}` — add it to this test"),
             }
             assert!(

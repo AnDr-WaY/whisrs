@@ -1,4 +1,4 @@
-//! Splitting long meeting tracks into backend-sized chunks.
+//! Splitting long recording tracks into backend-sized chunks.
 //!
 //! A backend takes at most [`TranscriptionBackend::max_segment_chunk_secs`]
 //! of audio per request, so a long track is cut into consecutive chunks.

@@ -1,6 +1,6 @@
-//! FLAC uploads for meeting chunks.
+//! FLAC uploads for recording chunks.
 //!
-//! Meeting chunks reach the backends as 16 kHz mono i16 WAV. FLAC is
+//! Recording chunks reach the backends as 16 kHz mono i16 WAV. FLAC is
 //! lossless, so a cloud service decodes the exact samples the WAV holds (same
 //! transcript, same billed duration) from, for speech, usually less than half
 //! the bytes. Only the native-timestamp `transcribe_segments` of Deepgram,
@@ -17,10 +17,10 @@ use tracing::{debug, warn};
 
 use super::SEGMENT_SAMPLE_RATE;
 
-/// Channels of a meeting chunk.
+/// Channels of a recording chunk.
 const CHANNELS: usize = 1;
 
-/// Bits per sample of a meeting chunk.
+/// Bits per sample of a recording chunk.
 const BITS_PER_SAMPLE: usize = 16;
 
 /// Bytes per sample in the WAV data chunk.
@@ -52,13 +52,13 @@ pub(crate) struct Upload<'a> {
     pub format: UploadFormat,
 }
 
-/// A meeting chunk as it goes on the wire: FLAC, or the WAV unchanged when
-/// encoding fails for any reason. A meeting never fails over compression.
+/// A recording chunk as it goes on the wire: FLAC, or the WAV unchanged when
+/// encoding fails for any reason. A recording never fails over compression.
 ///
 /// The encoder runs on the blocking pool, so a one-hour Deepgram chunk does
 /// not stall the daemon's runtime. Empty audio is passed through for the
 /// backend's own check to reject.
-pub(crate) async fn meeting_upload(wav: &[u8]) -> Upload<'_> {
+pub(crate) async fn recording_upload(wav: &[u8]) -> Upload<'_> {
     let unchanged = Upload {
         bytes: Cow::Borrowed(wav),
         format: UploadFormat::WAV,
@@ -184,7 +184,7 @@ pub(crate) fn wav_to_flac(wav: &[u8]) -> anyhow::Result<Vec<u8>> {
         .set_block_sizes(block_size, block_size)
         .map_err(flac_error)?;
 
-    // Room for 8 bits a sample (a recorded meeting took 6.8), so this rarely
+    // Room for 8 bits a sample (a real recording took 6.8), so this rarely
     // regrows.
     let mut out = ByteSink::with_capacity(source.pcm.len() * 4);
     // A placeholder header, overwritten once the MD5 and length are known.
@@ -251,7 +251,7 @@ mod tests {
     use crate::audio::wav::encode_wav;
     use crate::transcription::decode_wav_samples;
 
-    /// FLAC of `samples`, through the WAV a meeting chunk arrives as.
+    /// FLAC of `samples`, through the WAV a recording chunk arrives as.
     fn flac_of(samples: &[i16]) -> Vec<u8> {
         wav_to_flac(&encode_wav(samples).unwrap()).unwrap()
     }
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn other_wav_formats_are_refused() {
-        let meeting = hound::WavSpec {
+        let recording = hound::WavSpec {
             channels: 1,
             sample_rate: 16_000,
             bits_per_sample: 16,
@@ -376,21 +376,21 @@ mod tests {
         };
         let samples = mixed(5000);
         assert_eq!(
-            decode(&wav_to_flac(&wav_in(meeting, &samples)).unwrap()),
+            decode(&wav_to_flac(&wav_in(recording, &samples)).unwrap()),
             samples
         );
         for spec in [
             hound::WavSpec {
                 sample_rate: 8000,
-                ..meeting
+                ..recording
             },
             hound::WavSpec {
                 channels: 2,
-                ..meeting
+                ..recording
             },
             hound::WavSpec {
                 bits_per_sample: 8,
-                ..meeting
+                ..recording
             },
         ] {
             let samples: Vec<i16> = (0..4000).map(|i| (i % 100) as i16).collect();
@@ -467,18 +467,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meeting_upload_is_flac() {
+    async fn recording_upload_is_flac() {
         let samples = mixed(20_000);
         let wav = encode_wav(&samples).unwrap();
-        let upload = meeting_upload(&wav).await;
+        let upload = recording_upload(&wav).await;
         assert_eq!(upload.format, UploadFormat::FLAC);
         assert_eq!(decode(&upload.bytes), samples);
     }
 
     #[tokio::test]
-    async fn meeting_upload_falls_back_to_the_wav() {
+    async fn recording_upload_falls_back_to_the_wav() {
         let not_wav = b"RIFF but not really a WAV".to_vec();
-        let upload = meeting_upload(&not_wav).await;
+        let upload = recording_upload(&not_wav).await;
         assert_eq!(upload.format, UploadFormat::WAV);
         assert_eq!(&*upload.bytes, &not_wav[..]);
 
@@ -491,11 +491,11 @@ mod tests {
             },
             &mixed(8000),
         );
-        let upload = meeting_upload(&stereo).await;
+        let upload = recording_upload(&stereo).await;
         assert_eq!(upload.format, UploadFormat::WAV);
         assert_eq!(&*upload.bytes, &stereo[..]);
 
-        let upload = meeting_upload(&[]).await;
+        let upload = recording_upload(&[]).await;
         assert_eq!(upload.format, UploadFormat::WAV);
         assert!(upload.bytes.is_empty());
     }
@@ -507,14 +507,14 @@ mod tests {
     ///     transcription::flac::tests::real_recording -- --ignored --nocapture
     /// ```
     ///
-    /// Point it at a copy, never at a file inside the meetings folder.
+    /// Point it at a copy, never at a file inside the recordings folder.
     #[tokio::test]
     #[ignore = "needs WHISRS_FLAC_BENCH_WAV"]
     async fn real_recording() {
         let path = std::env::var("WHISRS_FLAC_BENCH_WAV").expect("WHISRS_FLAC_BENCH_WAV");
         let wav = std::fs::read(&path).unwrap();
         let started = std::time::Instant::now();
-        let upload = meeting_upload(&wav).await;
+        let upload = recording_upload(&wav).await;
         let elapsed = started.elapsed();
         let peak = std::fs::read_to_string("/proc/self/status")
             .unwrap()

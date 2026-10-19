@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::llm::LlmCommandConfig;
-use crate::meeting::MeetingAction;
+use crate::recording::RecordingAction;
 use crate::{Command, HotkeyConfig};
 pub use parse::{parse_hotkey, HotkeyBinding};
 
@@ -136,10 +136,10 @@ fn build_actions(config: &HotkeyConfig, llm_commands: &[LlmCommandConfig]) -> Ve
         ("command", &config.command, Command::CommandMode),
         ("speak", &config.speak, Command::Speak),
         (
-            "meeting",
-            &config.meeting,
-            Command::Meeting {
-                action: MeetingAction::Toggle,
+            "recording",
+            &config.recording,
+            Command::Recording {
+                action: RecordingAction::Toggle,
                 title: None,
                 id: None,
             },
@@ -541,7 +541,7 @@ mod tests {
             cancel: Some("Super+Shift+D".to_string()),
             command: Some("Super+Shift+G".to_string()),
             speak: Some("Super+Shift+R".to_string()),
-            meeting: Some("Super+Shift+M".to_string()),
+            recording: Some("Super+Shift+M".to_string()),
         }
     }
 
@@ -567,12 +567,12 @@ mod tests {
         );
     }
 
-    /// `[hotkeys] meeting` takes the same forms as the other fields, the
+    /// `[hotkeys] recording` takes the same forms as the other fields, the
     /// bare ScrollLock/Pause/F13-F24 bindings included.
     #[test]
-    fn meeting_hotkey_accepts_a_bare_binding() {
+    fn recording_hotkey_accepts_a_bare_binding() {
         let config = HotkeyConfig {
-            meeting: Some("ScrollLock".to_string()),
+            recording: Some("ScrollLock".to_string()),
             ..Default::default()
         };
         let actions = build_actions(&config, &[]);
@@ -581,8 +581,8 @@ mod tests {
         assert_eq!(actions[0].binding.trigger, Key::KEY_SCROLLLOCK);
         assert!(matches!(
             actions[0].command,
-            Command::Meeting {
-                action: MeetingAction::Toggle,
+            Command::Recording {
+                action: RecordingAction::Toggle,
                 ..
             }
         ));
@@ -598,8 +598,8 @@ mod tests {
             Command::Cancel,
             Command::CommandMode,
             Command::Speak,
-            Command::Meeting {
-                action: MeetingAction::Toggle,
+            Command::Recording {
+                action: RecordingAction::Toggle,
                 title: None,
                 id: None,
             },

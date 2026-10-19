@@ -10,7 +10,7 @@ use whisrs::transcription::TranscriptionBackend;
 use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
 
-use crate::meeting::MeetingRuntime;
+use crate::recording::RecordingRuntime;
 
 /// Context saved when command mode starts recording.
 pub(crate) struct CommandModeContext {
@@ -142,10 +142,10 @@ pub(crate) struct DaemonContext {
     /// overlay already shows recording/transcribing state visually.
     /// Error notifications still fire.
     pub(crate) overlay_enabled: bool,
-    /// Meeting mode: the recording session, its status broadcast (tray only)
-    /// and the processing queue. Kept out of [`DaemonState`] so a meeting
+    /// The recording feature: its session, its status broadcast (tray only)
+    /// and the processing queue. Kept out of [`DaemonState`] so a recording
     /// never waits on, or blocks, the dictation lock.
-    pub(crate) meeting: MeetingRuntime,
+    pub(crate) recording: RecordingRuntime,
 }
 
 impl DaemonContext {

@@ -154,7 +154,7 @@ impl TranscriptionBackend for OpenAiCompatibleRealtimeBackend {
         false
     }
 
-    // Live-only: a recorded meeting needs a batch backend.
+    // Live-only: a recording needs a batch backend.
     async fn transcribe_segments(
         &self,
         _audio: &[u8],

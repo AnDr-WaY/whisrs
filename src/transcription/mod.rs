@@ -73,7 +73,7 @@ use tokio::sync::mpsc;
 
 use crate::audio::AudioChunk;
 
-pub use crate::meeting::{Segment, Word};
+pub use crate::recording::{Segment, Word};
 
 /// A timed transcript of one audio chunk, as returned by
 /// [`TranscriptionBackend::transcribe_segments`]. Times are milliseconds
@@ -99,23 +99,23 @@ const SEGMENT_SAMPLE_RATE: usize = 16_000;
 /// local-whisper default so both phrase paths cut alike.
 const FALLBACK_PHRASE_SILENCE_MS: u64 = 400;
 
-/// The longest silence a meeting phrase may hold. A meeting chunk joins its
+/// The longest silence a recording phrase may hold. A recording chunk joins its
 /// speech regions with a second of digital silence
-/// ([`crate::meeting::speech::JOIN_GAP`]), so a longer `phrase_silence_ms`
+/// ([`crate::recording::speech::JOIN_GAP`]), so a longer `phrase_silence_ms`
 /// would decode two regions, possibly minutes apart, as one phrase.
-pub const MEETING_PHRASE_SILENCE_MAX_MS: u64 = 900;
+pub const RECORDING_PHRASE_SILENCE_MAX_MS: u64 = 900;
 
-/// `[local-whisper] phrase_silence_ms` as meetings apply it: capped at
-/// [`MEETING_PHRASE_SILENCE_MAX_MS`].
-pub fn meeting_phrase_silence_ms(configured: u64) -> u64 {
-    configured.min(MEETING_PHRASE_SILENCE_MAX_MS)
+/// `[local-whisper] phrase_silence_ms` as recordings apply it: capped at
+/// [`RECORDING_PHRASE_SILENCE_MAX_MS`].
+pub fn recording_phrase_silence_ms(configured: u64) -> u64 {
+    configured.min(RECORDING_PHRASE_SILENCE_MAX_MS)
 }
 
 /// A transient HTTP failure worth retrying later: 429 (rate limited), 503
 /// (overloaded), or a server or gateway error (500, 502, 504, and
 /// Cloudflare's 520 to 524, such as a 524 origin timeout on a long upload).
 /// Cloud backends return it inside their `anyhow::Error` so a long job such
-/// as a meeting can back off and resume ([`retry::retry_rate_limited`]),
+/// as a recording can back off and resume ([`retry::retry_rate_limited`]),
 /// while dictation, which does not retry, shows the same message as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryableHttpError {
@@ -397,7 +397,7 @@ pub trait TranscriptionBackend: Send + Sync {
     /// Backends whose answer is fixed ignore the argument.
     fn sends_prompt(&self, config: &TranscriptionConfig) -> bool;
 
-    /// Transcribe one chunk of a meeting track into timed segments.
+    /// Transcribe one chunk of a recording track into timed segments.
     ///
     /// `audio` is a 16 kHz mono i16 WAV of at most
     /// [`Self::max_segment_chunk_secs`]; segment times are relative to its
@@ -406,7 +406,7 @@ pub trait TranscriptionBackend: Send + Sync {
     /// naming the batch backends to use instead.
     ///
     /// Required, like `sends_prompt`: a default would let a new backend ship
-    /// meeting support nobody decided on.
+    /// recording support nobody decided on.
     async fn transcribe_segments(
         &self,
         audio: &[u8],
@@ -421,8 +421,8 @@ pub trait TranscriptionBackend: Send + Sync {
 /// Error for a backend that only transcribes live audio.
 pub(crate) fn live_only_error(backend: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "the {backend} backend only transcribes live audio and cannot transcribe a recorded \
-         meeting. Set [meeting] backend to a batch backend: groq, openai, deepgram, \
+        "the {backend} backend only transcribes live audio and cannot transcribe a \
+         recording. Set [recording] backend to a batch backend: groq, openai, deepgram, \
          local-whisper or asr-sidecar"
     )
 }

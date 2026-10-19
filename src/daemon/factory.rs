@@ -1,5 +1,5 @@
 //! Dictation backend construction: `[general] backend` through the shared
-//! factory in [`whisrs::transcription::factory`], which meetings also use.
+//! factory in [`whisrs::transcription::factory`], which recordings also use.
 
 use std::sync::Arc;
 

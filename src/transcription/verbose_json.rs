@@ -3,7 +3,7 @@
 //! Groq and OpenAI `whisper-1` answer `response_format=verbose_json` with the
 //! same shape: `segments[]` carrying start/end seconds plus Whisper's own
 //! confidence numbers, and, when word granularity is requested, a top-level
-//! `words[]`. Both meeting paths parse it here.
+//! `words[]`. Both recording paths parse it here.
 
 use serde::Deserialize;
 

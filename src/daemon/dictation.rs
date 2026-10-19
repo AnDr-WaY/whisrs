@@ -11,13 +11,13 @@ use whisrs::{validate_language_override, Response, State};
 
 use crate::context::{DaemonContext, DaemonState};
 use crate::injection::KeystrokeSettings;
-use crate::meeting::{refuse_while_recording, DictationStart};
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     build_transcription_config, format_no_microphone_error, history_backend_tag,
     process_recording_batch, run_streaming_pipeline, save_history_entry, DictationOutcome,
     StreamingPipelineParams,
 };
+use crate::recording::{refuse_while_recording, DictationStart};
 
 pub(crate) async fn handle_toggle(
     daemon_state: Arc<Mutex<DaemonState>>,
@@ -29,7 +29,7 @@ pub(crate) async fn handle_toggle(
 
     match current_state {
         State::Idle => {
-            // Refused first while a meeting records: no capture, no state
+            // Refused first while a recording is in progress: no capture, no state
             // change, no start cue. The stop arm below is never refused.
             if let Some(refused) = refuse_while_recording(&context, DictationStart::Dictation) {
                 return refused;

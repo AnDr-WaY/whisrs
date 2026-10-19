@@ -1,4 +1,4 @@
-//! Sending only the speech in a meeting track.
+//! Sending only the speech in a recording track.
 //!
 //! Whisper backends normalise their input, so a long quiet stretch (what is
 //! left of the far side after echo removal, room noise) comes back as
@@ -35,7 +35,7 @@ const MERGE_FRAMES: usize = 10;
 const MIN_SPEECH_MS: usize = 300;
 
 /// Digital silence between packed regions (1 s): longer than the phrase
-/// cut local whisper uses for meetings (`phrase_silence_ms`, capped at
+/// cut local whisper uses for recordings (`phrase_silence_ms`, capped at
 /// 900 ms there) and than Deepgram's utterance split, so both break at
 /// every join.
 pub const JOIN_GAP: usize = RATE;
@@ -401,7 +401,7 @@ pub fn decode_mask(bytes: &[u8], samples: usize) -> Option<Vec<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meeting::split::frame_len;
+    use crate::recording::split::frame_len;
 
     const SEC: usize = RATE;
 

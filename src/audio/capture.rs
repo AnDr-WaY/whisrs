@@ -59,7 +59,7 @@ impl Drop for AudioCaptureHandle {
 enum CaptureMode {
     /// Dictation: `[audio] device`, an unknown name falls back to the default.
     Dictation,
-    /// A meeting track: an unknown name is an error.
+    /// A recording track: an unknown name is an error.
     Strict,
 }
 
@@ -75,7 +75,7 @@ impl CaptureMode {
     fn hint(self) -> &'static str {
         match self {
             Self::Dictation => "set [audio] device = \"default\"",
-            Self::Strict => "check the [meeting] mic_device and system_device settings",
+            Self::Strict => "check the [recording] mic_device and system_device settings",
         }
     }
 }
@@ -93,7 +93,7 @@ impl AudioCaptureHandle {
         Self::start(device, level_tx, CaptureMode::Dictation)
     }
 
-    /// Start capturing a meeting track from `device`: a PulseAudio source
+    /// Start capturing a recording track from `device`: a PulseAudio source
     /// (such as [`device::default_monitor_source`]), an ALSA PCM, or
     /// `"default"`. Unlike [`Self::start_with_level_tx`] an unknown name is
     /// an error, never the default input, and no level is published.
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn dictation_hint_is_unchanged() {
-        // The dictation messages predate meeting mode; keep their wording.
+        // The dictation messages predate the recording feature; keep their wording.
         assert_eq!(
             CaptureMode::Dictation.hint(),
             "set [audio] device = \"default\""
@@ -497,7 +497,7 @@ mod tests {
             "audio device usb-mic did not start within 5s; set [audio] device = \"default\""
         );
         let msg = start_timeout_error("x.monitor", CaptureMode::Strict).to_string();
-        assert!(msg.contains("[meeting]"), "{msg}");
+        assert!(msg.contains("[recording]"), "{msg}");
         assert!(!msg.contains("[audio]"), "{msg}");
     }
 

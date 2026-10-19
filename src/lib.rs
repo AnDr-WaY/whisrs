@@ -8,10 +8,10 @@ pub mod hooks;
 pub mod hotkey;
 pub mod ipc;
 pub mod llm;
-pub mod meeting;
 #[cfg(feature = "hooks")]
 pub mod mpris;
 pub mod overlay;
+pub mod recording;
 pub mod replacements;
 pub mod service;
 pub mod state;

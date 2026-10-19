@@ -1,11 +1,11 @@
-//! Rendering a processed meeting as Markdown or plain text.
+//! Rendering a processed recording as Markdown or plain text.
 //!
-//! Markdown is the `<id>.md` written next to `meeting.json`: flat YAML front
+//! Markdown is the `<id>.md` written next to `recording.json`: flat YAML front
 //! matter (readable by Obsidian and other note tools) followed by the
-//! transcript as speaker turns. Plain text is what `whisrs meeting copy`
+//! transcript as speaker turns. Plain text is what `whisrs recording copy`
 //! puts on the clipboard.
 
-use super::MeetingMeta;
+use super::RecordingMeta;
 
 /// Consecutive segments from one speaker, merged.
 struct Turn<'a> {
@@ -15,7 +15,7 @@ struct Turn<'a> {
 }
 
 /// Merge consecutive same-speaker segments into turns.
-fn turns(meta: &MeetingMeta) -> Vec<Turn<'_>> {
+fn turns(meta: &RecordingMeta) -> Vec<Turn<'_>> {
     let mut out: Vec<Turn<'_>> = Vec::new();
     for seg in &meta.segments {
         let text = seg.text.trim();
@@ -38,7 +38,7 @@ fn turns(meta: &MeetingMeta) -> Vec<Turn<'_>> {
 }
 
 /// Display name for a speaker id, falling back to the id itself.
-fn speaker_name<'a>(meta: &'a MeetingMeta, id: &'a str) -> &'a str {
+fn speaker_name<'a>(meta: &'a RecordingMeta, id: &'a str) -> &'a str {
     meta.speakers
         .iter()
         .find(|s| s.id == id)
@@ -77,18 +77,18 @@ fn yaml_str(s: &str) -> String {
     out
 }
 
-/// The meeting title, or a dated default.
-fn title(meta: &MeetingMeta) -> String {
+/// The recording title, or a dated default.
+fn title(meta: &RecordingMeta) -> String {
     meta.title
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("Meeting {}", meta.started_at.format("%Y-%m-%d %H:%M")))
+        .unwrap_or_else(|| format!("Recording {}", meta.started_at.format("%Y-%m-%d %H:%M")))
 }
 
 /// Recording length: `ended_at - started_at`, else the longest track.
-fn duration_ms(meta: &MeetingMeta) -> u64 {
+fn duration_ms(meta: &RecordingMeta) -> u64 {
     if let Some(ended) = meta.ended_at {
         let ms = (ended - meta.started_at).num_milliseconds();
         if ms > 0 {
@@ -103,8 +103,8 @@ fn duration_ms(meta: &MeetingMeta) -> u64 {
         .unwrap_or(0)
 }
 
-/// Render the meeting as Markdown with YAML front matter.
-pub fn render_markdown(meta: &MeetingMeta) -> String {
+/// Render the recording as Markdown with YAML front matter.
+pub fn render_markdown(meta: &RecordingMeta) -> String {
     let mut out = String::from("---\n");
     out.push_str(&format!("title: {}\n", yaml_str(&title(meta))));
     out.push_str(&format!(
@@ -127,7 +127,7 @@ pub fn render_markdown(meta: &MeetingMeta) -> String {
             out.push_str(&format!("  - {}\n", yaml_str(&speaker.name)));
         }
     }
-    out.push_str("tags: [meeting]\n");
+    out.push_str("tags: [recording]\n");
     out.push_str(&format!("whisrs_id: {}\n", yaml_str(&meta.id)));
     if let Some(backend) = &meta.backend {
         out.push_str(&format!("backend: {}\n", yaml_str(backend)));
@@ -161,7 +161,7 @@ pub fn render_markdown(meta: &MeetingMeta) -> String {
 }
 
 /// Render the transcript as plain `[HH:MM:SS] Name: text` lines.
-pub fn render_text(meta: &MeetingMeta) -> String {
+pub fn render_text(meta: &RecordingMeta) -> String {
     turns(meta)
         .into_iter()
         .map(|turn| {
@@ -178,7 +178,7 @@ pub fn render_text(meta: &MeetingMeta) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meeting::{Speaker, TrackKind, TranscriptSegment};
+    use crate::recording::{Speaker, TrackKind, TranscriptSegment};
     use chrono::{Local, TimeZone};
 
     fn seg(start_ms: u64, speaker: &str, text: &str) -> TranscriptSegment {
@@ -195,9 +195,9 @@ mod tests {
         }
     }
 
-    fn meta() -> MeetingMeta {
+    fn meta() -> RecordingMeta {
         let started = Local.with_ymd_and_hms(2026, 10, 2, 14, 5, 0).unwrap();
-        let mut meta = MeetingMeta::new(
+        let mut meta = RecordingMeta::new(
             "2026-10-02_1405_standup".into(),
             Some("Standup: \"Q4\" #plan".into()),
             started,
@@ -234,7 +234,7 @@ mod tests {
             start: \"14:05\"\n\
             duration: \"01:02:05\"\n\
             speakers:\n  - \"Yosif\"\n  - \"Others\"\n\
-            tags: [meeting]\n\
+            tags: [recording]\n\
             whisrs_id: \"2026-10-02_1405_standup\"\n\
             backend: \"groq\"\n\
             ---\n\n## Transcript\n\n\
@@ -262,13 +262,13 @@ mod tests {
     }
 
     #[test]
-    fn untitled_empty_meeting_still_renders() {
+    fn untitled_empty_recording_still_renders() {
         let mut m = meta();
         m.title = None;
         m.segments.clear();
         m.backend = None;
         let md = render_markdown(&m);
-        assert!(md.contains("title: \"Meeting 2026-10-02 14:05\"\n"));
+        assert!(md.contains("title: \"Recording 2026-10-02 14:05\"\n"));
         assert!(md.contains("_No speech was transcribed._"));
         assert!(!md.contains("backend:"));
         assert_eq!(render_text(&m), "");
@@ -278,7 +278,7 @@ mod tests {
     fn duration_falls_back_to_tracks() {
         let mut m = meta();
         m.ended_at = None;
-        m.tracks.push(crate::meeting::TrackMeta {
+        m.tracks.push(crate::recording::TrackMeta {
             kind: TrackKind::Mic,
             file: "audio/mic.wav".into(),
             device: "default".into(),

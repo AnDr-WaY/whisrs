@@ -1,4 +1,5 @@
-//! Meeting track recording: writes captured audio chunks to WAV files.
+//! Track writer for the recording feature: writes captured audio chunks to
+//! WAV files.
 //!
 //! One writer per track (mic, system). The header is rewritten every
 //! `flush_every`, so a crash leaves a file that [`super::wav_repair`] can fix
@@ -27,7 +28,7 @@ pub struct TrackStats {
     pub first_chunk_at: Option<Instant>,
 }
 
-/// The format of every meeting track: 16 kHz mono 16-bit PCM.
+/// The format of every recording track: 16 kHz mono 16-bit PCM.
 fn track_spec() -> hound::WavSpec {
     hound::WavSpec {
         channels: 1,
@@ -161,7 +162,7 @@ mod tests {
 
         tx.send(vec![7i16; 1600]).unwrap();
         // Wait until the flushed header reports the chunk, without closing
-        // the channel: this is what a crash mid-meeting leaves on disk.
+        // the channel: this is what a crash mid-recording leaves on disk.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok(reader) = hound::WavReader::open(&path) {
@@ -173,7 +174,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(read_samples(&path), vec![7i16; 1600]);
-        let repaired = crate::meeting::wav_repair::repair_wav(&path).unwrap();
+        let repaired = crate::recording::wav_repair::repair_wav(&path).unwrap();
         assert_eq!(repaired.samples, 1600);
         assert!(!repaired.changed);
 
@@ -202,7 +203,7 @@ mod tests {
         // Simulate a crash: copy the file as it is now, before finalize.
         let crashed = dir.path().join("crashed.wav");
         std::fs::copy(&path, &crashed).unwrap();
-        let repaired = crate::meeting::wav_repair::repair_wav(&crashed).unwrap();
+        let repaired = crate::recording::wav_repair::repair_wav(&crashed).unwrap();
         assert!(repaired.changed);
         assert!(repaired.samples > 0 && repaired.samples <= 16_000);
         assert_eq!(read_samples(&crashed).len() as u64, repaired.samples);

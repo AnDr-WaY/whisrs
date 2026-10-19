@@ -30,7 +30,7 @@
 //! - [`PhraseSplitter::flush`] emits the trailing in-progress phrase at end of
 //!   stream (if it carries enough speech) exactly once.
 //!
-//! Local whisper meetings then group consecutive phrases into decode
+//! Local whisper recordings then group consecutive phrases into decode
 //! windows ([`decode_windows`]): one `full()` call per window instead of per
 //! phrase.
 
@@ -56,11 +56,11 @@ const QUIET_SEARCH_MS: usize = 2000;
 /// Longest decode window: the hard phrase ceiling, so a window fits in one
 /// 30 s mel window. That bounds the audio, not the decoder passes: whisper
 /// can still take a second pass over the rest of a window, which is why
-/// meeting windows decode without carried text (`n_max_text_ctx` 0).
+/// recording windows decode without carried text (`n_max_text_ctx` 0).
 pub const MAX_DECODE_WINDOW_SECS: usize = HARD_MAX_PHRASE_SECS;
 /// A run of at least this much exact-zero audio is a join: the second of
-/// digital silence a condensed meeting chunk puts between two speech regions
-/// (`crate::meeting::speech::JOIN_GAP`). The runs are found in the raw
+/// digital silence a condensed recording chunk puts between two speech regions
+/// (`crate::recording::speech::JOIN_GAP`). The runs are found in the raw
 /// samples, so a join always shows its full second; the threshold sits a
 /// little under it. A microphone never records that many exact zeros (its
 /// noise floor keeps flipping the low bits); a system track can, when

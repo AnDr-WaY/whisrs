@@ -23,7 +23,7 @@ pub struct AsrSidecarBackend {
     client: reqwest::Client,
     url: String,
     api_key: Option<String>,
-    /// Set once the sidecar answered without `segments`, so later meeting
+    /// Set once the sidecar answered without `segments`, so later recording
     /// chunks go straight to the phrase fallback.
     no_segments: AtomicBool,
 }
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(t.segments[0].start_ms, 1000);
         assert!(!backend.no_segments.load(Ordering::Relaxed));
     }
-    /// A Cloudflare origin timeout (524) on a meeting chunk is retried on the
+    /// A Cloudflare origin timeout (524) on a recording chunk is retried on the
     /// server-error schedule, here with short stand-ins for its waits.
     #[tokio::test]
     async fn a_524_is_retried_until_the_chunk_goes_through() {

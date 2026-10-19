@@ -1,7 +1,7 @@
-//! On-disk meeting store: one directory per meeting under the meetings root.
+//! On-disk recording store: one directory per recording under the recordings root.
 //!
-//! Layout: `<root>/<id>/meeting.json`, `<root>/<id>/audio/{mic,system}.wav`
-//! and `<root>/<id>/<id>.md`. Directories are 0700 and `meeting.json` is
+//! Layout: `<root>/<id>/recording.json`, `<root>/<id>/audio/{mic,system}.wav`
+//! and `<root>/<id>/<id>.md`. Directories are 0700 and `recording.json` is
 //! 0600, since both hold private conversation content.
 
 use std::fs;
@@ -13,27 +13,27 @@ use anyhow::{bail, Context};
 use chrono::{DateTime, Local};
 use tracing::{debug, warn};
 
-use super::{MeetingMeta, MeetingState, TrackKind};
+use super::{RecordingMeta, RecordingState, TrackKind};
 
-const META_FILE: &str = "meeting.json";
-const META_TMP: &str = ".meeting.json.tmp";
+const META_FILE: &str = "recording.json";
+const META_TMP: &str = ".recording.json.tmp";
 const AUDIO_DIR: &str = "audio";
 
-/// Per-chunk results of finished requests, under the meeting folder, so a
+/// Per-chunk results of finished requests, under the recording folder, so a
 /// retry or a recovery after a crash resumes instead of starting over.
-/// Dropped once the transcript is written; a failed meeting keeps it until
+/// Dropped once the transcript is written; a failed recording keeps it until
 /// its audio is deleted, since a retry needs both.
 pub const CACHE_DIR: &str = ".cache";
 const SLUG_MAX: usize = 40;
 
-/// The default meetings root, ignoring any `[meeting] dir` override.
-pub fn meetings_dir() -> PathBuf {
-    meetings_dir_from(None)
+/// The default recordings root, ignoring any `[recording] dir` override.
+pub fn recordings_dir() -> PathBuf {
+    recordings_dir_from(None)
 }
 
-/// The meetings root: `[meeting] dir` (with a leading `~/` expanded) or
-/// `$XDG_DATA_HOME/whisrs/meetings`.
-pub fn meetings_dir_from(cfg_dir: Option<&str>) -> PathBuf {
+/// The recordings root: `[recording] dir` (with a leading `~/` expanded) or
+/// `$XDG_DATA_HOME/whisrs/recordings`.
+pub fn recordings_dir_from(cfg_dir: Option<&str>) -> PathBuf {
     if let Some(dir) = cfg_dir.map(str::trim).filter(|d| !d.is_empty()) {
         return expand_tilde(dir);
     }
@@ -41,7 +41,7 @@ pub fn meetings_dir_from(cfg_dir: Option<&str>) -> PathBuf {
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
         .unwrap_or_else(std::env::temp_dir)
         .join("whisrs")
-        .join("meetings")
+        .join("recordings")
 }
 
 fn expand_tilde(dir: &str) -> PathBuf {
@@ -85,7 +85,7 @@ fn private_dir_builder() -> fs::DirBuilder {
     builder
 }
 
-/// Create a new meeting directory (with `audio/`) and return its id and path.
+/// Create a new recording directory (with `audio/`) and return its id and path.
 ///
 /// The id is `YYYY-MM-DD_HHMM`, plus `_<slug>` when a title is given; a
 /// collision appends `-2`, `-3`, ... The directory is claimed with
@@ -100,7 +100,7 @@ pub fn create(
         private_dir_builder()
             .recursive(true)
             .create(root)
-            .with_context(|| format!("failed to create meetings dir {}", root.display()))?;
+            .with_context(|| format!("failed to create recordings dir {}", root.display()))?;
         // `mode` is masked by the umask; set it explicitly.
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     }
@@ -127,19 +127,19 @@ pub fn create(
             Err(e) => return Err(e).with_context(|| format!("failed to create {}", dir.display())),
         }
     }
-    unreachable!("u32 range exhausted while picking a meeting id")
+    unreachable!("u32 range exhausted while picking a recording id")
 }
 
-/// Read `meeting.json` from a meeting directory.
-pub fn read_meta(dir: &Path) -> anyhow::Result<MeetingMeta> {
+/// Read `recording.json` from a recording directory.
+pub fn read_meta(dir: &Path) -> anyhow::Result<RecordingMeta> {
     let path = dir.join(META_FILE);
     let data = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&data).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-/// Write `meeting.json` atomically (temp file in the same dir, fsync,
+/// Write `recording.json` atomically (temp file in the same dir, fsync,
 /// rename), mode 0600.
-pub fn write_meta(dir: &Path, meta: &MeetingMeta) -> anyhow::Result<()> {
+pub fn write_meta(dir: &Path, meta: &RecordingMeta) -> anyhow::Result<()> {
     let tmp = dir.join(META_TMP);
     let path = dir.join(META_FILE);
     let json = serde_json::to_vec_pretty(meta)?;
@@ -165,15 +165,15 @@ pub fn write_meta(dir: &Path, meta: &MeetingMeta) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// All meetings under `root`, newest first by `started_at`. Directories
-/// without a readable `meeting.json` are skipped. A missing root is empty.
-pub fn list(root: &Path) -> anyhow::Result<Vec<(PathBuf, MeetingMeta)>> {
+/// All recordings under `root`, newest first by `started_at`. Directories
+/// without a readable `recording.json` are skipped. A missing root is empty.
+pub fn list(root: &Path) -> anyhow::Result<Vec<(PathBuf, RecordingMeta)>> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("failed to read {}", root.display())),
     };
-    let mut meetings = Vec::new();
+    let mut recordings = Vec::new();
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -181,46 +181,46 @@ pub fn list(root: &Path) -> anyhow::Result<Vec<(PathBuf, MeetingMeta)>> {
         }
         let dir = entry.path();
         match read_meta(&dir) {
-            Ok(meta) => meetings.push((dir, meta)),
+            Ok(meta) => recordings.push((dir, meta)),
             Err(e) => debug!("skipping {}: {e:#}", dir.display()),
         }
     }
-    meetings.sort_by(|(_, a), (_, b)| {
+    recordings.sort_by(|(_, a), (_, b)| {
         b.started_at
             .cmp(&a.started_at)
             .then_with(|| b.id.cmp(&a.id))
     });
-    Ok(meetings)
+    Ok(recordings)
 }
 
-/// Find a meeting by `"last"` (the newest), an exact id, or a unique id prefix.
+/// Find a recording by `"last"` (the newest), an exact id, or a unique id prefix.
 pub fn resolve(root: &Path, query: &str) -> anyhow::Result<PathBuf> {
     let query = query.trim();
-    let meetings = list(root)?;
-    if meetings.is_empty() {
-        bail!("no meetings found in {}", root.display());
+    let recordings = list(root)?;
+    if recordings.is_empty() {
+        bail!("no recordings found in {}", root.display());
     }
     if query == "last" {
-        return Ok(meetings[0].0.clone());
+        return Ok(recordings[0].0.clone());
     }
-    if let Some((dir, _)) = meetings.iter().find(|(_, m)| m.id == query) {
+    if let Some((dir, _)) = recordings.iter().find(|(_, m)| m.id == query) {
         return Ok(dir.clone());
     }
-    let matches: Vec<&(PathBuf, MeetingMeta)> = if query.is_empty() {
+    let matches: Vec<&(PathBuf, RecordingMeta)> = if query.is_empty() {
         Vec::new()
     } else {
-        meetings
+        recordings
             .iter()
             .filter(|(_, m)| m.id.starts_with(query))
             .collect()
     };
     match matches.as_slice() {
-        [] => bail!("no meeting matches '{query}'"),
+        [] => bail!("no recording matches '{query}'"),
         [(dir, _)] => Ok(dir.clone()),
         many => {
             let ids: Vec<&str> = many.iter().map(|(_, m)| m.id.as_str()).collect();
             bail!(
-                "'{query}' matches {} meetings: {}",
+                "'{query}' matches {} recordings: {}",
                 ids.len(),
                 ids.join(", ")
             )
@@ -239,41 +239,46 @@ pub fn audio_path(dir: &Path, kind: TrackKind) -> PathBuf {
         .join(format!("{}.wav", kind.file_stem()))
 }
 
-/// Meetings left mid-recording or mid-processing (e.g. by a crash).
+/// Recordings left mid-capture or mid-processing (e.g. by a crash).
 pub fn interrupted(root: &Path) -> Vec<PathBuf> {
     match list(root) {
-        Ok(meetings) => meetings
+        Ok(recordings) => recordings
             .into_iter()
-            .filter(|(_, m)| matches!(m.status, MeetingState::Recording | MeetingState::Processing))
+            .filter(|(_, m)| {
+                matches!(
+                    m.status,
+                    RecordingState::Recording | RecordingState::Processing
+                )
+            })
             .map(|(dir, _)| dir)
             .collect(),
         Err(e) => {
-            warn!("failed to scan meetings for interrupted ones: {e:#}");
+            warn!("failed to scan recordings for interrupted ones: {e:#}");
             Vec::new()
         }
     }
 }
 
-/// Delete the `audio/` dir of `Done` meetings that ended at least `days`
+/// Delete the `audio/` dir of `Done` recordings that ended at least `days`
 /// days before `now` (by `ended_at`, else `started_at`), mark them
-/// `audio_deleted`, and return their dirs. `0` sweeps every `Done` meeting;
+/// `audio_deleted`, and return their dirs. `0` sweeps every `Done` recording;
 /// a negative value keeps audio forever. `Failed`, `Recording` and
-/// `Processing` meetings are never touched, so their audio stays retryable.
+/// `Processing` recordings are never touched, so their audio stays retryable.
 pub fn sweep_retention(root: &Path, days: i64, now: DateTime<Local>) -> Vec<PathBuf> {
     if days < 0 {
         return Vec::new();
     }
-    let meetings = match list(root) {
-        Ok(meetings) => meetings,
+    let recordings = match list(root) {
+        Ok(recordings) => recordings,
         Err(e) => {
-            warn!("failed to scan meetings for audio retention: {e:#}");
+            warn!("failed to scan recordings for audio retention: {e:#}");
             return Vec::new();
         }
     };
     let max_age = chrono::Duration::days(days);
     let mut swept = Vec::new();
-    for (dir, mut meta) in meetings {
-        if meta.status != MeetingState::Done || meta.audio_deleted {
+    for (dir, mut meta) in recordings {
+        if meta.status != RecordingState::Done || meta.audio_deleted {
             continue;
         }
         let reference = meta.ended_at.unwrap_or(meta.started_at);
@@ -289,7 +294,7 @@ pub fn sweep_retention(root: &Path, days: i64, now: DateTime<Local>) -> Vec<Path
                 continue;
             }
         }
-        // A done meeting has no cache left; this is for completeness.
+        // A done recording has no cache left; this is for completeness.
         let cache = dir.join(CACHE_DIR);
         match fs::remove_dir_all(&cache) {
             Ok(()) => {}
@@ -319,16 +324,16 @@ mod tests {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    /// Create a meeting with a meta of the given status and times.
+    /// Create a recording with a meta of the given status and times.
     fn seed(
         root: &Path,
         started: DateTime<Local>,
         title: Option<&str>,
-        status: MeetingState,
+        status: RecordingState,
         ended: Option<DateTime<Local>>,
     ) -> PathBuf {
         let (id, dir) = create(root, started, title).unwrap();
-        let mut meta = MeetingMeta::new(id, title.map(String::from), started);
+        let mut meta = RecordingMeta::new(id, title.map(String::from), started);
         meta.status = status;
         meta.ended_at = ended;
         write_meta(&dir, &meta).unwrap();
@@ -351,7 +356,7 @@ mod tests {
     #[test]
     fn create_ids_and_collisions() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("meetings");
+        let root = tmp.path().join("recordings");
         let t = at(2026, 10, 2, 14, 5);
 
         let (id1, dir1) = create(&root, t, None).unwrap();
@@ -377,13 +382,13 @@ mod tests {
     fn meta_write_read_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let (id, dir) = create(tmp.path(), at(2026, 1, 1, 9, 0), Some("x")).unwrap();
-        let mut meta = MeetingMeta::new(id, Some("x".into()), at(2026, 1, 1, 9, 0));
+        let mut meta = RecordingMeta::new(id, Some("x".into()), at(2026, 1, 1, 9, 0));
         write_meta(&dir, &meta).unwrap();
         assert_eq!(read_meta(&dir).unwrap(), meta);
         assert_eq!(mode(&dir.join(META_FILE)), 0o600);
         assert!(!dir.join(META_TMP).exists());
 
-        meta.status = MeetingState::Done;
+        meta.status = RecordingState::Done;
         meta.errors.push("system audio unavailable".into());
         write_meta(&dir, &meta).unwrap();
         assert_eq!(read_meta(&dir).unwrap(), meta);
@@ -393,10 +398,10 @@ mod tests {
     fn list_is_newest_first_and_skips_junk() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let old = seed(root, at(2026, 1, 1, 9, 0), None, MeetingState::Done, None);
-        let new = seed(root, at(2026, 3, 1, 9, 0), None, MeetingState::Done, None);
-        let mid = seed(root, at(2026, 2, 1, 9, 0), None, MeetingState::Done, None);
-        fs::create_dir(root.join("not-a-meeting")).unwrap();
+        let old = seed(root, at(2026, 1, 1, 9, 0), None, RecordingState::Done, None);
+        let new = seed(root, at(2026, 3, 1, 9, 0), None, RecordingState::Done, None);
+        let mid = seed(root, at(2026, 2, 1, 9, 0), None, RecordingState::Done, None);
+        fs::create_dir(root.join("not-a-recording")).unwrap();
         fs::write(root.join("stray.txt"), b"x").unwrap();
 
         let dirs: Vec<PathBuf> = list(root).unwrap().into_iter().map(|(d, _)| d).collect();
@@ -414,17 +419,23 @@ mod tests {
             root,
             at(2026, 1, 1, 9, 0),
             Some("alpha"),
-            MeetingState::Done,
+            RecordingState::Done,
             None,
         );
         let b = seed(
             root,
             at(2026, 1, 1, 10, 0),
             Some("beta"),
-            MeetingState::Done,
+            RecordingState::Done,
             None,
         );
-        let c = seed(root, at(2026, 2, 5, 11, 0), None, MeetingState::Done, None);
+        let c = seed(
+            root,
+            at(2026, 2, 5, 11, 0),
+            None,
+            RecordingState::Done,
+            None,
+        );
 
         assert_eq!(resolve(root, "last").unwrap(), c);
         assert_eq!(resolve(root, "2026-01-01_0900_alpha").unwrap(), a);
@@ -436,7 +447,7 @@ mod tests {
         assert!(ambiguous.contains("2026-01-01_1000_beta"), "{ambiguous}");
 
         let none = resolve(root, "2025").unwrap_err().to_string();
-        assert!(none.contains("no meeting matches"), "{none}");
+        assert!(none.contains("no recording matches"), "{none}");
         assert!(resolve(root, "").is_err());
     }
 
@@ -445,8 +456,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let t = at(2026, 1, 1, 9, 0);
-        let first = seed(root, t, None, MeetingState::Done, None);
-        let _second = seed(root, t, None, MeetingState::Done, None);
+        let first = seed(root, t, None, RecordingState::Done, None);
+        let _second = seed(root, t, None, RecordingState::Done, None);
         assert_eq!(resolve(root, "2026-01-01_0900").unwrap(), first);
     }
 
@@ -458,18 +469,24 @@ mod tests {
             root,
             at(2026, 1, 1, 9, 0),
             None,
-            MeetingState::Recording,
+            RecordingState::Recording,
             None,
         );
         let proc_ = seed(
             root,
             at(2026, 1, 2, 9, 0),
             None,
-            MeetingState::Processing,
+            RecordingState::Processing,
             None,
         );
-        seed(root, at(2026, 1, 3, 9, 0), None, MeetingState::Done, None);
-        seed(root, at(2026, 1, 4, 9, 0), None, MeetingState::Failed, None);
+        seed(root, at(2026, 1, 3, 9, 0), None, RecordingState::Done, None);
+        seed(
+            root,
+            at(2026, 1, 4, 9, 0),
+            None,
+            RecordingState::Failed,
+            None,
+        );
 
         assert_eq!(interrupted(root), vec![proc_, rec]);
     }
@@ -484,7 +501,7 @@ mod tests {
             root,
             at(2026, 9, 1, 9, 0),
             Some("old"),
-            MeetingState::Done,
+            RecordingState::Done,
             Some(at(2026, 10, 2, 12, 0)),
         );
         // Ended 3 days ago: kept at 7 days.
@@ -492,7 +509,7 @@ mod tests {
             root,
             at(2026, 10, 7, 11, 0),
             Some("recent"),
-            MeetingState::Done,
+            RecordingState::Done,
             Some(at(2026, 10, 7, 12, 0)),
         );
         // No ended_at: falls back to started_at (20 days ago).
@@ -500,28 +517,28 @@ mod tests {
             root,
             at(2026, 9, 20, 9, 0),
             Some("noend"),
-            MeetingState::Done,
+            RecordingState::Done,
             None,
         );
         let failed = seed(
             root,
             at(2026, 1, 1, 9, 0),
             Some("f"),
-            MeetingState::Failed,
+            RecordingState::Failed,
             None,
         );
         let rec = seed(
             root,
             at(2026, 1, 2, 9, 0),
             Some("r"),
-            MeetingState::Recording,
+            RecordingState::Recording,
             None,
         );
         let proc_ = seed(
             root,
             at(2026, 1, 3, 9, 0),
             Some("p"),
-            MeetingState::Processing,
+            RecordingState::Processing,
             None,
         );
 
@@ -538,7 +555,7 @@ mod tests {
         assert!(recent.join("audio").exists());
         assert!(!read_meta(&recent).unwrap().audio_deleted);
 
-        // Already swept meetings are not reported again.
+        // Already swept recordings are not reported again.
         assert_eq!(sweep_retention(root, 0, now), vec![recent.clone()]);
         assert!(!recent.join("audio").exists());
 
@@ -549,12 +566,12 @@ mod tests {
     }
 
     #[test]
-    fn meetings_dir_override_and_tilde() {
+    fn recordings_dir_override_and_tilde() {
         let home = dirs::home_dir().unwrap();
-        assert_eq!(meetings_dir_from(Some("~/m")), home.join("m"));
-        assert_eq!(meetings_dir_from(Some("/srv/m")), PathBuf::from("/srv/m"));
-        assert!(meetings_dir_from(None).ends_with("whisrs/meetings"));
-        assert_eq!(meetings_dir_from(Some("  ")), meetings_dir());
+        assert_eq!(recordings_dir_from(Some("~/m")), home.join("m"));
+        assert_eq!(recordings_dir_from(Some("/srv/m")), PathBuf::from("/srv/m"));
+        assert!(recordings_dir_from(None).ends_with("whisrs/recordings"));
+        assert_eq!(recordings_dir_from(Some("  ")), recordings_dir());
     }
 
     #[test]

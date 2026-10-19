@@ -1,8 +1,8 @@
 //! Backend construction: turn a backend name plus the config into a
 //! [`TranscriptionBackend`], and pick the model and prompt each request uses.
 //!
-//! Lives in the library rather than the daemon so meeting processing
-//! ([`crate::meeting::process`]) can build a backend other than the dictation
+//! Lives in the library rather than the daemon so recording processing
+//! ([`crate::recording::process`]) can build a backend other than the dictation
 //! one. The daemon's `factory` module wraps these for `[general] backend`.
 
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use super::openai_compatible_realtime::OpenAiCompatibleRealtimeBackend;
 use super::openai_realtime::OpenAIRealtimeBackend;
 use super::openai_rest::OpenAIRestBackend;
 use super::{transcription_prompt, TranscriptionBackend, TranscriptionConfig};
-use crate::{Config, LocalWhisperConfig, MeetingConfig};
+use crate::{Config, LocalWhisperConfig, RecordingConfig};
 
 fn resolve_groq_api_key(config: &Config) -> Option<String> {
     if let Ok(key) = std::env::var("WHISRS_GROQ_API_KEY") {
@@ -163,8 +163,8 @@ fn sanitize_ws_endpoint_for_log(url: &str) -> String {
 
 /// Build the backend named `name` (a `[general] backend` string, aliases
 /// included). Unknown names fall back to Groq with a warning, which is the
-/// dictation behavior; meetings resolve their name through
-/// [`meeting_backend_name`] first, which rejects unknown names instead.
+/// dictation behavior; recordings resolve their name through
+/// [`recording_backend_name`] first, which rejects unknown names instead.
 pub fn create_backend_named(name: &str, config: &Config) -> Arc<dyn TranscriptionBackend> {
     match name {
         "deepgram" => {
@@ -355,14 +355,14 @@ pub fn canonical_backend_name(name: &str) -> &str {
 
 /// What decides backend `name`'s output beyond its [`TranscriptionConfig`]:
 /// for local whisper the model file, the phrase cut (`phrase_silence_ms`,
-/// as meetings cap it: [`super::meeting_phrase_silence_ms`]) and
+/// as recordings cap it: [`super::recording_phrase_silence_ms`]) and
 /// `flash_attn` (which can change the decoded text slightly); the
 /// endpoint for the ASR sidecar. Empty for cloud backends, whose model is in
-/// the request. Meetings key their chunk cache on it, so changing it
+/// the request. Recordings key their chunk cache on it, so changing it
 /// re-transcribes.
 ///
 /// `[local-whisper] segmentation` is deliberately absent: it only picks how
-/// dictation streams, and meetings always decode phrase by phrase whatever it
+/// dictation streams, and recordings always decode phrase by phrase whatever it
 /// says (see `LocalWhisperBackend::transcribe_segments`).
 pub fn backend_identity(name: &str, config: &Config) -> String {
     match canonical_backend_name(name) {
@@ -371,7 +371,7 @@ pub fn backend_identity(name: &str, config: &Config) -> String {
             format!(
                 "model_path={}\nphrase_silence_ms={}\nflash_attn={}",
                 settings.model_path,
-                super::meeting_phrase_silence_ms(settings.phrase_silence_ms),
+                super::recording_phrase_silence_ms(settings.phrase_silence_ms),
                 settings.flash_attn
             )
         }
@@ -380,18 +380,18 @@ pub fn backend_identity(name: &str, config: &Config) -> String {
     }
 }
 
-/// The backend meetings transcribe with: `[meeting] backend`, else
+/// The backend recordings transcribe with: `[recording] backend`, else
 /// `[general] backend`.
 ///
-/// Meetings are transcribed after the recording ends, so live-only backends
+/// Recordings are transcribed after they end, so live-only backends
 /// are mapped or refused here rather than failing per chunk:
 /// `deepgram-streaming` becomes the `deepgram` REST backend (same key and
 /// model), and the two OpenAI realtime backends are an error that names the
 /// batch backends. Unknown names are an error too: unlike dictation, a
-/// meeting never silently falls back to Groq.
-pub fn meeting_backend_name(config: &Config) -> anyhow::Result<String> {
-    let meeting = MeetingConfig::effective(config);
-    let name = meeting
+/// recording never silently falls back to Groq.
+pub fn recording_backend_name(config: &Config) -> anyhow::Result<String> {
+    let recording = RecordingConfig::effective(config);
+    let name = recording
         .backend
         .as_deref()
         .map(str::trim)
@@ -403,28 +403,28 @@ pub fn meeting_backend_name(config: &Config) -> anyhow::Result<String> {
         "deepgram" | "groq" | "openai" | "local-whisper" | "local" | "asr-sidecar" | "asr"
         | "vibevoice" | "local-vosk" | "local-parakeet" => Ok(name.to_string()),
         other => anyhow::bail!(
-            "unknown meeting backend '{other}'. Use one of: groq, openai, deepgram, \
+            "unknown recording backend '{other}'. Use one of: groq, openai, deepgram, \
              local-whisper, asr-sidecar"
         ),
     }
 }
 
-/// The request config for a meeting on backend `name`: `[general]` language
+/// The request config for a recording on backend `name`: `[general]` language
 /// and vocabulary, with that backend's model. Same shape as the dictation
 /// batch config, which uses `[general] backend`'s model and also sends
-/// `[general] prompt`. A meeting does not: the prompt is an instruction for
+/// `[general] prompt`. A recording does not: the prompt is an instruction for
 /// dictation ("Transcribe in the language spoken", a style), and the
 /// vocabulary still goes as the hint, keyterms or hotwords as before.
 ///
-/// Local whisper gets no prompt at all: its meeting windows decode with
+/// Local whisper gets no prompt at all: its recording windows decode with
 /// `n_max_text_ctx` 0, so no pass is conditioned on earlier text, and in
 /// this whisper.cpp that leaves the initial prompt unused too. Sending none
 /// keeps the prompt-echo filter and the chunk cache honest about it.
-pub fn meeting_transcription_config(name: &str, config: &Config) -> TranscriptionConfig {
+pub fn recording_transcription_config(name: &str, config: &Config) -> TranscriptionConfig {
     let model = model_for_backend(name, config);
     let canonical = canonical_backend_name(name);
     let model = match canonical {
-        "openai" => openai_meeting_model(model),
+        "openai" => openai_recording_model(model),
         _ => model,
     };
     let prompt = match canonical {
@@ -439,11 +439,11 @@ pub fn meeting_transcription_config(name: &str, config: &Config) -> Transcriptio
     }
 }
 
-/// The model a meeting on backend `name` runs, for the log: the request's
+/// The model a recording on backend `name` runs, for the log: the request's
 /// model, except for local whisper, whose request carries a fixed name while
 /// `[local-whisper] model_path` decides, so its file name. Nothing sent or
 /// cached depends on this.
-pub fn meeting_model_label(name: &str, config: &Config, request: &TranscriptionConfig) -> String {
+pub fn recording_model_label(name: &str, config: &Config, request: &TranscriptionConfig) -> String {
     match canonical_backend_name(name) {
         "local-whisper" => {
             let path = local_whisper_settings(config).model_path;
@@ -455,16 +455,16 @@ pub fn meeting_model_label(name: &str, config: &Config, request: &TranscriptionC
     }
 }
 
-/// The model a meeting on the `openai` REST backend sends, given
+/// The model a recording on the `openai` REST backend sends, given
 /// `[openai] model`.
 ///
 /// `[openai] model` is shared with `openai-realtime`, and its realtime-only
 /// models (gpt-live-transcribe, gpt-realtime-whisper) are refused by the file
 /// endpoint, `/v1/audio/transcriptions`. Without this, someone dictating with
-/// one of them could not run meetings on `openai` at all, since there is no
-/// separate meeting model to set. Those map to gpt-transcribe, the model
+/// one of them could not run recordings on `openai` at all, since there is no
+/// separate recording model to set. Those map to gpt-transcribe, the model
 /// OpenAI points recorded audio at; every other model is sent as written.
-fn openai_meeting_model(model: String) -> String {
+fn openai_recording_model(model: String) -> String {
     let realtime_only = ["gpt-live-transcribe", "gpt-realtime-whisper"];
     if realtime_only.iter().any(|m| model.eq_ignore_ascii_case(m)) {
         "gpt-transcribe".to_string()
@@ -500,7 +500,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: Default::default(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         }
@@ -642,7 +642,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: Default::default(),
-            meeting: None,
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -788,10 +788,10 @@ mod tests {
         );
     }
 
-    /// How meetings treat one `[general] backend` name.
-    struct MeetingCase {
+    /// How recordings treat one `[general] backend` name.
+    struct RecordingCase {
         name: &'static str,
-        /// What [`meeting_backend_name`] resolves it to, `None` = refused.
+        /// What [`recording_backend_name`] resolves it to, `None` = refused.
         resolves_to: Option<&'static str>,
         /// The real backend the resolved name builds.
         backend: Box<dyn TranscriptionBackend>,
@@ -822,12 +822,12 @@ mod tests {
             .collect()
     }
 
-    /// Every backend name a user can select has a decided meeting behavior,
+    /// Every backend name a user can select has a decided recording behavior,
     /// asked of the real impls: what the name resolves to, the chunk cap of the
     /// backend it builds, and that live-only backends are refused up front.
     /// Mirrors `config_inert_prompt_gate_agrees_with_every_sends_prompt_impl`.
     #[tokio::test]
-    async fn every_backend_name_has_a_meeting_behavior() {
+    async fn every_backend_name_has_a_recording_behavior() {
         let sidecar = || {
             Box::new(AsrSidecarBackend::new(
                 "http://127.0.0.1:8765/transcribe".to_string(),
@@ -837,56 +837,56 @@ mod tests {
         let whisper =
             || Box::new(LocalWhisperBackend::new(String::new())) as Box<dyn TranscriptionBackend>;
         let cases = vec![
-            MeetingCase {
+            RecordingCase {
                 name: "groq",
                 resolves_to: Some("groq"),
                 backend: Box::new(GroqBackend::new(String::new())),
                 chunk_secs: Some(600),
             },
-            MeetingCase {
+            RecordingCase {
                 name: "openai",
                 resolves_to: Some("openai"),
                 backend: Box::new(OpenAIRestBackend::new(String::new())),
                 chunk_secs: Some(600),
             },
-            MeetingCase {
+            RecordingCase {
                 name: "deepgram",
                 resolves_to: Some("deepgram"),
                 backend: Box::new(DeepgramRestBackend::new(String::new())),
                 chunk_secs: Some(3600),
             },
             // Mapped to REST; the streaming impl agrees if it is ever asked.
-            MeetingCase {
+            RecordingCase {
                 name: "deepgram-streaming",
                 resolves_to: Some("deepgram"),
                 backend: Box::new(DeepgramStreamingBackend::new(String::new())),
                 chunk_secs: Some(3600),
             },
-            MeetingCase {
+            RecordingCase {
                 name: "local-whisper",
                 resolves_to: Some("local-whisper"),
                 backend: whisper(),
                 chunk_secs: Some(600),
             },
-            MeetingCase {
+            RecordingCase {
                 name: "local",
                 resolves_to: Some("local"),
                 backend: whisper(),
                 chunk_secs: Some(600),
             },
-            MeetingCase {
+            RecordingCase {
                 name: "asr-sidecar",
                 resolves_to: Some("asr-sidecar"),
                 backend: sidecar(),
                 chunk_secs: Some(600),
             },
-            MeetingCase {
+            RecordingCase {
                 name: "asr",
                 resolves_to: Some("asr"),
                 backend: sidecar(),
                 chunk_secs: Some(600),
             },
-            MeetingCase {
+            RecordingCase {
                 name: "vibevoice",
                 resolves_to: Some("vibevoice"),
                 backend: sidecar(),
@@ -895,7 +895,7 @@ mod tests {
             // Built the way the factory builds a GPT Live Transcribe setup
             // (`[openai] languages`): language hints do not make it a batch
             // backend.
-            MeetingCase {
+            RecordingCase {
                 name: "openai-realtime",
                 resolves_to: None,
                 backend: Box::new(openai_realtime_backend(
@@ -908,7 +908,7 @@ mod tests {
                 )),
                 chunk_secs: None,
             },
-            MeetingCase {
+            RecordingCase {
                 name: "openai-compatible-realtime",
                 resolves_to: None,
                 backend: Box::new(
@@ -925,13 +925,13 @@ mod tests {
             },
             // Stubs resolve (dictation accepts them too) and then fail at
             // transcription time with "not yet implemented".
-            MeetingCase {
+            RecordingCase {
                 name: "local-vosk",
                 resolves_to: Some("local-vosk"),
                 backend: Box::new(VoskBackend::new(String::new())),
                 chunk_secs: None,
             },
-            MeetingCase {
+            RecordingCase {
                 name: "local-parakeet",
                 resolves_to: Some("local-parakeet"),
                 backend: Box::new(ParakeetBackend::new(String::new())),
@@ -949,7 +949,7 @@ mod tests {
         for case in &cases {
             let mut config: Config = toml::from_str("").unwrap();
             config.general.backend = case.name.to_string();
-            let resolved = meeting_backend_name(&config);
+            let resolved = recording_backend_name(&config);
             match case.resolves_to {
                 Some(expected) => assert_eq!(resolved.unwrap(), expected, "{}", case.name),
                 None => {
@@ -980,40 +980,40 @@ mod tests {
         for name in routed {
             assert!(
                 cases.iter().any(|c| c.name == name),
-                "{name} is a backend validate() routes but has no meeting behavior here. Add a \
+                "{name} is a backend validate() routes but has no recording behavior here. Add a \
                  case with its real impl."
             );
         }
     }
 
     #[test]
-    fn meeting_backend_override_and_refusals() {
+    fn recording_backend_override_and_refusals() {
         let mut config: Config = toml::from_str(
-            "[general]\nbackend = \"openai-realtime\"\n[meeting]\nbackend = \"deepgram-streaming\"\n",
+            "[general]\nbackend = \"openai-realtime\"\n[recording]\nbackend = \"deepgram-streaming\"\n",
         )
         .unwrap();
-        // `[meeting] backend` wins over a live-only dictation backend.
-        assert_eq!(meeting_backend_name(&config).unwrap(), "deepgram");
+        // `[recording] backend` wins over a live-only dictation backend.
+        assert_eq!(recording_backend_name(&config).unwrap(), "deepgram");
 
-        config.meeting.as_mut().unwrap().backend = Some("  ".into());
+        config.recording.as_mut().unwrap().backend = Some("  ".into());
         assert!(
-            meeting_backend_name(&config).is_err(),
+            recording_backend_name(&config).is_err(),
             "blank falls back to general"
         );
 
-        config.meeting.as_mut().unwrap().backend = Some("bogus".into());
-        let err = meeting_backend_name(&config).unwrap_err().to_string();
+        config.recording.as_mut().unwrap().backend = Some("bogus".into());
+        let err = recording_backend_name(&config).unwrap_err().to_string();
         assert!(
-            err.contains("unknown meeting backend"),
+            err.contains("unknown recording backend"),
             "no silent groq fallback: {err}"
         );
     }
 
     /// A realtime-only `[openai] model` (what an openai-realtime dictation
-    /// setup holds) still lets meetings run on `openai`: the meeting request
+    /// setup holds) still lets recordings run on `openai`: the recording request
     /// carries gpt-transcribe, while dictation keeps the configured model.
     #[test]
-    fn meeting_on_openai_maps_realtime_only_models_to_gpt_transcribe() {
+    fn recording_on_openai_maps_realtime_only_models_to_gpt_transcribe() {
         for (configured, sent) in [
             ("gpt-live-transcribe", "gpt-transcribe"),
             ("GPT-Live-Transcribe", "gpt-transcribe"),
@@ -1023,15 +1023,15 @@ mod tests {
             ("whisper-1", "whisper-1"),
         ] {
             let config: Config = toml::from_str(&format!(
-                "[general]\nbackend = \"openai-realtime\"\n[meeting]\nbackend = \"openai\"\n\
+                "[general]\nbackend = \"openai-realtime\"\n[recording]\nbackend = \"openai\"\n\
                  [openai]\napi_key = \"k\"\nmodel = \"{configured}\"\n\
                  languages = [\"ru\", \"en\"]\n"
             ))
             .unwrap();
-            let name = meeting_backend_name(&config).unwrap();
+            let name = recording_backend_name(&config).unwrap();
             assert_eq!(name, "openai");
             assert_eq!(
-                meeting_transcription_config(&name, &config).model,
+                recording_transcription_config(&name, &config).model,
                 sent,
                 "[openai] model = {configured}"
             );
@@ -1044,47 +1044,50 @@ mod tests {
     }
 
     #[test]
-    fn the_meeting_log_names_the_local_model_file() {
+    fn the_recording_log_names_the_local_model_file() {
         let config: Config = toml::from_str(
             "[general]\nbackend = \"local-whisper\"\n\
              [local-whisper]\nmodel_path = \"/m/ggml-large-v3-turbo-q5_0.bin\"\n",
         )
         .unwrap();
-        let request = meeting_transcription_config("local-whisper", &config);
+        let request = recording_transcription_config("local-whisper", &config);
         assert_eq!(
-            meeting_model_label("local-whisper", &config, &request),
+            recording_model_label("local-whisper", &config, &request),
             "ggml-large-v3-turbo-q5_0.bin"
         );
-        // Its meeting windows take no prompt, so none is sent.
+        // Its recording windows take no prompt, so none is sent.
         let with_vocabulary: Config =
             toml::from_str("[general]\nbackend = \"local-whisper\"\nvocabulary = [\"whisrs\"]\n")
                 .unwrap();
         assert_eq!(
-            meeting_transcription_config("local", &with_vocabulary).prompt,
+            recording_transcription_config("local", &with_vocabulary).prompt,
             None
         );
         assert_eq!(
-            meeting_model_label("local", &config, &request),
+            recording_model_label("local", &config, &request),
             "ggml-large-v3-turbo-q5_0.bin"
         );
         // What the request carries (and the cache keys on) is unchanged.
         assert_eq!(request.model, "base.en");
         let groq: Config = toml::from_str("[general]\nbackend = \"groq\"\n").unwrap();
-        let request = meeting_transcription_config("groq", &groq);
-        assert_eq!(meeting_model_label("groq", &groq, &request), request.model);
+        let request = recording_transcription_config("groq", &groq);
+        assert_eq!(
+            recording_model_label("groq", &groq, &request),
+            request.model
+        );
     }
 
     #[test]
-    fn meeting_request_uses_the_meeting_backends_model() {
+    fn recording_request_uses_the_recording_backends_model() {
         let config: Config = toml::from_str(
             "[general]\nbackend = \"groq\"\nlanguage = \"de\"\nvocabulary = [\"whisrs\"]\n\
              prompt = \"Transcribe in the language spoken.\"\n\
-             [meeting]\nbackend = \"openai\"\n\
+             [recording]\nbackend = \"openai\"\n\
              [openai]\napi_key = \"k\"\nmodel = \"whisper-1\"\n",
         )
         .unwrap();
-        let name = meeting_backend_name(&config).unwrap();
-        let request = meeting_transcription_config(&name, &config);
+        let name = recording_backend_name(&config).unwrap();
+        let request = recording_transcription_config(&name, &config);
         assert_eq!(request.model, "whisper-1");
         assert_eq!(request.language, "de");
         // The vocabulary, without the dictation prompt.
@@ -1095,7 +1098,7 @@ mod tests {
             "[general]\nbackend = \"groq\"\nprompt = \"Transcribe in the language spoken.\"\n",
         )
         .unwrap();
-        let request = meeting_transcription_config("groq", &no_vocabulary);
+        let request = recording_transcription_config("groq", &no_vocabulary);
         assert_eq!(request.prompt, None, "nothing to send");
     }
 }

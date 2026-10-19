@@ -380,7 +380,7 @@ pub fn resolve_input_for_diagnostics(name: &str) -> anyhow::Result<ResolvedInput
     resolve(name, Lookup::Diagnostic)
 }
 
-/// Resolve a meeting track's device with no fallback: an unknown name is an
+/// Resolve a recording track's device with no fallback: an unknown name is an
 /// error listing the valid names, where [`resolve_input`] would record from
 /// the default input instead. `"default"` (or empty) is the ALSA default
 /// input, as for dictation. Unlike [`resolve_input`] it never touches the

@@ -31,7 +31,7 @@ On save, writes the file and restarts the daemon via systemd. Unlike
 this does not touch udev rules, the systemd unit, or compositor keybindings.
 .TP
 .B toggle
-Start or stop recording. If idle, begins audio capture. If recording,
+Start or stop dictation. If idle, begins audio capture. If recording,
 stops capture and sends audio for transcription. Text is typed at the
 cursor in the previously focused window.
 .RS
@@ -58,7 +58,7 @@ dictate in each without switching settings.
 .RE
 .TP
 .B cancel
-Cancel the current recording and discard captured audio. Returns the
+Cancel the current dictation and discard captured audio. Returns the
 daemon to the idle state. Has no effect if the daemon is not recording.
 .TP
 .B log
@@ -131,22 +131,24 @@ to be running \(em
 .B restart
 will start a stopped service.
 .TP
-.B meeting
-Record a meeting and turn it into a transcript. Captures the microphone
+.B recording
+Record the microphone and the system audio and turn them into a
+transcript, for a meeting or call, a lecture, a video or language practice.
+Captures the microphone
 and the system audio (the default output's monitor) as two separate tracks,
 then transcribes them after
 .B stop
 into a Markdown transcript whose speaker labels are your name
-.RB ( [meeting]
+.RB ( [recording]
 .BR user_name )
 and \(lqOthers\(rq.
-While a meeting records,
+While a recording is in progress,
 .BR "whisrs toggle" ,
 .B whisrs command
 and
 .B whisrs llm\-command
-refuse to start, since the microphone is shared with the call.
-Each meeting lives in its own folder under the meetings directory (see
+refuse to start, since the microphone is shared with the recording.
+Each recording lives in its own folder under the recordings directory (see
 .BR FILES ),
 named by its id
 .RI ( YYYY\-MM\-DD_HHMM ,
@@ -154,28 +156,28 @@ plus a slug of the title). Wherever an
 .I ID
 is taken, it may be a full id, a unique id prefix, or
 .B last
-for the newest meeting. Requires an action:
+for the newest recording. Requires an action:
 .RS
 .TP
 \fBstart\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR]
-Start recording. The optional title goes into the transcript and the
+Start a recording. The optional title goes into the transcript and the
 folder name.
 .TP
 .B stop
-Stop recording and queue the meeting for transcription.
+Stop the recording and queue it for transcription.
 .TP
 \fBtoggle\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR]
-Start a meeting when none is recording, otherwise stop the one that is.
+Start a recording when none is in progress, otherwise stop the one that is.
 Meant for a compositor hotkey.
 .TP
 .B cancel
-Stop recording and delete the meeting.
+Stop the recording and delete it.
 .TP
 .B status
-Print whether a meeting is recording or processing.
+Print whether a recording is in progress or processing.
 .TP
 \fBlist\fR [\fB\-\-json\fR]
-List meetings, newest first, with id, start time, duration, status and title.
+List recordings, newest first, with id, start time, duration, status and title.
 .B \-\-json
 prints a JSON array instead.
 .TP
@@ -185,19 +187,19 @@ Print a transcript:
 (the default) prints the Markdown file,
 .B json
 prints
-.IR meeting.json ,
+.IR recording.json ,
 and
 .B txt
 prints plain text.
 .TP
 \fBpath\fR \fIID\fR
-Print the meeting folder.
+Print the recording's folder.
 .TP
 \fBcopy\fR \fIID\fR
 Copy the transcript to the clipboard.
 .TP
 \fBretry\fR \fIID\fR
-Transcribe the meeting again, for example after a failure. A meeting whose
+Transcribe the recording again, for example after a failure. A recording whose
 transcription was interrupted three times (by a crash each time) is marked
 failed instead of being resumed at startup; retry resets that count and
 queues it again. Chunks already transcribed with the same backend and
@@ -208,7 +210,7 @@ settings are reused.
 .B show
 and
 .B path
-read the meetings directory directly and work without the daemon.
+read the recordings directory directly and work without the daemon.
 .SH LLM OUTPUT
 Applies to
 .B command
@@ -286,11 +288,11 @@ Unix domain socket for CLI\-daemon IPC.
 .I ~/.cache/whisrs/recovery/
 Recovery directory for audio that failed transcription.
 .TP
-.I $XDG_DATA_HOME/whisrs/meetings/
-Meeting recordings and transcripts, one folder per meeting (defaults to
-.IR ~/.local/share/whisrs/meetings/ ;
+.I $XDG_DATA_HOME/whisrs/recordings/
+Recordings and their transcripts, one folder per recording (defaults to
+.IR ~/.local/share/whisrs/recordings/ ;
 override with
-.B [meeting] dir
+.B [recording] dir
 in
 .IR config.toml ).
 .SH EXIT STATUS
@@ -319,7 +321,7 @@ Start dictation in Polish for this session only:
 .B whisrs toggle \-l pl
 .RE
 .PP
-Cancel recording:
+Cancel a dictation:
 .PP
 .RS
 .B whisrs cancel

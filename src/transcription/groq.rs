@@ -1,6 +1,6 @@
 //! Groq Whisper API transcription backend.
 //!
-//! Sends WAV audio (FLAC for meeting chunks) to Groq's
+//! Sends WAV audio (FLAC for recording chunks) to Groq's
 //! `/openai/v1/audio/transcriptions` endpoint and returns the transcribed
 //! text. Supports chunked pseudo-streaming by splitting audio at silence
 //! boundaries and sending each chunk independently.
@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use crate::audio::wav::encode_wav;
 use crate::audio::AudioChunk;
 
-use super::flac::{meeting_upload, UploadFormat};
+use super::flac::{recording_upload, UploadFormat};
 use super::verbose_json::parse_verbose_segments;
 use super::{Transcript, TranscriptionBackend, TranscriptionConfig, UPLOAD_CHUNK_SECS};
 
@@ -126,7 +126,7 @@ fn check_audio_size(audio: &[u8]) -> anyhow::Result<()> {
 
 /// The multipart form for one transcription request.
 ///
-/// Dictation sends WAV and asks for `word` timestamps only; meetings send
+/// Dictation sends WAV and asks for `word` timestamps only; recordings send
 /// FLAC and add `segment`.
 fn build_form(
     audio: &[u8],
@@ -360,7 +360,7 @@ impl TranscriptionBackend for GroqBackend {
         audio: &[u8],
         config: &TranscriptionConfig,
     ) -> anyhow::Result<Transcript> {
-        let upload = meeting_upload(audio).await;
+        let upload = recording_upload(audio).await;
         check_audio_size(&upload.bytes)?;
         debug!(
             "sending {} bytes ({}, WAV was {}) to Groq API for segments (model={})",
@@ -507,15 +507,15 @@ mod tests {
             keyterms: Vec::new(),
         };
         // reqwest's Form is opaque; building must at least succeed for both
-        // the dictation and meeting shapes.
+        // the dictation and recording shapes.
         assert!(build_form(&[1, 2, 3], UploadFormat::WAV, &config, &["word"]).is_ok());
-        let meeting = build_form(
+        let recording = build_form(
             &[1, 2, 3],
             UploadFormat::FLAC,
             &config,
             &["segment", "word"],
         );
-        assert!(meeting.is_ok());
+        assert!(recording.is_ok());
     }
 
     #[test]
@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meeting_chunks_upload_as_flac_and_dictation_as_wav() {
+    async fn recording_chunks_upload_as_flac_and_dictation_as_wav() {
         let config = TranscriptionConfig {
             language: "en".to_string(),
             model: "whisper-large-v3-turbo".to_string(),
@@ -582,7 +582,7 @@ mod tests {
     const SEGMENTS: &str =
         r#"{"text": "hi", "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}"#;
 
-    fn meeting_request() -> (Vec<u8>, TranscriptionConfig) {
+    fn recording_request() -> (Vec<u8>, TranscriptionConfig) {
         let config = TranscriptionConfig {
             language: "en".to_string(),
             model: "whisper-large-v3-turbo".to_string(),
@@ -592,11 +592,11 @@ mod tests {
         (encode_wav(&[300i16; 16_000]).unwrap(), config)
     }
 
-    /// A Cloudflare origin timeout (524) on a meeting chunk is retried, and
+    /// A Cloudflare origin timeout (524) on a recording chunk is retried, and
     /// the chunk goes through on the next try.
     #[tokio::test]
     async fn a_524_is_retried_until_the_chunk_goes_through() {
-        let (wav, config) = meeting_request();
+        let (wav, config) = recording_request();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = local_backend(&listener);
         let server = tokio::spawn(serve_responses(
@@ -613,10 +613,10 @@ mod tests {
     }
 
     /// A 524 on every try ends after the bounded retries in the error the
-    /// server gave, as a final error the meeting reports.
+    /// server gave, as a final error the recording reports.
     #[tokio::test]
     async fn a_lasting_524_gives_up_after_the_bounded_retries() {
-        let (wav, config) = meeting_request();
+        let (wav, config) = recording_request();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = local_backend(&listener);
         let server = tokio::spawn(serve_responses(listener, vec![(524, CLOUDFLARE_524); 4]));
@@ -643,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_400_is_not_retried() {
-        let (wav, config) = meeting_request();
+        let (wav, config) = recording_request();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = local_backend(&listener);
         let server = tokio::spawn(serve_responses(

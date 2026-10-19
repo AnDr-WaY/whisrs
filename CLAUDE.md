@@ -30,7 +30,7 @@ whisrsd &
 systemctl --user enable --now whisrs.service
 
 # Use the CLI (bind to a hotkey)
-whisrs toggle    # start/stop recording
+whisrs toggle    # start/stop dictation
 whisrs cancel    # cancel and discard audio
 whisrs speak     # read the selected text aloud via TTS (alias: read; press again to stop)
 whisrs status    # query daemon state
@@ -38,8 +38,8 @@ whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
 whisrs config    # interactive config editor
-whisrs meeting start [-t TITLE] | stop | toggle | cancel | status   # record a meeting (mic + system audio)
-whisrs meeting list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id>
+whisrs recording start [-t TITLE] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
+whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id>
 
 # Dev loop: rebuild this checkout and restart the daemon
 ./scripts/dev-install.sh             # build + install to ~/.cargo/bin + restart
@@ -62,13 +62,13 @@ src/
 │                           #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ├── history.rs              # Dictation history (whisrs log)
 ├── llm.rs                  # LLM calls for command mode
-├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and meeting text
+├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and recording text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
-├── daemon/meeting.rs       # Meeting sessions, processing queue/worker, recovery, shutdown
-├── meeting/                # Meeting mode (record, then transcribe after the stop)
-│   ├── mod.rs              #   MeetingMeta (meeting.json), segments, status types
-│   ├── store.rs            #   Meetings folder: create, list, resolve ids, retention sweep
+├── daemon/recording.rs     # Recording sessions, processing queue/worker, recovery, shutdown
+├── recording/              # Recording feature (mic + system audio, transcribed after the stop)
+│   ├── mod.rs              #   RecordingMeta (recording.json), segments, status types
+│   ├── store.rs            #   Recordings folder: create, list, resolve ids, retention sweep
 │   ├── recorder.rs         #   Per-track WAV writer with periodic header flushes
 │   ├── wav_repair.rs       #   Fix WAV headers a crash left unfinalized
 │   ├── echo.rs             #   Remove speaker echo from the mic track (system track as reference)
@@ -84,10 +84,10 @@ src/
 │   └── recovery.rs         # Save/load audio on transcription failure
 ├── transcription/
 │   ├── mod.rs              # TranscriptionBackend trait, timed segments, phrase fallback
-│   ├── factory.rs          # Build a backend by name; model, alias and meeting backend rules
+│   ├── factory.rs          # Build a backend by name; model, alias and recording backend rules
 │   ├── verbose_json.rs     # Whisper verbose_json parsing (segment timestamps)
 │   ├── retry.rs            # 429/503 backoff for long jobs (one retry layer per request)
-│   ├── flac.rs             # Meeting chunks as FLAC for Deepgram, Groq, OpenAI whisper-1 (WAV fallback)
+│   ├── flac.rs             # Recording chunks as FLAC for Deepgram, Groq, OpenAI whisper-1 (WAV fallback)
 │   ├── deepgram.rs         # Deepgram Nova API (REST + WebSocket streaming)
 │   ├── groq.rs             # Groq Whisper API (chunked HTTP, timestamp dedup)
 │   ├── openai_realtime.rs  # OpenAI Realtime API (WebSocket, true streaming)
@@ -218,16 +218,16 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
-{"cmd": "meeting", "action": "start|stop|cancel|status|toggle|retry|copy", "title": "...", "id": "..."}
+{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy", "title": "...", "id": "..."}
                                      // title (start/toggle) and id (retry/copy, default "last") are optional
 ```
 
 Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": "..."}`,
-a `History` variant carrying log entries, and a `Meeting` variant carrying the meeting status.
+a `History` variant carrying log entries, and a `Recording` variant carrying the recording status.
 
 Adding a command means a new `Command` variant plus a daemon handler. Never put logic in
-`src/cli/main.rs` — it is a thin socket client. One read-only exception: `whisrs meeting
-list/show/path` read the meetings folder directly, which keeps transcript bodies off IPC.
+`src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording
+list/show/path` read the recordings folder directly, which keeps transcript bodies off IPC.
 
 ## Configuration
 
@@ -237,12 +237,13 @@ Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realti
 
 TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
 
-Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every meeting transcript segment, after filler removal (`src/replacements.rs`).
+Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 
-Meeting mode: the `[meeting]` section (`backend`, `user_name`, `mic_device`, `system_device`,
-`max_duration_minutes`, `audio_retention_days`, `dir`) plus `[hotkeys] meeting`. Meetings live in
-`~/.local/share/whisrs/meetings/<id>/` (`meeting.json`, `<id>.md`, `audio/`, and a `.cache/` of
-finished chunks kept until the transcript is written or the audio is deleted). The meeting backend
+Recording (mic + system audio, transcribed after the stop): the `[recording]` section (`backend`,
+`user_name`, `mic_device`, `system_device`, `max_duration_minutes`, `audio_retention_days`, `dir`)
+plus `[hotkeys] recording`. Recordings live in `~/.local/share/whisrs/recordings/<id>/`
+(`recording.json`, `<id>.md`, `audio/`, and a `.cache/` of finished chunks kept until the
+transcript is written or the audio is deleted). The recording backend
 must be file-capable, a backend that can transcribe a recorded file: groq, openai, deepgram,
 asr-sidecar or local-whisper (`deepgram-streaming` maps to `deepgram`; realtime backends are
 refused).

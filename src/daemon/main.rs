@@ -19,9 +19,9 @@ mod factory;
 #[cfg(feature = "hooks")]
 mod hooks;
 mod injection;
-mod meeting;
 mod notify;
 mod pipeline;
+mod recording;
 mod selection;
 mod speak;
 mod startup;
@@ -31,8 +31,8 @@ use crate::context::{DaemonContext, DaemonState};
 use crate::dictation::{handle_cancel, handle_toggle};
 use crate::factory::create_backend;
 use crate::injection::{prime_modifier_probe, warm_keyboard};
-use crate::meeting::{error_already_notified, handle_meeting, MeetingRuntime};
 use crate::notify::send_notification;
+use crate::recording::{error_already_notified, handle_recording, RecordingRuntime};
 use crate::speak::handle_speak;
 #[cfg(feature = "hooks")]
 use crate::startup::check_session_bus;
@@ -122,9 +122,9 @@ async fn main() -> Result<()> {
     // State broadcast channel — consumed by system tray and overlay.
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Idle);
     let (overlay_level_tx, overlay_level_rx) = tokio::sync::watch::channel(0.0_f32);
-    // Meeting status has its own channel, read by the tray only: a meeting
-    // must not animate the overlay or fire the recording hooks.
-    let (meeting_runtime, meeting_rx, meeting_queue_rx) = MeetingRuntime::new();
+    // Recording status has its own channel, read by the tray only: a recording
+    // must not animate the overlay or fire the dictation hooks.
+    let (recording_runtime, recording_rx, recording_queue_rx) = RecordingRuntime::new();
 
     let tray_enabled = config.general.tray;
     let overlay_enabled = config.general.overlay;
@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
         state_tx,
         overlay_level_tx: overlay_enabled.then_some(overlay_level_tx),
         overlay_enabled,
-        meeting: meeting_runtime,
+        recording: recording_runtime,
     });
 
     let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
@@ -152,21 +152,21 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 info!("internal command (hotkey/tray): {cmd:?}");
-                // A meeting start can spend seconds opening devices; run it
+                // A recording start can spend seconds opening devices; run it
                 // aside so a dictation hotkey pressed meanwhile is not held
-                // behind it. Meetings never touch the dictation state, so
+                // behind it. Recordings never touch the dictation state, so
                 // there is nothing to broadcast after it.
-                if let Command::Meeting { action, title, id } = cmd {
+                if let Command::Recording { action, title, id } = cmd {
                     let ctx = Arc::clone(&dispatch_ctx);
                     tokio::spawn(async move {
                         let notify = ctx.notify_error();
                         if let Response::Error { message } =
-                            handle_meeting(ctx, action, title, id).await
+                            handle_recording(ctx, action, title, id).await
                         {
                             // A stop that saved but could not queue the
-                            // meeting has notified already.
+                            // recording has notified already.
                             if notify && !error_already_notified(&message) {
-                                send_notification("whisrs", &format!("Meeting: {message}"));
+                                send_notification("whisrs", &format!("Recording: {message}"));
                             }
                         }
                     });
@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
             .then_some(send_notification as whisrs::tray::NotifyFn);
         tokio::spawn(whisrs::tray::spawn_tray(
             state_rx.clone(),
-            meeting_rx,
+            recording_rx,
             cmd_tx.clone(),
             tray_notify,
         ));
@@ -233,23 +233,23 @@ async fn main() -> Result<()> {
     info!("listening on {}", sock_path.display());
 
     // Only now, with the socket ours: a second whisrsd that exits at the
-    // check above must not also recover and process the same meetings.
-    // Meeting processing runs on its own task, one meeting at a time, so a
+    // check above must not also recover and process the same recordings.
+    // Recording processing runs on its own task, one recording at a time, so a
     // long transcription never holds up IPC or dictation. Recovery of
-    // meetings a crash or shutdown interrupted is spawned too, so the socket
-    // serves without waiting for WAV repair. Commands that queued a meeting
+    // recordings a crash or shutdown interrupted is spawned too, so the socket
+    // serves without waiting for WAV repair. Commands that queued a recording
     // before this wait in the channel.
-    let worker = tokio::spawn(crate::meeting::run_worker(
+    let worker = tokio::spawn(crate::recording::run_worker(
         Arc::clone(&context),
-        meeting_queue_rx,
+        recording_queue_rx,
     ));
     // Shutdown aborts it, so a SIGTERM mid-transcription is not counted as
     // a crashed attempt.
-    context.meeting.set_worker(worker);
-    tokio::spawn(crate::meeting::recover_on_startup(Arc::clone(&context)));
+    context.recording.set_worker(worker);
+    tokio::spawn(crate::recording::recover_on_startup(Arc::clone(&context)));
 
     // SIGTERM (systemd stop/restart, tray Quit) and SIGINT both finalize a
-    // recording meeting before exiting, so it is transcribed on the next start.
+    // recording in progress before exiting, so it is transcribed on the next start.
     let mut sigterm =
         signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
@@ -261,7 +261,7 @@ async fn main() -> Result<()> {
             _ = sigint.recv() => "SIGINT",
         };
         info!("received {name}, shutting down");
-        crate::meeting::shutdown(&shutdown_ctx).await;
+        crate::recording::shutdown(&shutdown_ctx).await;
         let _ = std::fs::remove_file(&sock_path_clone);
         std::process::exit(0);
     });
@@ -350,7 +350,9 @@ async fn handle_command(
             handle_set_llm_instruction(daemon_state, context, name).await
         }
         Command::Speak => handle_speak(daemon_state, context).await,
-        Command::Meeting { action, title, id } => handle_meeting(context, action, title, id).await,
+        Command::Recording { action, title, id } => {
+            handle_recording(context, action, title, id).await
+        }
     }
 }
 

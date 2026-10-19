@@ -1,6 +1,6 @@
 //! Waiting out rate limits (HTTP 429/503) and riding out server errors
-//! (500, 502, 504, Cloudflare's 520 to 524) for long jobs such as meetings.
-//! Only meeting requests go through here; dictation does not retry.
+//! (500, 502, 504, Cloudflare's 520 to 524) for long jobs such as recordings.
+//! Only recording requests go through here; dictation does not retry.
 //!
 //! One retry layer per request: [`retry_rate_limited`] retries an operation
 //! that fails with a [`RetryableHttpError`], and when its retries run out it

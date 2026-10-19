@@ -16,12 +16,12 @@ use crate::injection::{
     clear_line_and_inject, inject_text, is_terminal_class, notify_copied_for_held_modifier,
     prepare_llm_injection, Injection, KeystrokeSettings, LlmInjection,
 };
-use crate::meeting::{refuse_while_recording, DictationStart};
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     format_api_error, format_no_microphone_error, save_history_entry, transcribe_batch_audio,
     BatchOptions,
 };
+use crate::recording::{refuse_while_recording, DictationStart};
 use crate::selection::{acquire_selected_text, capture_selection};
 
 /// History `backend` tag for a command-mode result, alongside the `llm:<name>`
@@ -168,7 +168,7 @@ pub(crate) async fn handle_command_mode(
         }
         State::Idle => {
             // First press: copy selection and start recording. A recording
-            // meeting refuses it before the selection is copied.
+            // in progress refuses it before the selection is copied.
             if let Some(refused) = refuse_while_recording(&context, DictationStart::CommandMode) {
                 return refused;
             }
@@ -592,7 +592,7 @@ pub(crate) async fn handle_llm_command(
                 .cloned();
             match entry {
                 // After the lookup, so a misspelled name still gets the
-                // config error rather than the meeting's.
+                // config error rather than the recording's.
                 Some(entry) => {
                     if let Some(refused) =
                         refuse_while_recording(&context, DictationStart::LlmCommand(&name))

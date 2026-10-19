@@ -1,7 +1,8 @@
-//! Meeting mode: record mic + system audio to disk, transcribe afterwards.
+//! The recording feature: record mic + system audio to disk, transcribe
+//! afterwards.
 //!
-//! Each meeting lives in its own directory under the meetings root (see
-//! [`store`]): `meeting.json` holds [`MeetingMeta`], `audio/` holds one WAV
+//! Each recording lives in its own directory under the recordings root (see
+//! [`store`]): `recording.json` holds [`RecordingMeta`], `audio/` holds one WAV
 //! per track, and `<id>.md` is the rendered transcript.
 
 pub mod echo;
@@ -17,10 +18,10 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// What a `meeting` IPC command asks the daemon to do.
+/// What a `recording` IPC command asks the daemon to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum MeetingAction {
+pub enum RecordingAction {
     Start,
     Stop,
     Cancel,
@@ -30,20 +31,20 @@ pub enum MeetingAction {
     Copy,
 }
 
-/// Daemon-level meeting phase, reported over IPC and to the tray.
+/// Daemon-level recording phase, reported over IPC and to the tray.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum MeetingPhase {
+pub enum RecordingPhase {
     #[default]
     Idle,
     Recording,
     Processing,
 }
 
-/// Snapshot of the daemon's meeting activity.
+/// Snapshot of the daemon's recording activity.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct MeetingStatus {
-    pub phase: MeetingPhase,
+pub struct RecordingStatus {
+    pub phase: RecordingPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,15 +53,15 @@ pub struct MeetingStatus {
     pub started_at: Option<DateTime<Local>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
-    /// Ids of meetings waiting for processing.
+    /// Ids of recordings waiting for processing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued: Vec<String>,
 }
 
-/// Lifecycle of a single meeting, stored as `status` in `meeting.json`.
+/// Lifecycle of a single recording, stored as `status` in `recording.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum MeetingState {
+pub enum RecordingState {
     Recording,
     Processing,
     Done,
@@ -99,7 +100,7 @@ pub enum EndReason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackMeta {
     pub kind: TrackKind,
-    /// Path relative to the meeting directory, e.g. `audio/mic.wav`.
+    /// Path relative to the recording directory, e.g. `audio/mic.wav`.
     pub file: String,
     pub device: String,
     /// Time of the first captured chunk relative to `started_at`.
@@ -139,7 +140,7 @@ pub struct Speaker {
     pub source: String,
 }
 
-/// One line of the final transcript, on the meeting timeline.
+/// One line of the final transcript, on the recording timeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptSegment {
     pub start_ms: u64,
@@ -150,14 +151,14 @@ pub struct TranscriptSegment {
     pub text: String,
 }
 
-/// Contents of `meeting.json`.
+/// Contents of `recording.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MeetingMeta {
+pub struct RecordingMeta {
     pub version: u32,
     pub id: String,
     #[serde(default)]
     pub title: Option<String>,
-    pub status: MeetingState,
+    pub status: RecordingState,
     pub started_at: DateTime<Local>,
     #[serde(default)]
     pub ended_at: Option<DateTime<Local>>,
@@ -182,26 +183,26 @@ pub struct MeetingMeta {
     #[serde(default)]
     pub audio_deleted: bool,
     /// Processing attempts started since the last manual retry. Written
-    /// before each attempt, so a meeting whose processing keeps crashing the
+    /// before each attempt, so a recording whose processing keeps crashing the
     /// daemon is not requeued on every start forever.
     #[serde(default)]
     pub attempts: u32,
 }
 
-/// Current `meeting.json` schema version.
+/// Current `recording.json` schema version.
 pub const META_VERSION: u32 = 1;
 
-/// Sample rate of meeting tracks.
+/// Sample rate of recording tracks.
 pub const SAMPLE_RATE: u32 = 16_000;
 
-impl MeetingMeta {
-    /// A fresh meta for a meeting that just started recording.
+impl RecordingMeta {
+    /// A fresh meta for a recording that just started.
     pub fn new(id: String, title: Option<String>, started_at: DateTime<Local>) -> Self {
         Self {
             version: META_VERSION,
             id,
             title,
-            status: MeetingState::Recording,
+            status: RecordingState::Recording,
             started_at,
             ended_at: None,
             end_reason: None,
@@ -229,19 +230,19 @@ mod tests {
             r#""max_duration""#
         );
         assert_eq!(
-            serde_json::to_string(&MeetingState::Done).unwrap(),
+            serde_json::to_string(&RecordingState::Done).unwrap(),
             r#""done""#
         );
         assert_eq!(
             serde_json::to_string(&TrackKind::System).unwrap(),
             r#""system""#
         );
-        assert_eq!(MeetingStatus::default().phase, MeetingPhase::Idle);
+        assert_eq!(RecordingStatus::default().phase, RecordingPhase::Idle);
     }
 
     #[test]
     fn meta_json_roundtrip() {
-        let mut meta = MeetingMeta::new("2026-10-02_1400".into(), None, Local::now());
+        let mut meta = RecordingMeta::new("2026-10-02_1400".into(), None, Local::now());
         meta.tracks.push(TrackMeta {
             kind: TrackKind::Mic,
             file: "audio/mic.wav".into(),
@@ -251,7 +252,7 @@ mod tests {
         });
         meta.end_reason = Some(EndReason::Stopped);
         let json = serde_json::to_string(&meta).unwrap();
-        let back: MeetingMeta = serde_json::from_str(&json).unwrap();
+        let back: RecordingMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back, meta);
     }
 }

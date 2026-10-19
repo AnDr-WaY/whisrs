@@ -380,7 +380,7 @@ pub fn run_setup() -> Result<()> {
         overlay: if overlay { overlay_config } else { None },
         llm_commands: Vec::new(),
         replacements: Default::default(),
-        meeting: None,
+        recording: None,
     };
 
     let config_path = write_config(&config)?;

@@ -1,7 +1,8 @@
 //! System tray indicator via StatusNotifierItem (KDE/freedesktop SNI protocol).
 //!
 //! Shows the daemon state (idle/recording/transcribing) as a tray icon, plus
-//! meeting recording status and start/stop/cancel meeting menu items.
+//! the status of a recording (mic + system audio) and start/stop/cancel
+//! menu items for it.
 //! Works with any SNI-compatible tray host: waybar, swaybar, KDE Plasma,
 //! GNOME (with AppIndicator extension), etc.
 
@@ -21,7 +22,7 @@ pub type NotifyFn = fn(&str, &str);
 #[cfg(not(feature = "tray"))]
 pub async fn spawn_tray(
     _state_rx: tokio::sync::watch::Receiver<crate::State>,
-    _meeting_rx: tokio::sync::watch::Receiver<crate::meeting::MeetingStatus>,
+    _recording_rx: tokio::sync::watch::Receiver<crate::recording::RecordingStatus>,
     _cmd_tx: tokio::sync::mpsc::Sender<crate::Command>,
     _notify: Option<NotifyFn>,
 ) {

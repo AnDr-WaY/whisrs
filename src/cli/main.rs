@@ -5,8 +5,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use whisrs::history::HistoryEntry;
-use whisrs::meeting::{
-    store, MeetingAction, MeetingMeta, MeetingPhase, MeetingState, MeetingStatus,
+use whisrs::recording::{
+    store, RecordingAction, RecordingMeta, RecordingPhase, RecordingState, RecordingStatus,
 };
 use whisrs::{
     encode_message, read_message, service::ServiceManager, socket_path, Command, Response,
@@ -51,14 +51,14 @@ enum SubCmd {
     Setup,
     /// Edit any part of ~/.config/whisrs/config.toml; restarts the daemon on save
     Config,
-    /// Toggle recording on/off (start dictation or stop and transcribe)
+    /// Toggle dictation on/off (start, or stop and transcribe)
     Toggle {
         /// Override the transcription language for this session: an ISO 639-1
         /// code (e.g. `en`, `pl`), optionally with a region (`en-US`), or `auto`
         #[arg(short, long, value_parser = whisrs::validate_language_override)]
         language: Option<String>,
     },
-    /// Cancel the current recording and discard audio
+    /// Cancel the current dictation and discard its audio
     Cancel,
     /// Query the daemon state (idle, recording, transcribing)
     Status,
@@ -94,68 +94,68 @@ enum SubCmd {
     Speak,
     /// Restart the whisrs daemon (uses the systemd or OpenRC user service when present)
     Restart,
-    /// Record a meeting (mic + system audio) and turn it into a transcript
+    /// Record your mic and the system audio, then turn them into a transcript
     #[command(subcommand)]
-    Meeting(MeetingCmd),
+    Recording(RecordingCmd),
 }
 
 #[derive(Subcommand)]
-enum MeetingCmd {
-    /// Start recording a meeting
+enum RecordingCmd {
+    /// Start a recording (mic + system audio)
     Start {
-        /// Meeting title, used in the transcript and the folder name
+        /// Recording title, used in the transcript and the folder name
         #[arg(short, long)]
         title: Option<String>,
     },
-    /// Stop recording and queue the meeting for transcription
+    /// Stop the recording and queue it for transcription
     Stop,
-    /// Start a meeting, or stop the one recording (bind this to a hotkey)
+    /// Start a recording, or stop the one in progress (bind this to a hotkey)
     Toggle {
-        /// Meeting title when this starts a meeting
+        /// Recording title when this starts a recording
         #[arg(short, long)]
         title: Option<String>,
     },
-    /// Stop recording and delete the meeting
+    /// Stop the recording and delete it
     Cancel,
-    /// Show whether a meeting is recording or processing
+    /// Show whether a recording is in progress or processing
     Status,
-    /// List recorded meetings, newest first
+    /// List recordings, newest first
     List {
         /// Print a JSON array instead of a table
         #[arg(long)]
         json: bool,
     },
-    /// Print a meeting transcript
+    /// Print a recording's transcript
     Show {
-        /// Meeting id, a unique id prefix, or `last`
+        /// Recording id, a unique id prefix, or `last`
         id: String,
         /// Output format
         #[arg(short, long, value_enum, default_value_t = ShowFormat::Md)]
         format: ShowFormat,
     },
-    /// Print a meeting's folder
+    /// Print a recording's folder
     Path {
-        /// Meeting id, a unique id prefix, or `last`
+        /// Recording id, a unique id prefix, or `last`
         id: String,
     },
-    /// Copy a meeting transcript to the clipboard
+    /// Copy a recording's transcript to the clipboard
     Copy {
-        /// Meeting id, a unique id prefix, or `last`
+        /// Recording id, a unique id prefix, or `last`
         id: String,
     },
-    /// Transcribe a meeting again (e.g. after a failure)
+    /// Transcribe a recording again (e.g. after a failure)
     Retry {
-        /// Meeting id, a unique id prefix, or `last`
+        /// Recording id, a unique id prefix, or `last`
         id: String,
     },
 }
 
-/// Output format of `whisrs meeting show`.
+/// Output format of `whisrs recording show`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ShowFormat {
     /// The rendered Markdown transcript (`<id>.md`)
     Md,
-    /// The raw `meeting.json`
+    /// The raw `recording.json`
     Json,
     /// Plain text, one line per utterance
     Txt,
@@ -238,8 +238,8 @@ async fn main() -> anyhow::Result<()> {
         SubCmd::Restart => {
             cmd_restart()?;
         }
-        SubCmd::Meeting(cmd) => {
-            cmd_meeting(cmd).await?;
+        SubCmd::Recording(cmd) => {
+            cmd_recording(cmd).await?;
         }
     }
 
@@ -328,8 +328,8 @@ async fn send_command(cmd: Command) -> anyhow::Result<()> {
                 print_history(&entries, use_color);
             }
         }
-        Response::Meeting { meeting } => {
-            println!("{}", format_meeting_status(&meeting, use_color));
+        Response::Recording { recording } => {
+            println!("{}", format_recording_status(&recording, use_color));
         }
         Response::Error { message } => exit_with_error(&message),
     }
@@ -394,37 +394,37 @@ async fn request(cmd: Command) -> anyhow::Result<Response> {
     Ok(response)
 }
 
-/// `whisrs meeting <action>`. Recording control goes through the daemon;
-/// `list`, `show` and `path` only read the meetings folder, so they work
+/// `whisrs recording <action>`. Recording control goes through the daemon;
+/// `list`, `show` and `path` only read the recordings folder, so they work
 /// with the daemon stopped.
-async fn cmd_meeting(cmd: MeetingCmd) -> anyhow::Result<()> {
+async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
     let use_color = is_tty();
     let (action, title, id) = match cmd {
-        MeetingCmd::Start { title } => (MeetingAction::Start, title, None),
-        MeetingCmd::Stop => (MeetingAction::Stop, None, None),
-        MeetingCmd::Toggle { title } => (MeetingAction::Toggle, title, None),
-        MeetingCmd::Cancel => (MeetingAction::Cancel, None, None),
-        MeetingCmd::Status => (MeetingAction::Status, None, None),
-        MeetingCmd::Copy { id } => (MeetingAction::Copy, None, Some(id)),
-        MeetingCmd::Retry { id } => (MeetingAction::Retry, None, Some(id)),
-        MeetingCmd::List { json } => return meeting_list(json),
-        MeetingCmd::Show { id, format } => return meeting_show(&id, format),
-        MeetingCmd::Path { id } => {
+        RecordingCmd::Start { title } => (RecordingAction::Start, title, None),
+        RecordingCmd::Stop => (RecordingAction::Stop, None, None),
+        RecordingCmd::Toggle { title } => (RecordingAction::Toggle, title, None),
+        RecordingCmd::Cancel => (RecordingAction::Cancel, None, None),
+        RecordingCmd::Status => (RecordingAction::Status, None, None),
+        RecordingCmd::Copy { id } => (RecordingAction::Copy, None, Some(id)),
+        RecordingCmd::Retry { id } => (RecordingAction::Retry, None, Some(id)),
+        RecordingCmd::List { json } => return recording_list(json),
+        RecordingCmd::Show { id, format } => return recording_show(&id, format),
+        RecordingCmd::Path { id } => {
             let dir = resolve_or_exit(&id);
             println!("{}", dir.display());
             return Ok(());
         }
     };
 
-    let response = request(Command::Meeting { action, title, id }).await?;
+    let response = request(Command::Recording { action, title, id }).await?;
     match response {
-        Response::Meeting { meeting } => {
+        Response::Recording { recording } => {
             match action {
-                MeetingAction::Copy => println!("Transcript copied to the clipboard."),
-                MeetingAction::Retry => println!("Queued for transcription."),
+                RecordingAction::Copy => println!("Transcript copied to the clipboard."),
+                RecordingAction::Retry => println!("Queued for transcription."),
                 _ => {}
             }
-            println!("{}", format_meeting_status(&meeting, use_color));
+            println!("{}", format_recording_status(&recording, use_color));
         }
         Response::Error { message } => exit_with_error(&message),
         other => exit_with_error(&format!("unexpected daemon response: {other:?}")),
@@ -432,57 +432,57 @@ async fn cmd_meeting(cmd: MeetingCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The meetings root: `[meeting] dir` from config.toml, else the default.
+/// The recordings root: `[recording] dir` from config.toml, else the default.
 ///
 /// Reads only that one key, so a config the daemon would reject for an
-/// unrelated reason still lets you browse meetings.
-fn meetings_root() -> std::path::PathBuf {
+/// unrelated reason still lets you browse recordings.
+fn recordings_root() -> std::path::PathBuf {
     let dir = std::fs::read_to_string(whisrs::config_path())
         .ok()
-        .and_then(|text| meeting_dir_from_toml(&text));
-    store::meetings_dir_from(dir.as_deref())
+        .and_then(|text| recording_dir_from_toml(&text));
+    store::recordings_dir_from(dir.as_deref())
 }
 
-/// `[meeting] dir` from config.toml text, if set.
-fn meeting_dir_from_toml(text: &str) -> Option<String> {
+/// `[recording] dir` from config.toml text, if set.
+fn recording_dir_from_toml(text: &str) -> Option<String> {
     let table: toml::Table = text.parse().ok()?;
     table
-        .get("meeting")?
+        .get("recording")?
         .get("dir")?
         .as_str()
         .map(str::to_string)
 }
 
-/// Resolve `<id|last>` to a meeting folder, or print the error and exit 1.
+/// Resolve `<id|last>` to a recording folder, or print the error and exit 1.
 fn resolve_or_exit(query: &str) -> std::path::PathBuf {
-    match store::resolve(&meetings_root(), query) {
+    match store::resolve(&recordings_root(), query) {
         Ok(dir) => dir,
         Err(e) => exit_with_error(&format!("{e:#}")),
     }
 }
 
-/// `whisrs meeting list`.
-fn meeting_list(json: bool) -> anyhow::Result<()> {
-    let root = meetings_root();
-    let meetings = match store::list(&root) {
+/// `whisrs recording list`.
+fn recording_list(json: bool) -> anyhow::Result<()> {
+    let root = recordings_root();
+    let recordings = match store::list(&root) {
         Ok(m) => m,
         Err(e) => exit_with_error(&format!("{e:#}")),
     };
 
     if json {
-        let items: Vec<serde_json::Value> = meetings
+        let items: Vec<serde_json::Value> = recordings
             .iter()
-            .map(|(dir, meta)| meeting_list_json(dir, meta))
+            .map(|(dir, meta)| recording_list_json(dir, meta))
             .collect();
         println!("{}", serde_json::to_string_pretty(&items)?);
         return Ok(());
     }
 
-    if meetings.is_empty() {
-        println!("No meetings in {}.", root.display());
+    if recordings.is_empty() {
+        println!("No recordings in {}.", root.display());
         return Ok(());
     }
-    let id_width = meetings
+    let id_width = recordings
         .iter()
         .map(|(_, m)| m.id.len())
         .max()
@@ -492,15 +492,15 @@ fn meeting_list(json: bool) -> anyhow::Result<()> {
         "{:<id_width$}  {:<16}  {:>8}  {:<10}  TITLE",
         "ID", "STARTED", "DURATION", "STATUS"
     );
-    for (_, meta) in &meetings {
-        println!("{}", format_meeting_row(meta, id_width));
+    for (_, meta) in &recordings {
+        println!("{}", format_recording_row(meta, id_width));
     }
     Ok(())
 }
 
-/// One row of the `meeting list` table.
-fn format_meeting_row(meta: &MeetingMeta, id_width: usize) -> String {
-    let duration = meeting_duration_secs(meta)
+/// One row of the `recording list` table.
+fn format_recording_row(meta: &RecordingMeta, id_width: usize) -> String {
+    let duration = recording_duration_secs(meta)
         .map(format_duration)
         .unwrap_or_else(|| "-".to_string());
     format!(
@@ -508,26 +508,26 @@ fn format_meeting_row(meta: &MeetingMeta, id_width: usize) -> String {
         meta.id,
         meta.started_at.format("%Y-%m-%d %H:%M"),
         duration,
-        meeting_state_name(meta.status),
+        recording_state_name(meta.status),
         meta.title.as_deref().unwrap_or(""),
     )
 }
 
-/// One element of `meeting list --json`: the metadata without segments.
-fn meeting_list_json(dir: &std::path::Path, meta: &MeetingMeta) -> serde_json::Value {
+/// One element of `recording list --json`: the metadata without segments.
+fn recording_list_json(dir: &std::path::Path, meta: &RecordingMeta) -> serde_json::Value {
     serde_json::json!({
         "id": meta.id,
         "title": meta.title,
         "status": meta.status,
         "started_at": meta.started_at,
         "ended_at": meta.ended_at,
-        "duration_secs": meeting_duration_secs(meta),
+        "duration_secs": recording_duration_secs(meta),
         "dir": dir,
     })
 }
 
 /// Recorded length in whole seconds, or `None` while still recording.
-fn meeting_duration_secs(meta: &MeetingMeta) -> Option<i64> {
+fn recording_duration_secs(meta: &RecordingMeta) -> Option<i64> {
     let ended = meta.ended_at?;
     Some((ended - meta.started_at).num_seconds().max(0))
 }
@@ -542,21 +542,21 @@ fn format_duration(secs: i64) -> String {
     }
 }
 
-fn meeting_state_name(state: MeetingState) -> &'static str {
+fn recording_state_name(state: RecordingState) -> &'static str {
     match state {
-        MeetingState::Recording => "recording",
-        MeetingState::Processing => "processing",
-        MeetingState::Done => "done",
-        MeetingState::Failed => "failed",
+        RecordingState::Recording => "recording",
+        RecordingState::Processing => "processing",
+        RecordingState::Done => "done",
+        RecordingState::Failed => "failed",
     }
 }
 
-/// `whisrs meeting show`.
-fn meeting_show(query: &str, format: ShowFormat) -> anyhow::Result<()> {
+/// `whisrs recording show`.
+fn recording_show(query: &str, format: ShowFormat) -> anyhow::Result<()> {
     let dir = resolve_or_exit(query);
     match format {
         ShowFormat::Json => {
-            let path = dir.join("meeting.json");
+            let path = dir.join("recording.json");
             match std::fs::read_to_string(&path) {
                 Ok(text) => print!("{text}"),
                 Err(e) => exit_with_error(&format!("failed to read {}: {e}", path.display())),
@@ -568,17 +568,17 @@ fn meeting_show(query: &str, format: ShowFormat) -> anyhow::Result<()> {
                 Err(e) => exit_with_error(&format!("{e:#}")),
             };
             if format == ShowFormat::Txt {
-                if meta.status != MeetingState::Done {
+                if meta.status != RecordingState::Done {
                     exit_with_error(&not_ready_message(&meta));
                 }
-                print!("{}", whisrs::meeting::render::render_text(&meta));
+                print!("{}", whisrs::recording::render::render_text(&meta));
             } else {
                 let path = store::transcript_path(&dir, &meta.id);
                 match std::fs::read_to_string(&path) {
                     Ok(text) => print!("{text}"),
                     Err(e)
                         if e.kind() == std::io::ErrorKind::NotFound
-                            && meta.status != MeetingState::Done =>
+                            && meta.status != RecordingState::Done =>
                     {
                         exit_with_error(&not_ready_message(&meta))
                     }
@@ -590,42 +590,42 @@ fn meeting_show(query: &str, format: ShowFormat) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Why `show` has no transcript to print for a meeting that is not done.
-fn not_ready_message(meta: &MeetingMeta) -> String {
+/// Why `show` has no transcript to print for a recording that is not done.
+fn not_ready_message(meta: &RecordingMeta) -> String {
     match meta.status {
-        MeetingState::Failed => format!(
-            "meeting {} failed to process: {}. Run `whisrs meeting retry {}` to try again.",
+        RecordingState::Failed => format!(
+            "recording {} failed to process: {}. Run `whisrs recording retry {}` to try again.",
             meta.id,
             meta.error.as_deref().unwrap_or("unknown error"),
             meta.id
         ),
         state => format!(
-            "meeting {} has no transcript yet (status: {}).",
+            "recording {} has no transcript yet (status: {}).",
             meta.id,
-            meeting_state_name(state)
+            recording_state_name(state)
         ),
     }
 }
 
-/// One-line meeting status, e.g.
+/// One-line recording status, e.g.
 /// `Recording since 14:05 (Weekly sync)  id 2026-10-02_1405_weekly-sync`.
-fn format_meeting_status(status: &MeetingStatus, use_color: bool) -> String {
+fn format_recording_status(status: &RecordingStatus, use_color: bool) -> String {
     let (word, color) = match status.phase {
-        MeetingPhase::Idle => ("Idle", ""),
-        MeetingPhase::Recording => ("Recording", GREEN),
-        MeetingPhase::Processing => ("Processing", YELLOW),
+        RecordingPhase::Idle => ("Idle", ""),
+        RecordingPhase::Recording => ("Recording", GREEN),
+        RecordingPhase::Processing => ("Processing", YELLOW),
     };
     let mut line = if use_color {
         format!("{BOLD}{color}{word}{RESET}")
     } else {
         word.to_string()
     };
-    if status.phase == MeetingPhase::Recording {
+    if status.phase == RecordingPhase::Recording {
         if let Some(started) = status.started_at {
             line.push_str(&format!(" since {}", started.format("%H:%M")));
         }
     }
-    if status.phase != MeetingPhase::Idle {
+    if status.phase != RecordingPhase::Idle {
         if let Some(title) = status.title.as_deref().filter(|t| !t.is_empty()) {
             line.push_str(&format!(" ({title})"));
         }
@@ -673,80 +673,80 @@ mod tests {
 
     use super::*;
 
-    fn parse_meeting(args: &[&str]) -> MeetingCmd {
-        let mut argv = vec!["whisrs", "meeting"];
+    fn parse_recording(args: &[&str]) -> RecordingCmd {
+        let mut argv = vec!["whisrs", "recording"];
         argv.extend_from_slice(args);
         match Cli::try_parse_from(argv).expect("parse").command {
-            SubCmd::Meeting(cmd) => cmd,
-            _ => panic!("not a meeting command"),
+            SubCmd::Recording(cmd) => cmd,
+            _ => panic!("not a recording command"),
         }
     }
 
     #[test]
-    fn meeting_start_parses_title() {
+    fn recording_start_parses_title() {
         assert!(matches!(
-            parse_meeting(&["start"]),
-            MeetingCmd::Start { title: None }
+            parse_recording(&["start"]),
+            RecordingCmd::Start { title: None }
         ));
         for flag in ["-t", "--title"] {
-            match parse_meeting(&["start", flag, "Weekly sync"]) {
-                MeetingCmd::Start { title } => assert_eq!(title.as_deref(), Some("Weekly sync")),
+            match parse_recording(&["start", flag, "Weekly sync"]) {
+                RecordingCmd::Start { title } => assert_eq!(title.as_deref(), Some("Weekly sync")),
                 _ => panic!("expected start"),
             }
         }
     }
 
     #[test]
-    fn meeting_toggle_parses_title() {
+    fn recording_toggle_parses_title() {
         assert!(matches!(
-            parse_meeting(&["toggle"]),
-            MeetingCmd::Toggle { title: None }
+            parse_recording(&["toggle"]),
+            RecordingCmd::Toggle { title: None }
         ));
-        match parse_meeting(&["toggle", "-t", "Weekly sync"]) {
-            MeetingCmd::Toggle { title } => assert_eq!(title.as_deref(), Some("Weekly sync")),
+        match parse_recording(&["toggle", "-t", "Weekly sync"]) {
+            RecordingCmd::Toggle { title } => assert_eq!(title.as_deref(), Some("Weekly sync")),
             _ => panic!("expected toggle"),
         }
     }
 
     #[test]
-    fn meeting_plain_actions_parse() {
-        assert!(matches!(parse_meeting(&["stop"]), MeetingCmd::Stop));
-        assert!(matches!(parse_meeting(&["cancel"]), MeetingCmd::Cancel));
-        assert!(matches!(parse_meeting(&["status"]), MeetingCmd::Status));
+    fn recording_plain_actions_parse() {
+        assert!(matches!(parse_recording(&["stop"]), RecordingCmd::Stop));
+        assert!(matches!(parse_recording(&["cancel"]), RecordingCmd::Cancel));
+        assert!(matches!(parse_recording(&["status"]), RecordingCmd::Status));
         assert!(matches!(
-            parse_meeting(&["list"]),
-            MeetingCmd::List { json: false }
+            parse_recording(&["list"]),
+            RecordingCmd::List { json: false }
         ));
         assert!(matches!(
-            parse_meeting(&["list", "--json"]),
-            MeetingCmd::List { json: true }
+            parse_recording(&["list", "--json"]),
+            RecordingCmd::List { json: true }
         ));
     }
 
     #[test]
-    fn meeting_id_actions_parse() {
-        match parse_meeting(&["path", "last"]) {
-            MeetingCmd::Path { id } => assert_eq!(id, "last"),
+    fn recording_id_actions_parse() {
+        match parse_recording(&["path", "last"]) {
+            RecordingCmd::Path { id } => assert_eq!(id, "last"),
             _ => panic!("expected path"),
         }
-        match parse_meeting(&["copy", "2026-10-02"]) {
-            MeetingCmd::Copy { id } => assert_eq!(id, "2026-10-02"),
+        match parse_recording(&["copy", "2026-10-02"]) {
+            RecordingCmd::Copy { id } => assert_eq!(id, "2026-10-02"),
             _ => panic!("expected copy"),
         }
-        match parse_meeting(&["retry", "last"]) {
-            MeetingCmd::Retry { id } => assert_eq!(id, "last"),
+        match parse_recording(&["retry", "last"]) {
+            RecordingCmd::Retry { id } => assert_eq!(id, "last"),
             _ => panic!("expected retry"),
         }
         for action in ["show", "path", "copy", "retry"] {
-            let argv = ["whisrs", "meeting", action];
+            let argv = ["whisrs", "recording", action];
             assert!(Cli::try_parse_from(argv).is_err(), "{action} needs an id");
         }
     }
 
     #[test]
-    fn meeting_show_format_defaults_to_md() {
-        match parse_meeting(&["show", "last"]) {
-            MeetingCmd::Show { id, format } => {
+    fn recording_show_format_defaults_to_md() {
+        match parse_recording(&["show", "last"]) {
+            RecordingCmd::Show { id, format } => {
                 assert_eq!(id, "last");
                 assert_eq!(format, ShowFormat::Md);
             }
@@ -757,24 +757,24 @@ mod tests {
             ("json", ShowFormat::Json),
             ("txt", ShowFormat::Txt),
         ] {
-            match parse_meeting(&["show", "last", "--format", arg]) {
-                MeetingCmd::Show { format, .. } => assert_eq!(format, want),
+            match parse_recording(&["show", "last", "--format", arg]) {
+                RecordingCmd::Show { format, .. } => assert_eq!(format, want),
                 _ => panic!("expected show"),
             }
         }
-        match parse_meeting(&["show", "x", "-f", "json"]) {
-            MeetingCmd::Show { format, .. } => assert_eq!(format, ShowFormat::Json),
+        match parse_recording(&["show", "x", "-f", "json"]) {
+            RecordingCmd::Show { format, .. } => assert_eq!(format, ShowFormat::Json),
             _ => panic!("expected show"),
         }
         assert!(
-            Cli::try_parse_from(["whisrs", "meeting", "show", "x", "--format", "pdf"]).is_err()
+            Cli::try_parse_from(["whisrs", "recording", "show", "x", "--format", "pdf"]).is_err()
         );
     }
 
     #[test]
-    fn meeting_requires_an_action() {
-        assert!(Cli::try_parse_from(["whisrs", "meeting"]).is_err());
-        assert!(Cli::try_parse_from(["whisrs", "meeting", "bogus"]).is_err());
+    fn recording_requires_an_action() {
+        assert!(Cli::try_parse_from(["whisrs", "recording"]).is_err());
+        assert!(Cli::try_parse_from(["whisrs", "recording", "bogus"]).is_err());
     }
 
     fn at(h: u32, m: u32) -> chrono::DateTime<chrono::Local> {
@@ -786,62 +786,62 @@ mod tests {
     }
 
     #[test]
-    fn meeting_status_idle() {
+    fn recording_status_idle() {
         assert_eq!(
-            format_meeting_status(&MeetingStatus::default(), false),
+            format_recording_status(&RecordingStatus::default(), false),
             "Idle"
         );
     }
 
     #[test]
-    fn meeting_status_recording() {
-        let status = MeetingStatus {
-            phase: MeetingPhase::Recording,
+    fn recording_status_in_progress() {
+        let status = RecordingStatus {
+            phase: RecordingPhase::Recording,
             id: Some("2026-10-02_1405_weekly-sync".into()),
             title: Some("Weekly sync".into()),
             started_at: Some(at(14, 5)),
             ..Default::default()
         };
         assert_eq!(
-            format_meeting_status(&status, false),
+            format_recording_status(&status, false),
             "Recording since 14:05 (Weekly sync)  id 2026-10-02_1405_weekly-sync"
         );
 
-        let untitled = MeetingStatus {
+        let untitled = RecordingStatus {
             title: None,
             id: Some("2026-10-02_1405".into()),
             ..status
         };
         assert_eq!(
-            format_meeting_status(&untitled, false),
+            format_recording_status(&untitled, false),
             "Recording since 14:05  id 2026-10-02_1405"
         );
     }
 
     #[test]
-    fn meeting_status_processing_with_queue() {
-        let status = MeetingStatus {
-            phase: MeetingPhase::Processing,
+    fn recording_status_processing_with_queue() {
+        let status = RecordingStatus {
+            phase: RecordingPhase::Processing,
             id: Some("a".into()),
             started_at: Some(at(9, 0)),
             queued: vec!["b".into(), "c".into()],
             ..Default::default()
         };
         assert_eq!(
-            format_meeting_status(&status, false),
+            format_recording_status(&status, false),
             "Processing  id a  (2 queued)"
         );
     }
 
     #[test]
-    fn meeting_status_color_wraps_phase_only() {
-        let status = MeetingStatus {
-            phase: MeetingPhase::Recording,
+    fn recording_status_color_wraps_phase_only() {
+        let status = RecordingStatus {
+            phase: RecordingPhase::Recording,
             started_at: Some(at(8, 30)),
             ..Default::default()
         };
         assert_eq!(
-            format_meeting_status(&status, true),
+            format_recording_status(&status, true),
             format!("{BOLD}{GREEN}Recording{RESET} since 08:30")
         );
     }
@@ -854,24 +854,24 @@ mod tests {
     }
 
     #[test]
-    fn meeting_row_and_json() {
-        let mut meta = MeetingMeta::new(
+    fn recording_row_and_json() {
+        let mut meta = RecordingMeta::new(
             "2026-10-02_1405_sync".into(),
             Some("Sync".into()),
             at(14, 5),
         );
-        assert_eq!(meeting_duration_secs(&meta), None);
-        assert!(format_meeting_row(&meta, 20).contains("       -  recording   Sync"));
+        assert_eq!(recording_duration_secs(&meta), None);
+        assert!(format_recording_row(&meta, 20).contains("       -  recording   Sync"));
 
         meta.ended_at = Some(at(15, 7));
-        meta.status = MeetingState::Done;
-        assert_eq!(meeting_duration_secs(&meta), Some(62 * 60));
+        meta.status = RecordingState::Done;
+        assert_eq!(recording_duration_secs(&meta), Some(62 * 60));
         assert_eq!(
-            format_meeting_row(&meta, 20),
+            format_recording_row(&meta, 20),
             "2026-10-02_1405_sync  2026-10-02 14:05   1:02:00  done        Sync"
         );
 
-        let json = meeting_list_json(std::path::Path::new("/m/x"), &meta);
+        let json = recording_list_json(std::path::Path::new("/m/x"), &meta);
         assert_eq!(json["id"], "2026-10-02_1405_sync");
         assert_eq!(json["status"], "done");
         assert_eq!(json["duration_secs"], 3720);
@@ -881,28 +881,28 @@ mod tests {
 
     #[test]
     fn not_ready_message_names_status_and_retry() {
-        let mut meta = MeetingMeta::new("m1".into(), None, at(10, 0));
+        let mut meta = RecordingMeta::new("m1".into(), None, at(10, 0));
         assert_eq!(
             not_ready_message(&meta),
-            "meeting m1 has no transcript yet (status: recording)."
+            "recording m1 has no transcript yet (status: recording)."
         );
-        meta.status = MeetingState::Failed;
+        meta.status = RecordingState::Failed;
         meta.error = Some("backend down".into());
         assert!(not_ready_message(&meta).contains("backend down"));
-        assert!(not_ready_message(&meta).contains("whisrs meeting retry m1"));
+        assert!(not_ready_message(&meta).contains("whisrs recording retry m1"));
     }
 
     #[test]
-    fn meeting_dir_read_from_config_toml() {
+    fn recording_dir_read_from_config_toml() {
         assert_eq!(
-            meeting_dir_from_toml("[meeting]\ndir = \"~/notes/meetings\"\n").as_deref(),
-            Some("~/notes/meetings")
+            recording_dir_from_toml("[recording]\ndir = \"~/notes/recordings\"\n").as_deref(),
+            Some("~/notes/recordings")
         );
         assert_eq!(
-            meeting_dir_from_toml("[general]\nbackend = \"groq\"\n"),
+            recording_dir_from_toml("[general]\nbackend = \"groq\"\n"),
             None
         );
-        assert_eq!(meeting_dir_from_toml("not toml ["), None);
+        assert_eq!(recording_dir_from_toml("not toml ["), None);
     }
 
     /// Issue #84: `llm-command` and `llm-command-set` existed in the clap CLI

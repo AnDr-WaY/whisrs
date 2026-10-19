@@ -6,15 +6,15 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use super::NotifyFn;
-use crate::meeting::{MeetingAction, MeetingPhase, MeetingStatus};
+use crate::recording::{RecordingAction, RecordingPhase, RecordingStatus};
 use crate::service::{RestartOutcome, ServiceManager};
 use crate::{Command, State};
 use icons::IconSet;
 
-/// Speech-bubble tray icons, one set per dictation state plus two for a
-/// meeting, at several sizes so HiDPI panels get a sharp render instead of an
-/// upscaled 16x16. Dictation states fill the bubble; a meeting outlines it in
-/// the matching color (red while recording, amber while transcribing), so the
+/// Speech-bubble tray icons, one set per dictation state plus two for the
+/// recording feature, at several sizes so HiDPI panels get a sharp render instead of an
+/// upscaled 16x16. Dictation states fill the bubble; a recording outlines it in
+/// the matching color (red while capturing, amber while transcribing), so the
 /// two read apart at a glance.
 ///
 /// The PNGs in `src/tray/icons/` are rendered from the SVGs next to them:
@@ -45,10 +45,10 @@ mod icons {
         Transcribing,
         Synthesizing,
         Speaking,
-        /// A meeting is recording while dictation is idle.
-        MeetingRecording,
-        /// A meeting is being transcribed while dictation is idle.
-        MeetingProcessing,
+        /// A recording (mic + system audio) is in progress while dictation is idle.
+        RecordingActive,
+        /// A recording is being transcribed while dictation is idle.
+        RecordingProcessing,
     }
 
     impl IconSet {
@@ -59,8 +59,8 @@ mod icons {
             IconSet::Transcribing,
             IconSet::Synthesizing,
             IconSet::Speaking,
-            IconSet::MeetingRecording,
-            IconSet::MeetingProcessing,
+            IconSet::RecordingActive,
+            IconSet::RecordingProcessing,
         ];
 
         /// The set for a dictation state.
@@ -81,8 +81,8 @@ mod icons {
                 IconSet::Transcribing => set_pngs!("transcribing"),
                 IconSet::Synthesizing => set_pngs!("synthesizing"),
                 IconSet::Speaking => set_pngs!("speaking"),
-                IconSet::MeetingRecording => set_pngs!("meeting-recording"),
-                IconSet::MeetingProcessing => set_pngs!("meeting-processing"),
+                IconSet::RecordingActive => set_pngs!("recording-active"),
+                IconSet::RecordingProcessing => set_pngs!("recording-processing"),
             }
         }
     }
@@ -137,24 +137,24 @@ mod icons {
 /// miss icon refreshes and leave the old color visible.
 struct TrayState {
     current: State,
-    meeting: MeetingStatus,
+    recording: RecordingStatus,
 }
 
-/// One-line description of the meeting, or `None` when no meeting is active.
-fn meeting_line(meeting: &MeetingStatus) -> Option<String> {
-    match meeting.phase {
-        MeetingPhase::Idle => None,
-        MeetingPhase::Recording => {
-            let mut line = "Meeting recording".to_string();
-            if let Some(started) = meeting.started_at {
+/// One-line description of the recording, or `None` when no recording is active.
+fn recording_line(recording: &RecordingStatus) -> Option<String> {
+    match recording.phase {
+        RecordingPhase::Idle => None,
+        RecordingPhase::Recording => {
+            let mut line = "Recording mic + system audio".to_string();
+            if let Some(started) = recording.started_at {
                 line.push_str(&format!(" since {}", started.format("%H:%M")));
             }
-            if let Some(title) = meeting.title.as_deref().filter(|t| !t.is_empty()) {
+            if let Some(title) = recording.title.as_deref().filter(|t| !t.is_empty()) {
                 line.push_str(&format!(" ({title})"));
             }
             Some(line)
         }
-        MeetingPhase::Processing => Some("Processing meeting...".to_string()),
+        RecordingPhase::Processing => Some("Processing recording...".to_string()),
     }
 }
 
@@ -201,12 +201,14 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn title(&self) -> String {
-        // A meeting only takes over the title while dictation is idle: a
-        // dictation started before the meeting, or while it is transcribed,
+        // A recording only takes over the title while dictation is idle: a
+        // dictation started before the recording, or while it is transcribed,
         // matters more in the moment.
-        match (self.state.current, self.state.meeting.phase) {
-            (State::Idle, MeetingPhase::Recording) => "whisrs: meeting recording".to_string(),
-            (State::Idle, MeetingPhase::Processing) => "whisrs: processing meeting".to_string(),
+        match (self.state.current, self.state.recording.phase) {
+            (State::Idle, RecordingPhase::Recording) => {
+                "whisrs: recording mic + system audio".to_string()
+            }
+            (State::Idle, RecordingPhase::Processing) => "whisrs: processing recording".to_string(),
             (state, _) => format!("whisrs: {}", state_word(state)),
         }
     }
@@ -218,12 +220,12 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        // A meeting only takes over the icon while dictation is idle: a
-        // dictation started before the meeting, or while it is transcribed,
+        // A recording only takes over the icon while dictation is idle: a
+        // dictation started before the recording, or while it is transcribed,
         // matters more in the moment.
-        let set = match (self.state.current, self.state.meeting.phase) {
-            (State::Idle, MeetingPhase::Recording) => IconSet::MeetingRecording,
-            (State::Idle, MeetingPhase::Processing) => IconSet::MeetingProcessing,
+        let set = match (self.state.current, self.state.recording.phase) {
+            (State::Idle, RecordingPhase::Recording) => IconSet::RecordingActive,
+            (State::Idle, RecordingPhase::Processing) => IconSet::RecordingProcessing,
             (state, _) => IconSet::for_state(state),
         };
         icons::get(set)
@@ -237,12 +239,12 @@ impl ksni::Tray for WhisrsTray {
             State::Synthesizing => "Synthesizing…",
             State::Speaking => "Reading aloud…",
         };
-        // The meeting line leads while dictation is idle, and is appended
-        // otherwise so a running meeting is never hidden.
-        let description = match (self.state.current, meeting_line(&self.state.meeting)) {
+        // The recording line leads while dictation is idle, and is appended
+        // otherwise so a running recording is never hidden.
+        let description = match (self.state.current, recording_line(&self.state.recording)) {
             (_, None) => description.to_string(),
-            (State::Idle, Some(meeting)) => meeting,
-            (_, Some(meeting)) => format!("{description}\n{meeting}"),
+            (State::Idle, Some(recording)) => recording,
+            (_, Some(recording)) => format!("{description}\n{recording}"),
         };
         ToolTip {
             title: "whisrs".to_string(),
@@ -257,7 +259,7 @@ impl ksni::Tray for WhisrsTray {
     /// Deliberately holds no dictation controls: whisrs is driven by hotkeys,
     /// and toggle/cancel each already have a hotkey, a CLI command, and (for
     /// toggle) the left-click above. A menu item for them would be a fourth
-    /// way to do the same thing. Meetings are the exception: they run for an
+    /// way to do the same thing. Recordings are the exception: they run for an
     /// hour, often started without a hotkey bound, and the tray is where the
     /// user sees one is running, so the start/stop/cancel controls live here.
     fn menu(&self) -> Vec<MenuItem<Self>> {
@@ -275,7 +277,7 @@ impl ksni::Tray for WhisrsTray {
             }),
             MenuItem::Separator,
         ];
-        items.extend(meeting_menu_items(&self.state.meeting));
+        items.extend(recording_menu_items(&self.state.recording));
         items.extend([
             MenuItem::Separator,
             MenuItem::Standard(StandardItem {
@@ -297,35 +299,35 @@ impl ksni::Tray for WhisrsTray {
     }
 }
 
-/// The meeting section of the menu: a status line while a meeting is active,
-/// a start/stop toggle, and cancel while recording.
-fn meeting_menu_items(meeting: &MeetingStatus) -> Vec<MenuItem<WhisrsTray>> {
+/// The recording section of the menu: a status line while a recording is active,
+/// a start/stop toggle, and cancel while capturing.
+fn recording_menu_items(recording: &RecordingStatus) -> Vec<MenuItem<WhisrsTray>> {
     let mut items = Vec::new();
-    if let Some(line) = meeting_line(meeting) {
+    if let Some(line) = recording_line(recording) {
         items.push(MenuItem::Standard(StandardItem {
             label: line,
             enabled: false,
             ..Default::default()
         }));
     }
-    let recording = meeting.phase == MeetingPhase::Recording;
+    let capturing = recording.phase == RecordingPhase::Recording;
     items.push(MenuItem::Standard(StandardItem {
-        label: if recording {
-            "Stop meeting"
+        label: if capturing {
+            "Stop recording (mic + system audio)"
         } else {
-            "Start meeting"
+            "Start recording (mic + system audio)"
         }
         .to_string(),
         activate: Box::new(|tray: &mut WhisrsTray| {
-            tray.send(meeting_command(MeetingAction::Toggle));
+            tray.send(recording_command(RecordingAction::Toggle));
         }),
         ..Default::default()
     }));
-    if recording {
+    if capturing {
         items.push(MenuItem::Standard(StandardItem {
-            label: "Cancel meeting".to_string(),
+            label: "Cancel recording (mic + system audio)".to_string(),
             activate: Box::new(|tray: &mut WhisrsTray| {
-                tray.send(meeting_command(MeetingAction::Cancel));
+                tray.send(recording_command(RecordingAction::Cancel));
             }),
             ..Default::default()
         }));
@@ -333,8 +335,8 @@ fn meeting_menu_items(meeting: &MeetingStatus) -> Vec<MenuItem<WhisrsTray>> {
     items
 }
 
-fn meeting_command(action: MeetingAction) -> Command {
-    Command::Meeting {
+fn recording_command(action: RecordingAction) -> Command {
+    Command::Recording {
         action,
         title: None,
         id: None,
@@ -386,7 +388,7 @@ fn restart_daemon(notify: Option<NotifyFn>) {
 }
 
 /// Quit from the tray menu by sending the daemon SIGTERM, so it takes the
-/// same shutdown path as `systemctl stop`: a recording meeting is finalized
+/// same shutdown path as `systemctl stop`: a recording in progress is finalized
 /// and the IPC socket removed before the process exits.
 fn quit_daemon() {
     info!("tray: quit requested, shutting down");
@@ -412,7 +414,7 @@ const TRAY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1
 /// on boot when the daemon starts before the desktop environment is fully ready).
 pub async fn spawn_tray(
     mut state_rx: watch::Receiver<State>,
-    mut meeting_rx: watch::Receiver<MeetingStatus>,
+    mut recording_rx: watch::Receiver<RecordingStatus>,
     cmd_tx: mpsc::Sender<Command>,
     notify: Option<NotifyFn>,
 ) {
@@ -424,7 +426,7 @@ pub async fn spawn_tray(
         let tray = WhisrsTray {
             state: TrayState {
                 current: *state_rx.borrow(),
-                meeting: meeting_rx.borrow().clone(),
+                recording: recording_rx.borrow().clone(),
             },
             cmd_tx: cmd_tx.clone(),
             notify,
@@ -454,11 +456,11 @@ pub async fn spawn_tray(
 
     let handle = handle.expect("handle must be set after successful spawn");
 
-    // Watch for dictation and meeting changes and update the tray. The
+    // Watch for dictation and recording changes and update the tray. The
     // dictation channel ends the loop when it closes (the daemon is going
-    // away); a closed meeting channel only stops meeting updates.
+    // away); a closed recording channel only stops recording updates.
     tokio::spawn(async move {
-        let mut meeting_open = true;
+        let mut recording_open = true;
         loop {
             tokio::select! {
                 changed = state_rx.changed() => {
@@ -476,16 +478,16 @@ pub async fn spawn_tray(
                         })
                         .await;
                 }
-                changed = meeting_rx.changed(), if meeting_open => {
+                changed = recording_rx.changed(), if recording_open => {
                     if changed.is_err() {
-                        meeting_open = false;
+                        recording_open = false;
                         continue;
                     }
-                    let meeting = meeting_rx.borrow().clone();
-                    debug!("tray meeting update: {:?}", meeting.phase);
+                    let recording = recording_rx.borrow().clone();
+                    debug!("tray recording update: {:?}", recording.phase);
                     handle
                         .update(|tray| {
-                            tray.state.meeting = meeting;
+                            tray.state.recording = recording;
                         })
                         .await;
                 }
@@ -505,19 +507,19 @@ mod tests {
     fn tray_with(
         cmd_tx: mpsc::Sender<Command>,
         current: State,
-        meeting: MeetingStatus,
+        recording: RecordingStatus,
     ) -> WhisrsTray {
         WhisrsTray {
-            state: TrayState { current, meeting },
+            state: TrayState { current, recording },
             cmd_tx,
             notify: None,
         }
     }
 
-    fn recording_meeting(title: Option<&str>) -> MeetingStatus {
+    fn active_recording(title: Option<&str>) -> RecordingStatus {
         use chrono::TimeZone;
-        MeetingStatus {
-            phase: MeetingPhase::Recording,
+        RecordingStatus {
+            phase: RecordingPhase::Recording,
             id: Some("2026-10-02_0930".to_string()),
             title: title.map(str::to_string),
             started_at: Some(
@@ -541,7 +543,7 @@ mod tests {
 
     /// Activate the standard menu item with this label.
     fn click(tray: &mut WhisrsTray, label: &str) {
-        let mut items = meeting_menu_items(&tray.state.meeting);
+        let mut items = recording_menu_items(&tray.state.recording);
         let item = items
             .iter_mut()
             .find_map(|i| match i {
@@ -554,59 +556,62 @@ mod tests {
     }
 
     #[test]
-    fn meeting_line_describes_each_phase() {
-        assert_eq!(meeting_line(&MeetingStatus::default()), None);
+    fn recording_line_describes_each_phase() {
+        assert_eq!(recording_line(&RecordingStatus::default()), None);
         assert_eq!(
-            meeting_line(&recording_meeting(Some("standup"))).as_deref(),
-            Some("Meeting recording since 09:30 (standup)")
+            recording_line(&active_recording(Some("standup"))).as_deref(),
+            Some("Recording mic + system audio since 09:30 (standup)")
         );
         assert_eq!(
-            meeting_line(&recording_meeting(None)).as_deref(),
-            Some("Meeting recording since 09:30")
+            recording_line(&active_recording(None)).as_deref(),
+            Some("Recording mic + system audio since 09:30")
         );
-        let processing = MeetingStatus {
-            phase: MeetingPhase::Processing,
+        let processing = RecordingStatus {
+            phase: RecordingPhase::Processing,
             ..Default::default()
         };
         assert_eq!(
-            meeting_line(&processing).as_deref(),
-            Some("Processing meeting...")
+            recording_line(&processing).as_deref(),
+            Some("Processing recording...")
         );
     }
 
     #[test]
-    fn idle_meeting_menu_offers_only_start() {
+    fn idle_recording_menu_offers_only_start() {
         assert_eq!(
-            labels(&meeting_menu_items(&MeetingStatus::default())),
-            vec![("Start meeting".to_string(), true)]
+            labels(&recording_menu_items(&RecordingStatus::default())),
+            vec![("Start recording (mic + system audio)".to_string(), true)]
         );
     }
 
     #[test]
-    fn recording_meeting_menu_offers_status_stop_and_cancel() {
+    fn active_recording_menu_offers_status_stop_and_cancel() {
         assert_eq!(
-            labels(&meeting_menu_items(&recording_meeting(None))),
+            labels(&recording_menu_items(&active_recording(None))),
             vec![
-                ("Meeting recording since 09:30".to_string(), false),
-                ("Stop meeting".to_string(), true),
-                ("Cancel meeting".to_string(), true),
+                (
+                    "Recording mic + system audio since 09:30".to_string(),
+                    false
+                ),
+                ("Stop recording (mic + system audio)".to_string(), true),
+                ("Cancel recording (mic + system audio)".to_string(), true),
             ]
         );
     }
 
     #[test]
-    fn meeting_menu_items_send_toggle_and_cancel() {
+    fn recording_menu_items_send_toggle_and_cancel() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
-        let mut tray = tray_with(cmd_tx, State::Idle, recording_meeting(None));
+        let mut tray = tray_with(cmd_tx, State::Idle, active_recording(None));
 
-        click(&mut tray, "Stop meeting");
-        click(&mut tray, "Cancel meeting");
+        click(&mut tray, "Stop recording (mic + system audio)");
+        click(&mut tray, "Cancel recording (mic + system audio)");
 
-        for expected in [MeetingAction::Toggle, MeetingAction::Cancel] {
-            let cmd = cmd_rx.try_recv().expect("a meeting command is queued");
+        for expected in [RecordingAction::Toggle, RecordingAction::Cancel] {
+            let cmd = cmd_rx.try_recv().expect("a recording command is queued");
             assert!(
-                matches!(cmd, Command::Meeting { action, title: None, id: None } if action == expected),
-                "expected meeting {expected:?}, got {cmd:?}"
+                matches!(cmd, Command::Recording { action, title: None, id: None } if action == expected),
+                "expected recording {expected:?}, got {cmd:?}"
             );
         }
     }
@@ -616,36 +621,36 @@ mod tests {
         icons.iter().map(|i| i.data.as_slice()).collect()
     }
 
-    /// The meeting shows in the icon and tooltip only while dictation is
-    /// idle; a dictation in progress keeps its own icon, and the meeting is
+    /// The recording shows in the icon and tooltip only while dictation is
+    /// idle; a dictation in progress keeps its own icon, and the recording is
     /// still named in the tooltip.
     #[test]
-    fn dictation_state_wins_the_icon_during_a_meeting() {
+    fn dictation_state_wins_the_icon_during_a_recording() {
         let (cmd_tx, _rx) = mpsc::channel(1);
-        let idle = tray_with(cmd_tx.clone(), State::Idle, recording_meeting(Some("x")));
+        let idle = tray_with(cmd_tx.clone(), State::Idle, active_recording(Some("x")));
         assert_eq!(
             pixmaps(&idle.icon_pixmap()),
-            pixmaps(&icons::get(IconSet::MeetingRecording))
+            pixmaps(&icons::get(IconSet::RecordingActive))
         );
         assert_eq!(
             idle.tool_tip().description,
-            "Meeting recording since 09:30 (x)"
+            "Recording mic + system audio since 09:30 (x)"
         );
 
-        let processing = MeetingStatus {
-            phase: MeetingPhase::Processing,
+        let processing = RecordingStatus {
+            phase: RecordingPhase::Processing,
             ..Default::default()
         };
         let idle_processing = tray_with(cmd_tx.clone(), State::Idle, processing.clone());
         assert_eq!(
             pixmaps(&idle_processing.icon_pixmap()),
-            pixmaps(&icons::get(IconSet::MeetingProcessing))
+            pixmaps(&icons::get(IconSet::RecordingProcessing))
         );
 
         let dictating = tray_with(
             cmd_tx.clone(),
             State::Recording,
-            recording_meeting(Some("x")),
+            active_recording(Some("x")),
         );
         assert_eq!(
             pixmaps(&dictating.icon_pixmap()),
@@ -654,7 +659,7 @@ mod tests {
         assert!(dictating
             .tool_tip()
             .description
-            .ends_with("Meeting recording since 09:30 (x)"));
+            .ends_with("Recording mic + system audio since 09:30 (x)"));
 
         let transcribing = tray_with(cmd_tx, State::Transcribing, processing);
         assert_eq!(
@@ -663,8 +668,8 @@ mod tests {
         );
     }
 
-    /// No two icon sets share a pixmap at any size, so a meeting never looks
-    /// like a dictation state (or the other meeting phase) on the panel.
+    /// No two icon sets share a pixmap at any size, so a recording never looks
+    /// like a dictation state (or the other recording phase) on the panel.
     #[test]
     fn every_icon_set_is_distinct_at_every_size() {
         let sets: Vec<(IconSet, Vec<Icon>)> =
@@ -693,7 +698,7 @@ mod tests {
     #[test]
     fn activate_queues_toggle_command() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
-        let mut tray = tray_with(cmd_tx, State::Idle, MeetingStatus::default());
+        let mut tray = tray_with(cmd_tx, State::Idle, RecordingStatus::default());
 
         tray.activate(0, 0);
 
@@ -706,7 +711,7 @@ mod tests {
         );
     }
 
-    /// Every icon set (each dictation state and both meeting phases) ships
+    /// Every icon set (each dictation state and both recording phases) ships
     /// every size, and each decodes to a full ARGB pixmap that is not blank.
     /// Catches a missing or mis-rendered PNG at test time rather than as a
     /// panic in the running tray.
