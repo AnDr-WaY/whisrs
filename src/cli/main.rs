@@ -155,9 +155,7 @@ enum RecordingCmd {
         #[arg(long, value_name = "NAME", value_parser = whisrs::recording::validate_others_label)]
         others: Option<String>,
     },
-    /// Stop the recording and delete it. With none in progress, stop the
-    /// automatic tries of recordings waiting for the network (their audio is
-    /// kept)
+    /// Stop the recording and delete it
     Cancel,
     /// Show whether a recording is in progress or processing, and which
     /// recordings wait for the network

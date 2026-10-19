@@ -193,9 +193,6 @@ struct RecordingView {
     /// Waiting for the network ([`RecordingState::Waiting`]) and neither
     /// queued nor processing: what [`retry_waiting`] looks at.
     waiting: Vec<ActiveRecording>,
-    /// Ids whose automatic retries `cancel` stopped while one was queued or
-    /// running: that attempt fails the recording instead of waiting again.
-    wait_cancelled: Vec<String>,
 }
 
 impl RecordingView {
@@ -466,15 +463,6 @@ impl RecordingRuntime {
 
     fn hide_waiting(&self, id: &str) {
         self.update(|v| v.waiting.retain(|w| w.id != id));
-    }
-
-    /// Whether `cancel` stopped the network wait of recording `id` while an
-    /// attempt was pending, clearing the mark.
-    fn take_wait_cancelled(&self, id: &str) -> bool {
-        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-        let before = view.wait_cancelled.len();
-        view.wait_cancelled.retain(|c| c != id);
-        view.wait_cancelled.len() != before
     }
 }
 
@@ -1229,14 +1217,17 @@ async fn stop(
     queued
 }
 
-/// Cancel the recording in progress and delete it. With none in progress,
-/// stop the automatic retries of the recordings waiting for the network
-/// instead ([`stop_waiting`]).
+/// Cancel the recording in progress and delete it. Recordings waiting for
+/// the network are left alone: their automatic tries end by themselves
+/// ([`NETWORK_RETRY_FOR`]).
 async fn cancel(context: &Arc<DaemonContext>) -> Result<()> {
-    let session = context.recording.session.lock().await.take();
-    let Some(session) = session else {
-        return stop_waiting(context).await;
-    };
+    let session = context
+        .recording
+        .session
+        .lock()
+        .await
+        .take()
+        .context("no recording is in progress")?;
     if let Some(watch) = &session.watch {
         watch.abort();
     }
@@ -1372,14 +1363,6 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
     let id = recording.id.clone();
     let dir = recording.dir.clone();
     let network_retry = recording.network_retry;
-    if network_retry && context.recording.take_wait_cancelled(&id) {
-        // `cancel` stopped its wait while this attempt was queued.
-        context
-            .recording
-            .update(|v| v.queued.retain(|q| q.id != id));
-        stopped_waiting(context, &dir, &id, WAIT_CANCELLED).await;
-        return;
-    }
     context.recording.update(|v| {
         v.queued.retain(|q| q.id != id);
         v.processing = Some(recording);
@@ -1424,15 +1407,7 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
             );
         }
         Err(e) if is_network_unavailable(&e) => {
-            let message = format!("{e:#}");
-            if context.recording.take_wait_cancelled(&id) {
-                if let Err(write_err) = mark_waiting(&dir, &message, Local::now()) {
-                    error!("failed to record the failure of recording {id}: {write_err:#}");
-                }
-                stopped_waiting(context, &dir, &id, WAIT_CANCELLED).await;
-            } else {
-                wait_for_network(context, &dir, &id, &message).await;
-            }
+            wait_for_network(context, &dir, &id, &format!("{e:#}")).await
         }
         Err(e) => {
             let message = format!("{e:#}");
@@ -1449,7 +1424,6 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
             );
         }
     }
-    context.recording.take_wait_cancelled(&id);
     context.recording.update(|v| v.processing = None);
     sweep(context).await;
 }
@@ -1479,9 +1453,6 @@ async fn wait_for_network(context: &Arc<DaemonContext>, dir: &Path, id: &str, me
         Err(e) => error!("failed to record that recording {id} waits for the network: {e:#}"),
     }
 }
-
-/// Why `cancel` ended a recording's wait for the network.
-const WAIT_CANCELLED: &str = "stopped waiting for the network (whisrs recording cancel)";
 
 /// Fail recording `id` that was waiting for the network, keeping its audio
 /// for `whisrs recording retry`, and notify why. Blocking writes run off
@@ -1681,49 +1652,6 @@ pub(crate) async fn run_network_retries(context: Arc<DaemonContext>) {
         tokio::time::sleep(NETWORK_RETRY_TICK).await;
         retry_waiting(&context, Local::now(), false).await;
     }
-}
-
-/// `cancel` with no recording in progress: stop the automatic retries of
-/// every recording waiting for the network. Each is marked failed and keeps
-/// its audio, so `whisrs recording retry` still runs it. One whose attempt
-/// is queued or running is marked for that attempt to fail it
-/// ([`process_one`]).
-async fn stop_waiting(context: &Arc<DaemonContext>) -> Result<()> {
-    let (waiting, pending) = {
-        let mut view = context
-            .recording
-            .view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let pending: Vec<String> = view
-            .processing
-            .iter()
-            .chain(&view.queued)
-            .filter(|r| r.network_retry)
-            .map(|r| r.id.clone())
-            .collect();
-        for id in &pending {
-            if !view.wait_cancelled.contains(id) {
-                view.wait_cancelled.push(id.clone());
-            }
-        }
-        (view.waiting.clone(), pending)
-    };
-    if waiting.is_empty() && pending.is_empty() {
-        bail!("no recording is in progress");
-    }
-    for recording in waiting {
-        if context.recording.reserve(&recording).is_ok() {
-            stopped_waiting(context, &recording.dir, &recording.id, WAIT_CANCELLED).await;
-            context.recording.unreserve(&recording.id);
-        }
-    }
-    for id in pending {
-        info!(
-            "recording {id}: its network retry in progress fails it if the network is still down"
-        );
-    }
-    Ok(())
 }
 
 async fn sweep(context: &DaemonContext) {
@@ -3864,100 +3792,19 @@ mod tests {
         assert_eq!(store::read_meta(&dir).unwrap().status, RecordingState::Done);
     }
 
-    /// `cancel` with nothing recording stops the automatic retries: the
-    /// recording fails with its audio kept, and a retry still runs it. With
-    /// nothing waiting either it is the usual error.
+    /// `cancel` acts on the recording in progress only: with none, it is the
+    /// usual error, and a recording waiting for the network keeps waiting.
     #[tokio::test]
-    async fn cancel_stops_the_wait_and_keeps_the_audio() {
+    async fn cancel_leaves_a_waiting_recording_alone() {
         let tmp = tempfile::tempdir().unwrap();
-        let backend = FlakyNetwork::new(DOWN);
-        let (context, mut queue) = test_context(tmp.path(), backend.clone());
-        let (dir, _) = waiting_recording(&context, &mut queue, tmp.path()).await;
+        let (context, mut queue) = test_context(tmp.path(), FlakyNetwork::new(DOWN));
+        let (dir, id) = waiting_recording(&context, &mut queue, tmp.path()).await;
+        let before = store::read_meta(&dir).unwrap();
 
-        cancel(&context).await.unwrap();
-        let meta = store::read_meta(&dir).unwrap();
-        assert_eq!(meta.status, RecordingState::Failed);
-        assert!(
-            meta.error.unwrap().starts_with(WAIT_CANCELLED),
-            "the reason"
-        );
-        assert!(store::audio_path(&dir, TrackKind::Mic).exists());
-        assert_eq!(context.recording.status(), RecordingStatus::default());
-        retry_waiting(&context, Local::now() + chrono::Duration::hours(1), false).await;
-        assert!(queue.try_recv().is_err(), "no more automatic attempts");
         let err = cancel(&context).await.unwrap_err();
-        assert!(
-            err.to_string().contains("no recording is in progress"),
-            "{err:#}"
-        );
-
-        // Cancelled while its automatic attempt was queued: the attempt
-        // does not run.
-        retry(&context, "last", &RecordingOptions::default())
-            .await
-            .unwrap();
-        process_one(&context, queue.try_recv().unwrap()).await;
-        retry_waiting(
-            &context,
-            Local::now() + chrono::Duration::minutes(11),
-            false,
-        )
-        .await;
-        let item = queue.try_recv().unwrap();
-        let calls = backend.calls.load(Ordering::Relaxed);
-        cancel(&context).await.unwrap();
-        process_one(&context, item).await;
-        assert_eq!(backend.calls.load(Ordering::Relaxed), calls, "not sent");
-        assert_eq!(
-            store::read_meta(&dir).unwrap().status,
-            RecordingState::Failed
-        );
-        assert_eq!(context.recording.status(), RecordingStatus::default());
-    }
-
-    /// Cancelled while its automatic attempt is running: that attempt, when
-    /// it still finds no network, fails the recording instead of waiting.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancel_during_an_automatic_attempt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let backend = FlakyNetwork::new(DOWN);
-        let (context, mut queue) = test_context(tmp.path(), backend.clone());
-        let (dir, _) = waiting_recording(&context, &mut queue, tmp.path()).await;
-
-        retry_waiting(
-            &context,
-            Local::now() + chrono::Duration::minutes(11),
-            false,
-        )
-        .await;
-        let item = queue.try_recv().unwrap();
-        backend.set(HANG);
-        let calls = backend.calls.load(Ordering::Relaxed);
-        let attempt = tokio::spawn({
-            let context = Arc::clone(&context);
-            async move { process_one(&context, item).await }
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while backend.calls.load(Ordering::Relaxed) == calls {
-            assert!(Instant::now() < deadline, "the attempt never started");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        cancel(&context).await.unwrap();
-        // The request in flight fails: still no network.
-        backend.release.notify_one();
-        attempt.await.unwrap();
-
-        let meta = store::read_meta(&dir).unwrap();
-        assert_eq!(meta.status, RecordingState::Failed);
-        assert!(meta.error.unwrap().starts_with(WAIT_CANCELLED));
-        assert_eq!(context.recording.status(), RecordingStatus::default());
-        assert!(context
-            .recording
-            .view
-            .lock()
-            .unwrap()
-            .wait_cancelled
-            .is_empty());
+        assert_eq!(err.to_string(), "no recording is in progress");
+        assert_eq!(store::read_meta(&dir).unwrap(), before);
+        assert_eq!(context.recording.status().waiting, vec![id]);
     }
 
     /// A restarted daemon tries a waiting recording at once, as an
