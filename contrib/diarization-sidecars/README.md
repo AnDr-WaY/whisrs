@@ -8,7 +8,7 @@ gives every word the voice speaking at that moment.
 | Recipe | What runs | 15 minutes of audio on a laptop | Voices found | Error rate |
 |---|---|---|---|---|
 | [`nemotron`](nemotron/) (recommended) | `nemo-speech serve`, one binary | 49 s on the CPU, 17 s on Vulkan | 4, 4, 4; 1; 2 | 17.9 % |
-| [`sherpa-onnx`](sherpa-onnx/) | `uv run server.py` | 170 s on 4 CPU threads | 4, 4, 3; 1; 2 | 11.8 % |
+| [`sherpa-onnx`](sherpa-onnx/) | `uv run server.py` | 150 to 170 s on 4 CPU threads | 4, 4, 3; 1; 2 | 11.8 % |
 
 Measured on an Intel Core Ultra 9 185H on three 15-minute AMI meetings
 (error rate with a 0.25 s collar, overlapping speech included), a lesson

@@ -13,6 +13,14 @@ Environment=NEMO_SPEECH_MODEL_DIR=%h/.local/share/nemo-speech/models
 Nice=10
 Restart=on-failure
 RestartSec=5
+# Memory grows with the speech it is sent, about 22 MB a minute (measured on
+# the CPU build: 440 MB for 15 minutes, 1.4 GB for an hour, 2.7 GB for two),
+# so some 3.9 GB for three hours, whisrs' default longest recording. Past
+# this cap the kernel stops the sidecar alone, not your session, and whisrs
+# writes that transcript without speakers. Lower it to refuse long tracks on
+# a small machine. No swap, so the cap stops it instead of swapping.
+MemoryMax=4500M
+MemorySwapMax=0
 
 [Install]
 WantedBy=default.target

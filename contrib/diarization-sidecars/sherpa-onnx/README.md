@@ -25,14 +25,27 @@ against the AMI reference, plus two real recordings.
 
 | | |
 |---|---|
-| Time for 15 minutes of audio | about 2 min 50 s (0.19 x real time) |
-| Peak memory | 570 MB (680 MB for a 28-minute call) |
+| Time for 15 minutes of audio | about 2.5 to 2.8 minutes (0.16 to 0.19 x real time) |
+| Peak memory | 575 MB for 15 minutes sent over HTTP; 660 MB for a 28-minute call (run with `--input`) |
 | Error rate (0.25 s collar, overlapping speech included) | 11.8 % |
 | Voices found, after the merge | 4, 4 and 3 for the meetings (4 in each, but the fourth person of the third meeting says 2 s); 1 for a one-teacher lesson video; 2 for a two-person call |
 | Voices found, before the merge | 8, 8 and 8; 1; 9 |
 
 The environment takes about 100 MB (sherpa-onnx bundles onnxruntime), and the
-two models 32 MB.
+two models 32 MB. The Python packages are pinned in `server.py` to the
+versions measured here (sherpa-onnx 1.13.8, numpy 2.5.4, soundfile 0.14.0):
+the threshold below was tuned on sherpa-onnx 1.13.8, and another version may
+need it tuned again.
+
+Reading an upload takes about 3 times its size in memory (it is read once
+and decoded where it lies), on top of the diarization itself: about 1 GB more
+for a 3-hour track (345 MB of WAV). `--max-upload-mb` (default 400, a little
+over 3.5 hours of speech) refuses anything larger with HTTP 413. One
+recording is diarized at a time: a request that comes meanwhile is answered
+HTTP 503 with `Retry-After: 30` (whisrs waits and tries again) and its body
+is never kept. That answer takes under a second, except during sherpa-onnx's
+first pass over the audio (the first 35 s or so for 15 minutes of audio),
+which holds Python's interpreter lock until it ends.
 
 ## Why the threshold matters
 
@@ -83,10 +96,11 @@ tar xjf sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
 
 ## Run
 
-From this folder:
+`server.py` can live anywhere; here it is run from a whisrs checkout at
+`~/whisrs`:
 
 ```sh
-uv run server.py \
+uv run ~/whisrs/contrib/diarization-sidecars/sherpa-onnx/server.py \
   --seg ~/.local/share/sherpa-onnx/sherpa-onnx-pyannote-segmentation-3-0/model.onnx \
   --emb ~/.local/share/sherpa-onnx/3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx
 ```
@@ -104,9 +118,9 @@ ffmpeg -loglevel error -i some-talk.m4a -t 120 -ac 1 -ar 16000 /tmp/talk.wav
 curl -s -F file=@/tmp/talk.wav http://127.0.0.1:8770/diarize | head -c 300
 ```
 
-Or without the server: `uv run server.py --seg ... --emb ... --input /tmp/talk.wav`
-prints the same answer, and on stderr how many voices it found before and
-after the merge.
+Or without the server: the same command with `--input /tmp/talk.wav` prints
+the same answer, and on stderr how many voices it found before and after the
+merge.
 
 ## whisrs config
 

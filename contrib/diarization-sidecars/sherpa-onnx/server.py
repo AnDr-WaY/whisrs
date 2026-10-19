@@ -2,9 +2,10 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "sherpa-onnx>=1.13.8,<2",
-#     "numpy",
-#     "soundfile",
+#     # The versions measured; --threshold 1.1 was tuned on sherpa-onnx 1.13.8.
+#     "sherpa-onnx==1.13.8",
+#     "numpy==2.5.4",
+#     "soundfile==0.14.0",
 # ]
 # ///
 """Speaker diarization sidecar for whisrs, on sherpa-onnx.
@@ -14,7 +15,7 @@ embedding model (3D-Speaker ERes2Net by default) tells the voices apart, and
 the turns go back to whisrs in its diarization sidecar contract:
 
     POST /diarize   multipart form: file = 16 kHz mono WAV,
-                    num_speakers = N (optional, N > 0)
+                    num_speakers = N (optional, 1 to 20; 0 or none: decide)
     200 {"segments": [{"start": 1.2, "end": 4.85, "speaker": "S0"}, ...]}
     GET  /health    {"ok": true, ...}
 
@@ -29,6 +30,13 @@ cluster too short to embed goes to the voice next to it in time. With
 num_speakers, sherpa-onnx groups the speech into that many clusters (one
 can come back empty on short audio) and nothing is merged.
 
+Memory: an upload is read once and decoded where it lies, about 3 times its
+size while that happens (a 345 MB WAV, three hours of speech, about 1 GB),
+then the diarization's own. One recording is diarized at a time: a request
+that comes while one runs is answered HTTP 503 with Retry-After, and its
+body is only read to be dropped. That takes under a second, except during
+sherpa-onnx's first pass over the audio, which holds the GIL until it ends.
+
     uv run server.py --seg model.onnx --emb eres2net.onnx
     uv run server.py --seg model.onnx --emb eres2net.onnx --input talk.wav
 """
@@ -38,11 +46,11 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import re
+import socket
 import sys
 import threading
 import time
-from email.parser import BytesParser
-from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -119,7 +127,7 @@ class Diarizer:
         if num_speakers:
             self.sd.set_config(self._config(num_speakers))
         try:
-            result = self.sd.process(audio).sort_by_start_time()
+            result = self.sd.process(audio, callback=_let_others_run).sort_by_start_time()
         finally:
             if num_speakers:
                 self.sd.set_config(self._config(-1))
@@ -144,6 +152,15 @@ class Diarizer:
         m = np.mean(vecs, axis=0)
         n = float(np.linalg.norm(m))
         return m / n if n > 0 else None
+
+
+def _let_others_run(done: int, total: int) -> int:
+    """process()'s progress callback, called between embedding chunks.
+    sherpa-onnx holds the GIL for the whole diarization; sleeping 0 s here
+    hands it to the other request threads, so a second request gets its 503
+    within a second (its first pass, before any chunk, still blocks them)."""
+    time.sleep(0)
+    return 0  # non-zero would abort
 
 
 def merge_minor(segs, centroid_of, min_share: float, min_similarity: float,
@@ -222,22 +239,115 @@ def _union(segs):
     return [tuple(x) for x in out]
 
 
-def read_wav(data: bytes) -> np.ndarray:
-    audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+class _View(io.RawIOBase):
+    """A read-only file over a memoryview, so soundfile decodes the upload
+    where it lies instead of from a copy (io.BytesIO copies a memoryview)."""
+
+    def __init__(self, view: memoryview) -> None:
+        self.view, self.pos = view, 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        n = max(0, min(len(b), len(self.view) - self.pos))
+        b[:n] = self.view[self.pos:self.pos + n]
+        self.pos += n
+        return n
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        base = {io.SEEK_SET: 0, io.SEEK_CUR: self.pos, io.SEEK_END: len(self.view)}[whence]
+        self.pos = max(0, base + offset)
+        return self.pos
+
+    def tell(self) -> int:
+        return self.pos
+
+    def __repr__(self) -> str:  # how soundfile names it in its errors
+        return "the uploaded file"
+
+
+def read_wav(data) -> np.ndarray:
+    """A 16 kHz WAV (bytes or a memoryview) as float32 mono samples."""
+    source = _View(data) if isinstance(data, memoryview) else io.BytesIO(data)
+    audio, sr = sf.read(source, dtype="float32")
     if sr != RATE:
         raise ValueError(f"expected a {RATE} Hz WAV, got {sr} Hz")
-    return np.ascontiguousarray(audio[:, 0])
+    return audio if audio.ndim == 1 else np.ascontiguousarray(audio[:, 0])
+
+
+_NAME = re.compile(rb'(?im)^content-disposition:[^\r\n]*?;\s*name="?([^";\r\n]+)')
+
+
+def parse_multipart(buf: bytearray, boundary: bytes) -> dict[str, memoryview]:
+    """The parts of a multipart/form-data body by name, as views into it: the
+    file's bytes are not copied."""
+    delim = b"--" + boundary
+    view = memoryview(buf)
+    parts: dict[str, memoryview] = {}
+    pos = buf.find(delim)
+    if pos < 0:
+        raise ValueError("the body holds no multipart boundary")
+    while True:
+        pos += len(delim)
+        if buf[pos:pos + 2] == b"--":  # the closing boundary
+            return parts
+        head = buf.find(b"\r\n", pos)
+        head_end = buf.find(b"\r\n\r\n", head) if head >= 0 else -1
+        if head_end < 0:
+            raise ValueError("a multipart part has no end to its headers")
+        data_start = head_end + 4
+        nxt = buf.find(b"\r\n" + delim, data_start)
+        if nxt < 0:
+            raise ValueError("the multipart body has no closing boundary")
+        name = _NAME.search(buf, head, head_end + 2)
+        if name:
+            parts.setdefault(name.group(1).decode("latin-1"), view[data_start:nxt])
+        pos = nxt + 2
+
+
+class BadRequest(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def make_handler(diarizer: Diarizer, args: argparse.Namespace):
+    # One diarization at a time, and one upload in memory: a second request
+    # is told 503 instead of having its body read and kept.
+    busy = threading.Lock()
+    max_bytes = args.max_upload_mb * 1024 * 1024
+
     class Handler(BaseHTTPRequestHandler):
-        def _json(self, code: int, obj) -> None:
+        def _json(self, code: int, obj, headers=()) -> None:
             body = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
+            for k, v in headers:
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
+
+        def _discard(self, length: int) -> None:
+            """Read and drop an unread body, so the client gets the answer
+            instead of a reset connection. Large waiting reads: during a
+            diarization each one waits for its turn at the GIL."""
+            self.connection.settimeout(30)
+            scratch = bytearray(min(length, 4 << 20))
+            try:
+                length -= len(self.rfile.read1(min(length, 1 << 16)))  # what it buffered
+                while length > 0:
+                    n = self.connection.recv_into(scratch, min(length, len(scratch)),
+                                                  socket.MSG_WAITALL)
+                    if not n:
+                        break
+                    length -= n
+            except OSError:
+                pass
 
         def do_GET(self):
             if self.path.rstrip("/") == "/health":
@@ -245,35 +355,83 @@ def make_handler(diarizer: Diarizer, args: argparse.Namespace):
                                         "min_share": args.min_share})
             self._json(404, {"error": "not found"})
 
-        def do_POST(self):
-            if self.path.split("?")[0].rstrip("/") != "/diarize":
-                return self._json(404, {"error": "POST /diarize"})
-            length = int(self.headers.get("content-length") or 0)
-            if length <= 0 or length > args.max_upload_mb * 1024 * 1024:
-                return self._json(413 if length > 0 else 411, {"error": "bad length"})
-            body = self.rfile.read(length)
-            ctype = self.headers.get("content-type", "")
-            if not ctype.startswith("multipart/form-data"):
-                return self._json(400, {"error": "send multipart/form-data with a file part"})
-            msg = BytesParser(policy=HTTP).parsebytes(
-                b"content-type: " + ctype.encode() + b"\r\n\r\n" + body
-            )
-            wav, num = None, None
-            for part in msg.iter_parts():
-                name = part.get_param("name", header="content-disposition")
-                if name == "file":
-                    wav = part.get_payload(decode=True)
-                elif name == "num_speakers":
-                    try:
-                        num = int(part.get_payload(decode=True).decode().strip() or 0) or None
-                    except ValueError:
-                        return self._json(400, {"error": "num_speakers must be an integer"})
-            if not wav:
-                return self._json(400, {"error": "missing the file part"})
+        def _length(self) -> int:
+            raw = self.headers.get("content-length")
+            if raw is None:
+                raise BadRequest(411, "a Content-Length is required")
             try:
-                audio = read_wav(wav)
+                length = int(raw)
+            except ValueError:
+                raise BadRequest(400, "Content-Length is not a number") from None
+            if length <= 0:
+                raise BadRequest(400, "the body is empty")
+            if length > max_bytes:
+                raise BadRequest(413, f"the upload is over --max-upload-mb ({args.max_upload_mb})")
+            return length
+
+        def do_POST(self):
+            # The headers are checked before a byte of the body is read.
+            self.close_connection = True
+            try:
+                length = self._length()
+            except BadRequest as e:
+                return self._json(e.code, {"error": str(e)})
+            ctype = self.headers.get("content-type", "")
+            boundary = re.search(r'boundary="?([^";]+)"?', ctype)
+            if self.path.split("?")[0].rstrip("/") != "/diarize":
+                self._json(404, {"error": "POST /diarize"})
+                return self._discard(length)
+            if not ctype.lower().startswith("multipart/form-data") or not boundary:
+                self._json(400, {"error": "send multipart/form-data with a file part"})
+                return self._discard(length)
+            if not busy.acquire(blocking=False):
+                self._json(503, {"error": "busy with another recording"},
+                           headers=[("retry-after", "30")])
+                return self._discard(length)
+            try:
+                self._diarize(length, boundary.group(1).encode("latin-1"))
+            except BadRequest as e:
+                self._json(e.code, {"error": str(e)})
+            except Exception as e:  # noqa: BLE001 - never a dropped connection
+                print(f"diarization failed: {e!r}", file=sys.stderr, flush=True)
+                self._json(500, {"error": f"diarization failed: {e}"})
+            finally:
+                busy.release()
+
+        def _diarize(self, length: int, boundary: bytes) -> None:
+            buf = bytearray(length)
+            view = memoryview(buf)
+            got = 0
+            while got < length:
+                n = self.rfile.readinto(view[got:])
+                if not n:
+                    raise BadRequest(400, f"the body ended after {got} of {length} bytes")
+                got += n
+            try:
+                parts = parse_multipart(buf, boundary)
+            except ValueError as e:
+                raise BadRequest(400, str(e)) from None
+            num = None
+            if "num_speakers" in parts:
+                text = bytes(parts["num_speakers"]).decode("utf-8", "replace").strip()
+                try:
+                    num = int(text or 0)
+                except ValueError:
+                    raise BadRequest(400, "num_speakers must be an integer") from None
+                if not 0 <= num <= 20:
+                    raise BadRequest(400, "num_speakers must be 1 to 20 (0 or none: decide)")
+                num = num or None
+            if "file" not in parts or len(parts["file"]) == 0:
+                raise BadRequest(400, "missing the file part")
+            try:
+                audio = read_wav(parts["file"])
             except Exception as e:  # noqa: BLE001 - any unreadable upload
-                return self._json(400, {"error": f"bad WAV: {e}"})
+                raise BadRequest(400, f"bad WAV: {e}") from None
+            # The upload is decoded: let it go before the long part.
+            for v in parts.values():
+                v.release()
+            view.release()
+            del parts, view, buf
             started = time.monotonic()
             segments, stats = diarizer.diarize(audio, num)
             took = time.monotonic() - started
@@ -308,10 +466,14 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8770)
-    ap.add_argument("--max-upload-mb", type=int, default=512)
+    ap.add_argument("--max-upload-mb", type=int, default=400,
+                    help="largest upload accepted (default 400: 3.6 hours of 16 kHz speech); "
+                         "reading one takes about 3 times its size in memory")
     ap.add_argument("--input", help="diarize this WAV once, print the JSON answer and exit")
     ap.add_argument("--num-speakers", type=int, default=0, help="with --input")
     args = ap.parse_args()
+    if not 0 <= args.num_speakers <= 20:
+        ap.error("--num-speakers must be 1 to 20 (0: decide)")
 
     diarizer = Diarizer(args)
     if args.input:

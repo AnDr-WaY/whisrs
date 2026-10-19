@@ -744,14 +744,15 @@ Two ready sidecars are in
 measured on a laptop with 15-minute meetings. `nemotron`, the recommended
 one, runs NVIDIA's Nemotron 3 Diarization in `nemo-speech serve`, a single
 download with no Python: it takes under a minute for 15 minutes of audio on
-the CPU (17 seconds on an Intel GPU), found the right number of main voices
-in every recording, and almost never mixes two people up, but leaves more
-quiet or short speech without a voice. It ignores `num_speakers`.
-`sherpa-onnx` is a small Python server started with `uv`: it took about 3
-minutes for the same audio and gave the most speech the right voice.
-Deepgram's own speaker separation (`diarization = "backend"`) needs no
-sidecar and comes free with its transcription, but scored clearly worse than
-both on the same meetings.
+the CPU (17 seconds on an Intel GPU), found 4, 4 and 4 voices in the three
+four-person meetings, 1 in a video with one teacher and 2 in a two-person
+call (beside a 3-second third), and almost never mixes two people up, but
+leaves more quiet or short speech without a voice. It ignores
+`num_speakers`. `sherpa-onnx` is a small Python server started with `uv`: it
+took under 3 minutes for the same audio and gave the most speech the right
+voice. Deepgram's own speaker separation (`diarization = "backend"`) needs
+no sidecar and comes free with its transcription, but scored clearly worse
+than both on the same meetings.
 
 whisrs waits for the sidecar's answer for twice the length of the speech it
 sent, and at least 10 minutes. A sidecar that cannot be reached is tried

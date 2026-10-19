@@ -25,7 +25,13 @@ meetings, scored against the AMI reference) plus two real recordings.
 | | CPU build | Vulkan build (Arc iGPU) |
 |---|---|---|
 | Time for 15 minutes of audio | 49 s (0.054 x real time, about 4 cores) | 17 s (0.019 x real time, CPU nearly idle) |
-| Peak memory | 380 MB (620 MB for a 28-minute call) | 300 MB (540 MB for 28 minutes) |
+| Peak memory (`nemo-speech diarize`) | 380 MB (620 MB for a 28-minute call) | 300 MB (540 MB for 28 minutes) |
+
+Through `nemo-speech serve`, which also holds the upload, the CPU build
+peaked at 440 MB for 15 minutes of audio, 730 MB for 28 minutes, 1.4 GB for
+an hour (3.3 minutes to answer) and 2.7 GB for two hours (7.9 minutes):
+about 22 MB per minute of speech, so some 3.9 GB for three hours, whisrs'
+default longest recording.
 
 Speakers found were 4, 4 and 4 for the three meetings (4 each in the
 reference; the Vulkan build found 3 in the third, whose fourth person says
@@ -52,16 +58,18 @@ for 15 minutes of audio) and 10 times longer on Vulkan.
    base=https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v0.2.0
    curl -LO "$base/nemo-speech-0.2.0-linux-x86_64-cpu.tar.gz"      # 6.7 MB
    # or: curl -LO "$base/nemo-speech-0.2.0-linux-x86_64-vulkan.tar.gz"   # 16.6 MB
-   curl -LO "$base/SHA256SUMS"
-   sha256sum --check --ignore-missing SHA256SUMS
+   sha256sum --check --ignore-missing <<'EOF'
+   f396057150f1b774935c7414fd32ebc04195a795a34120d78d8c9ecefa1b7507  nemo-speech-0.2.0-linux-x86_64-cpu.tar.gz
+   c8d0ed5b9ac5fb6d5c460015ba38ea217415c44edc1e6d49120646781009aee6  nemo-speech-0.2.0-linux-x86_64-vulkan.tar.gz
+   EOF
    tar xzf nemo-speech-0.2.0-linux-x86_64-cpu.tar.gz
    ```
 
-   The checksums of 0.2.0 are
-   `f396057150f1b774935c7414fd32ebc04195a795a34120d78d8c9ecefa1b7507` (cpu) and
-   `c8d0ed5b9ac5fb6d5c460015ba38ea217415c44edc1e6d49120646781009aee6` (vulkan).
-   On a GPU, `nemo-speech-0.2.0-linux-x86_64-vulkan/bin/nemo-speech doctor`
-   should list it.
+   These are the checksums of the files measured here; the release's own
+   `SHA256SUMS` lists the same. `sha256sum` must print `OK` for the file you
+   downloaded. On a GPU,
+   `nemo-speech-0.2.0-linux-x86_64-vulkan/bin/nemo-speech doctor` should list
+   it.
 
 2. The model, pinned to the revision measured here:
 
@@ -71,13 +79,20 @@ for 15 minutes of audio) and 10 times longer on Vulkan.
    echo "08456d9e22cd9a323c0364d98375f3746d6e68507ebb705cd46438c534c7a3a1  Nemotron-3-Diarization.q8_0.gguf" | sha256sum --check
    ```
 
-3. The server config, [`diarization.yaml`](diarization.yaml), with your home
-   in the model path (run from this folder):
+3. The server config: [`diarization.yaml`](diarization.yaml) with the model's
+   full path. This writes it with your home filled in:
 
    ```sh
    mkdir -p ~/.config/nemo-speech
-   sed "s|/home/YOU|$HOME|" diarization.yaml > ~/.config/nemo-speech/diarization.yaml
+   cat > ~/.config/nemo-speech/diarization.yaml <<EOF
+   diar:
+     model_path: $HOME/.local/share/nemo-speech/Nemotron-3-Diarization.q8_0.gguf
+     preset: v3-offline
+   EOF
    ```
+
+   `preset: v3-offline` is not the API's `mode=offline` (see the comments in
+   `diarization.yaml`).
 
 ## Run
 
@@ -92,16 +107,23 @@ With the Vulkan build, use its directory and `--device vulkan:0`. Keep
 
 To start it with your session instead, install the user unit
 [`nemotron-diarization.service`](nemotron-diarization.service) (edit its
-`ExecStart` for the Vulkan build):
+`ExecStart` for the Vulkan build). From a whisrs checkout at `~/whisrs`:
 
 ```sh
-mkdir -p ~/.config/systemd/user
-cp nemotron-diarization.service ~/.config/systemd/user/
+install -Dm644 ~/whisrs/contrib/diarization-sidecars/nemotron/nemotron-diarization.service \
+  ~/.config/systemd/user/nemotron-diarization.service
 systemctl --user daemon-reload
 systemctl --user enable --now nemotron-diarization.service
 ```
 
-It holds about 120 MB of memory when it starts, and some 220 MB after a
+The unit caps the sidecar at `MemoryMax=4500M` (with `MemorySwapMax=0`),
+which fits three hours of speech. A longer track gets the sidecar alone
+stopped by the kernel, not your session (checked with a deliberately small
+cap: only the sidecar's unit was killed), and whisrs then writes that
+transcript without speakers and says why. Lower the cap on a machine with
+little memory.
+
+It holds about 120 MB of memory when it starts, and 150 to 220 MB after a
 recording.
 
 ## Check it
