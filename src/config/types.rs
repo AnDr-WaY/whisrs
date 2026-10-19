@@ -111,6 +111,14 @@ pub struct RecordingConfig {
     /// How the voices on the system track are told apart.
     #[serde(default)]
     pub diarization: DiarizationMode,
+    /// A diarization sidecar: `POST` a track's speech as a WAV, get each
+    /// voice's turns back. Blank is unset.
+    #[serde(default)]
+    pub diarization_url: Option<String>,
+    /// How many voices the diarization sidecar should find on the system
+    /// track (on the mic of a recording without one). 0 lets it decide.
+    #[serde(default)]
+    pub num_speakers: u32,
     /// Several people share the mic (an in-person meeting): its voices are
     /// told apart too. `false` makes the whole mic track the user.
     #[serde(default)]
@@ -121,12 +129,16 @@ pub struct RecordingConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiarizationMode {
-    /// `backend` on Deepgram, else `off`.
+    /// `sidecar` when `diarization_url` is set, else `backend` on Deepgram,
+    /// else `off`.
     #[default]
     Auto,
     /// The transcription backend labels speakers: Deepgram, or an
     /// `asr-sidecar` that returns `segments[].speaker`.
     Backend,
+    /// The diarization sidecar at `diarization_url` finds the voices, and
+    /// any backend transcribes the words.
+    Sidecar,
     /// One speaker per track, as before speakers were separated.
     Off,
 }
@@ -153,6 +165,8 @@ impl Default for RecordingConfig {
             audio_retention_days: default_recording_audio_retention_days(),
             dir: None,
             diarization: DiarizationMode::default(),
+            diarization_url: None,
+            num_speakers: 0,
             shared_mic: false,
         }
     }
@@ -162,6 +176,14 @@ impl RecordingConfig {
     /// The effective recording config: `[recording]` if present, else defaults.
     pub fn effective(config: &Config) -> RecordingConfig {
         config.recording.clone().unwrap_or_default()
+    }
+
+    /// `diarization_url`, trimmed; blank is unset.
+    pub fn diarization_url(&self) -> Option<&str> {
+        self.diarization_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
     }
 
     /// The language track `kind` of a recording is transcribed in when the
@@ -2280,6 +2302,36 @@ impl Config {
                     });
                 }
             }
+        }
+
+        // The diarization sidecar: a URL it can post to, a mode that has
+        // one, and a number of voices in range.
+        if let Some(url) = recording.diarization_url() {
+            let parsed = reqwest::Url::parse(url).map_err(|e| {
+                WhisrsError::Config(format!(
+                    "[recording] diarization_url = \"{url}\" is not a URL: {e}"
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(WhisrsError::Config(format!(
+                    "[recording] diarization_url must use http:// or https://, got {}://",
+                    parsed.scheme()
+                )));
+            }
+        } else if recording.diarization == DiarizationMode::Sidecar {
+            return Err(WhisrsError::Config(
+                "[recording] diarization = \"sidecar\" needs diarization_url: the address of \
+                 the diarization sidecar, e.g. \"http://127.0.0.1:8770/diarize\"."
+                    .to_string(),
+            ));
+        }
+        if recording.num_speakers > crate::recording::NUM_SPEAKERS_MAX {
+            return Err(WhisrsError::Config(format!(
+                "[recording] num_speakers = {} is out of range: use 0 (let the sidecar decide) \
+                 to {}.",
+                recording.num_speakers,
+                crate::recording::NUM_SPEAKERS_MAX
+            )));
         }
 
         // Speaker separation by the backend needs a backend that labels
@@ -5190,6 +5242,7 @@ mod tests {
         for (value, want) in [
             ("auto", DiarizationMode::Auto),
             ("backend", DiarizationMode::Backend),
+            ("sidecar", DiarizationMode::Sidecar),
             ("off", DiarizationMode::Off),
         ] {
             let config: Config = toml::from_str(&format!(
@@ -5207,10 +5260,47 @@ mod tests {
             assert!(err.contains("diarization"), "{bad}: {err}");
         }
         // Known keys: no unknown-key warning.
+        assert!(unknown_config_keys(
+            "[recording]\ndiarization = \"off\"\nshared_mic = true\nnum_speakers = 2\n\
+             diarization_url = \"http://127.0.0.1:8770/diarize\"\n"
+        )
+        .is_empty());
+        assert_eq!(recording.num_speakers, 0);
+        assert_eq!(recording.diarization_url(), None);
+        let blank = RecordingConfig {
+            diarization_url: Some("  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(blank.diarization_url(), None, "blank is unset");
+    }
+
+    /// The sidecar's URL must be http(s), `sidecar` needs one, and the
+    /// number of voices is 0 to 20: each a config error, since the user
+    /// wrote it.
+    #[test]
+    fn diarization_sidecar_keys_are_validated() {
+        let check = |edit: fn(&mut RecordingConfig)| {
+            let mut config = validatable_config("groq");
+            config.recording = recording_config(edit);
+            config.validate().map(|_| ()).map_err(|e| e.to_string())
+        };
         assert!(
-            unknown_config_keys("[recording]\ndiarization = \"off\"\nshared_mic = true\n")
-                .is_empty()
+            check(|r| r.diarization_url = Some("http://127.0.0.1:8770/diarize".into())).is_ok()
         );
+        assert!(check(|r| {
+            r.diarization = DiarizationMode::Sidecar;
+            r.diarization_url = Some("https://diar.lan/diarize".into());
+        })
+        .is_ok());
+        let err = check(|r| r.diarization_url = Some("ws://127.0.0.1:8770".into())).unwrap_err();
+        assert!(err.contains("http:// or https://"), "{err}");
+        let err = check(|r| r.diarization_url = Some("127.0.0.1:8770/diarize".into())).unwrap_err();
+        assert!(err.contains("diarization_url"), "{err}");
+        let err = check(|r| r.diarization = DiarizationMode::Sidecar).unwrap_err();
+        assert!(err.contains("needs diarization_url"), "{err}");
+        assert!(check(|r| r.num_speakers = 20).is_ok());
+        let err = check(|r| r.num_speakers = 21).unwrap_err();
+        assert!(err.contains("num_speakers = 21"), "{err}");
     }
 
     /// `diarization = "backend"` with a backend that labels no speakers

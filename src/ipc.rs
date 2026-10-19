@@ -56,7 +56,8 @@ pub enum Command {
     /// `title` names a new recording (`start`/`toggle`); `id` selects an
     /// existing one (`retry`/`copy`). `options` (flat on the wire:
     /// `language`, `mic_language`, `system_language`, `others`,
-    /// `shared_mic`) set the languages and speaker settings of a new
+    /// `shared_mic`, `num_speakers`) set the languages and speaker settings
+    /// of a new
     /// recording or a retry and the label of the system track; a request
     /// without them gets the config defaults.
     Recording {
@@ -546,6 +547,7 @@ mod tests {
             system_language: Some("auto".to_string()),
             others: Some("Video".to_string()),
             shared_mic: Some(true),
+            num_speakers: Some(3),
         };
         let cmd = Command::Recording {
             action: RecordingAction::Start,
@@ -556,7 +558,7 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
             json,
-            r#"{"cmd":"recording","action":"start","title":"Lesson 50","language":"de","system_language":"auto","others":"Video","shared_mic":true}"#
+            r#"{"cmd":"recording","action":"start","title":"Lesson 50","language":"de","system_language":"auto","others":"Video","shared_mic":true,"num_speakers":3}"#
         );
         let parsed: Command = serde_json::from_str(&json).unwrap();
         assert!(
@@ -565,7 +567,7 @@ mod tests {
         );
 
         let retry: Command = serde_json::from_str(
-            r#"{"cmd":"recording","action":"retry","id":"last","mic_language":"en","shared_mic":false}"#,
+            r#"{"cmd":"recording","action":"retry","id":"last","mic_language":"en","shared_mic":false,"num_speakers":0}"#,
         )
         .unwrap();
         let Command::Recording {
@@ -584,6 +586,7 @@ mod tests {
             RecordingOptions {
                 mic_language: Some("en".to_string()),
                 shared_mic: Some(false),
+                num_speakers: Some(0),
                 ..Default::default()
             }
         );

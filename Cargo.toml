@@ -62,6 +62,9 @@ prompt-echo = { path = "crates/prompt-echo", version = "0.1" }
 xkb-type = { path = "crates/xkb-type", version = "0.1.4", features = ["arboard", "wayland-vk"] }
 async-trait = "0.1"
 base64 = "0.22"
+# Shares one upload buffer between the retries of a diarization sidecar
+# request. Already in the build through reqwest and hyper.
+bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 cpal = { version = "0.18", features = ["pulseaudio"] }

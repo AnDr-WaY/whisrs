@@ -29,6 +29,7 @@ use whisrs::recording::recorder::{
     is_disk_full, spawn_mic_writer, spawn_track_writer, SilenceAlarm, TrackStats,
     SILENCE_WARN_AFTER,
 };
+use whisrs::recording::speakers::separation_failure;
 use whisrs::recording::wav_repair::repair_wav;
 use whisrs::recording::{
     store, EndReason, NetworkWait, RecordingAction, RecordingMeta, RecordingOptions,
@@ -752,7 +753,8 @@ fn open_tracks(
 /// The meta of a recording that is starting: each track's language from
 /// `options` ([`RecordingOptions::language_for`]), else from the config
 /// ([`RecordingConfig::language_for`]), the label of the system track, and
-/// whether the mic is shared, from `options` else the config.
+/// whether the mic is shared and how many voices to look for, from
+/// `options` else the config.
 fn new_meta(
     id: String,
     title: Option<String>,
@@ -777,6 +779,7 @@ fn new_meta(
             .unwrap_or_else(|| DEFAULT_OTHERS_LABEL.to_string()),
     );
     meta.shared_mic = Some(options.shared_mic.unwrap_or(recording.shared_mic));
+    meta.num_speakers = Some(options.num_speakers.unwrap_or(recording.num_speakers));
     meta
 }
 
@@ -1368,9 +1371,9 @@ fn has_audio(dir: &Path, meta: &RecordingMeta) -> bool {
     !meta.audio_deleted && meta.tracks.iter().any(|t| dir.join(&t.file).exists())
 }
 
-/// Queue a recording for transcription again. The languages and
-/// `shared_mic` `options` give replace the stored ones (and are saved); the
-/// rest keep theirs.
+/// Queue a recording for transcription again. The languages,
+/// `shared_mic` and `num_speakers` `options` give replace the stored ones
+/// (and are saved); the rest keep theirs.
 async fn retry(
     context: &Arc<DaemonContext>,
     query: &str,
@@ -1515,10 +1518,7 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
         Ok(meta) => {
             let md = store::transcript_path(&dir, &meta.id);
             info!("recording {id} transcript ready: {}", md.display());
-            notify(
-                context,
-                &format!("Recording transcript ready: {}", md.display()),
-            );
+            notify(context, &ready_message(&md, &meta));
         }
         Err(e) if is_network_unavailable(&e) => {
             wait_for_network(context, &dir, &id, &format!("{e:#}")).await
@@ -1540,6 +1540,21 @@ async fn process_one(context: &Arc<DaemonContext>, item: QueuedRecording) {
     }
     context.recording.update(|v| v.processing = None);
     sweep(context).await;
+}
+
+/// The notification for a finished transcript at `md`. When its voices
+/// could not be told apart it says so and why: the transcript is fine, but
+/// not what speaker separation promised, and this is the one place the
+/// user hears of it (`recording.json` and the transcript's notes keep it).
+fn ready_message(md: &Path, meta: &RecordingMeta) -> String {
+    match separation_failure(meta) {
+        Some(why) => format!(
+            "Recording transcript ready, without speakers ({}): {}",
+            truncate_preview(why, NOTIFY_ERROR_MAX),
+            md.display()
+        ),
+        None => format!("Recording transcript ready: {}", md.display()),
+    }
 }
 
 /// Mark recording `id` as waiting for the network after an attempt could
@@ -2543,6 +2558,29 @@ mod tests {
         }
     }
 
+    /// The ready notification names a speaker separation that failed, once,
+    /// and stays as it was otherwise.
+    #[test]
+    fn the_ready_notification_says_when_speakers_were_not_separated() {
+        let md = Path::new("/r/m/m.md");
+        let mut meta = RecordingMeta::new("m".into(), None, Local::now());
+        assert_eq!(
+            ready_message(md, &meta),
+            "Recording transcript ready: /r/m/m.md"
+        );
+        meta.errors
+            .push("system audio missing: audio/system.wav".into());
+        meta.errors
+            .push(whisrs::recording::speakers::separation_note(
+                "the diarization sidecar failed on the system track: refused",
+            ));
+        assert_eq!(
+            ready_message(md, &meta),
+            "Recording transcript ready, without speakers (the diarization sidecar failed on \
+             the system track: refused): /r/m/m.md"
+        );
+    }
+
     /// What a start stores: each track's language from the command (its own,
     /// else `language`), else from `[recording]`, and the others label.
     #[test]
@@ -2580,8 +2618,12 @@ mod tests {
         assert_eq!(meta.others_label.as_deref(), Some("Others"));
         assert_eq!(meta.shared_mic, Some(false), "the config's");
 
-        let meta = stored(r#"{"cmd":"recording","action":"start","shared_mic":true}"#);
+        assert_eq!(meta.num_speakers, Some(0), "the config's");
+
+        let meta =
+            stored(r#"{"cmd":"recording","action":"start","shared_mic":true,"num_speakers":4}"#);
         assert_eq!(meta.shared_mic, Some(true));
+        assert_eq!(meta.num_speakers, Some(4));
     }
 
     /// `shared_mic` is stored at start from the config when the command
@@ -2640,6 +2682,8 @@ mod tests {
             ("start", r#""others":"   ""#),
             ("toggle", r#""others":"a\nb""#),
             ("retry", r#""language":"german""#),
+            ("start", r#""num_speakers":21"#),
+            ("retry", r#""num_speakers":99"#),
         ] {
             let cmd = format!(r#"{{"cmd":"recording","action":"{action}",{json}}}"#);
             let whisrs::Command::Recording {
@@ -2656,7 +2700,9 @@ mod tests {
                 panic!("{cmd} was accepted: {response:?}");
             };
             assert!(
-                message.starts_with("invalid language") || message.contains("others label"),
+                message.starts_with("invalid language")
+                    || message.contains("others label")
+                    || message.starts_with("num_speakers is"),
                 "{cmd}: {message}"
             );
         }

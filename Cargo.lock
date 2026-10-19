@@ -3817,6 +3817,7 @@ dependencies = [
  "async-trait",
  "audio-silence-gate",
  "base64",
+ "bytes",
  "chrono",
  "clap",
  "claxon",

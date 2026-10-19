@@ -335,6 +335,26 @@ impl TimeMap {
     }
 }
 
+impl TimeMap {
+    /// Condensed time `start_ms..end_ms` on the track's timeline: one span
+    /// per piece it overlaps, the part of it in that piece. What lies in a
+    /// gap (the digital silence of a join) or past the end is dropped, so a
+    /// span across a join becomes two, minutes apart on the track.
+    pub fn map_span(&self, start_ms: u64, end_ms: u64) -> Vec<(u64, u64)> {
+        let (start, end) = (ms_to_samples(start_ms), ms_to_samples(end_ms));
+        self.pieces
+            .iter()
+            .filter_map(|p| {
+                let (lo, hi) = (start.max(p.condensed), end.min(p.condensed + p.len));
+                (lo < hi).then(|| {
+                    let to_track = |at: usize| samples_to_ms(p.original + (at - p.condensed));
+                    (to_track(lo), to_track(hi))
+                })
+            })
+            .collect()
+    }
+}
+
 /// `words` joined the way the backend's own `text` joins them: with a
 /// space, or with none where the text runs two of them together, or holds
 /// no space at all (Chinese, Japanese).
@@ -686,6 +706,22 @@ mod tests {
             "用whisrs开会"
         );
         assert_eq!(join_words("Yeah, so", ["yeah", "so"]), "yeah so");
+    }
+
+    /// A span is mapped piece by piece: the part on a join's silence is
+    /// dropped, and a span across a join becomes one per piece.
+    #[test]
+    fn spans_map_piece_by_piece() {
+        let map = two_pieces();
+        // Inside the first piece (track 0.5 s on).
+        assert_eq!(map.map_span(200, 900), [(700, 1400)]);
+        // Across the join: the end of the first piece, the start of the
+        // second (track 60 s on); the gap between is dropped.
+        assert_eq!(map.map_span(1500, 3500), [(2000, 2500), (60_000, 60_500)]);
+        // Wholly on the silence, or past the end.
+        assert!(map.map_span(2100, 2900).is_empty());
+        assert!(map.map_span(5100, 6000).is_empty());
+        assert!(map.map_span(800, 800).is_empty(), "empty");
     }
 
     #[test]

@@ -4,14 +4,17 @@
 //! (`me`) and the system audio is everyone else (`others`, named by the
 //! recording's others label). With it ([`plan`]), the voices on the system
 //! track, and with `shared_mic` those on the mic, are told apart. Every word
-//! takes a voice label from the backend, a segment splits where its words
-//! change voice ([`split_segment`]), and once both tracks are transcribed the
-//! voices become speakers, numbered by first appearance ([`assign`]).
+//! takes a voice label, from the backend or from the turns of a diarization
+//! sidecar ([`super::diarize`], aligned by [`speaker_at`]), a segment splits
+//! where its words change voice ([`split_segment`]), and once both tracks
+//! are transcribed the voices become speakers, numbered by first appearance
+//! ([`assign`]).
 //!
 //! Nothing is guessed: a voice is named only when the track says who it is
 //! (a single remote voice keeps the others label, a single mic voice is the
 //! user); every other voice is `Speaker N`.
 
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::speech::join_words;
@@ -49,6 +52,23 @@ pub const SOURCE_CHANNEL: &str = "channel";
 /// [`Speaker::source`] of an unnamed speaker, shown as `Speaker N`.
 pub const SOURCE_NONE: &str = "none";
 
+/// A word this far from every turn of a diarization sidecar, or nearer,
+/// takes the nearest one ([`speaker_at`]).
+pub const NEAREST_TURN_MS: u64 = 1000;
+
+/// Start of the note `recording.json` keeps in `errors` when the voices
+/// could not be told apart ([`separation_failure`]).
+pub const SEPARATION_FAILED: &str = "speakers were not separated: ";
+
+/// One stretch of one voice, from a diarization sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Turn {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// The sidecar's label, consistent within one track.
+    pub speaker: String,
+}
+
 /// How the voices of a recording are told apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Method {
@@ -59,6 +79,10 @@ pub enum Method {
     /// is whether the request has to ask for it
     /// ([`crate::transcription::TranscriptionConfig::diarize`]).
     Backend { label: String, request: bool },
+    /// A diarization sidecar at `url` (`[recording] diarization_url`) finds
+    /// the turns of each voice, and the words are aligned to them. `label`
+    /// is `sidecar:<host>`.
+    Sidecar { url: String, label: String },
 }
 
 impl Method {
@@ -66,7 +90,25 @@ impl Method {
     pub fn label(&self) -> &str {
         match self {
             Method::Off => "off",
-            Method::Backend { label, .. } => label,
+            Method::Backend { label, .. } | Method::Sidecar { label, .. } => label,
+        }
+    }
+
+    /// The sidecar method for `url`, labelled by its host (and port).
+    pub fn sidecar(url: &str) -> Method {
+        let host = reqwest::Url::parse(url).ok().and_then(|u| {
+            let host = u.host_str()?.to_string();
+            Some(match u.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        });
+        Method::Sidecar {
+            url: url.to_string(),
+            label: match host {
+                Some(host) => format!("sidecar:{host}"),
+                None => "sidecar".to_string(),
+            },
         }
     }
 }
@@ -114,19 +156,33 @@ pub fn backend_speakers(name: &str, config: &Config) -> Option<Method> {
 }
 
 /// How a recording transcribed with backend `backend` finds its speakers,
-/// from `[recording] diarization`: `backend` when the backend labels
-/// speakers ([`backend_speakers`]), `off` when it cannot or when asked to.
-/// `auto` is Deepgram's speakers on Deepgram, and `off` on every other
-/// backend.
+/// from `[recording] diarization`: `sidecar` asks the diarization sidecar
+/// at `diarization_url`, `backend` takes the speakers the backend labels
+/// ([`backend_speakers`]), `off` keeps one speaker per track, as does a
+/// mode that cannot work. `auto` is the sidecar when `diarization_url` is
+/// set (a sidecar set up is a sidecar wanted), else Deepgram's speakers on
+/// Deepgram, else `off`.
 pub fn plan(config: &Config, backend: &str, shared_mic: bool) -> SpeakerPlan {
     let recording = RecordingConfig::effective(config);
+    let url = recording.diarization_url();
     let method = match recording.diarization {
         DiarizationMode::Off => Method::Off,
-        DiarizationMode::Auto => match canonical_backend_name(backend) {
-            "deepgram" | "deepgram-streaming" => {
+        DiarizationMode::Auto => match (url, canonical_backend_name(backend)) {
+            (Some(url), _) => Method::sidecar(url),
+            (None, "deepgram" | "deepgram-streaming") => {
                 backend_speakers(backend, config).unwrap_or(Method::Off)
             }
             _ => Method::Off,
+        },
+        DiarizationMode::Sidecar => match url {
+            Some(url) => Method::sidecar(url),
+            None => {
+                warn!(
+                    "[recording] diarization = \"sidecar\" without a diarization_url; each \
+                     track stays one speaker"
+                );
+                Method::Off
+            }
         },
         DiarizationMode::Backend => match backend_speakers(backend, config) {
             Some(method) => method,
@@ -142,20 +198,69 @@ pub fn plan(config: &Config, backend: &str, shared_mic: bool) -> SpeakerPlan {
     SpeakerPlan { method, shared_mic }
 }
 
+/// The note for `recording.json` `errors` when the voices could not be
+/// told apart for `why`.
+pub fn separation_note(why: &str) -> String {
+    format!("{SEPARATION_FAILED}{why}")
+}
+
+/// Why the voices of a processed recording could not be told apart, when
+/// they could not ([`separation_note`]).
+pub fn separation_failure(meta: &super::RecordingMeta) -> Option<&str> {
+    meta.errors
+        .iter()
+        .find_map(|note| note.strip_prefix(SEPARATION_FAILED))
+}
+
+/// The voice of the turn overlapping `start_ms..end_ms` most, else of the
+/// nearest turn no more than [`NEAREST_TURN_MS`] away, else none. A span of
+/// no length overlaps nothing and goes by distance (0 inside a turn).
+/// Earlier turns win ties.
+pub fn speaker_at(turns: &[Turn], start_ms: u64, end_ms: u64) -> Option<&str> {
+    let end_ms = end_ms.max(start_ms);
+    let mut best: Option<(&Turn, u64)> = None;
+    for turn in turns {
+        let overlap = end_ms
+            .min(turn.end_ms)
+            .saturating_sub(start_ms.max(turn.start_ms));
+        if overlap > 0 && best.is_none_or(|(_, most)| overlap > most) {
+            best = Some((turn, overlap));
+        }
+    }
+    if let Some((turn, _)) = best {
+        return Some(&turn.speaker);
+    }
+    let mut nearest: Option<(&Turn, u64)> = None;
+    for turn in turns {
+        // The gap between the two, 0 when they touch or overlap.
+        let distance = start_ms
+            .saturating_sub(turn.end_ms)
+            .max(turn.start_ms.saturating_sub(end_ms));
+        if distance <= NEAREST_TURN_MS && nearest.is_none_or(|(_, least)| distance < least) {
+            nearest = Some((turn, distance));
+        }
+    }
+    nearest.map(|(turn, _)| turn.speaker.as_str())
+}
+
 /// Where a track's voice labels come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Labels {
+pub enum Labels<'a> {
     /// Its voices are not told apart: labels are dropped.
     None,
     /// The labels the backend put on words and segments.
     Backend,
+    /// The turns a diarization sidecar found, on the track's timeline
+    /// ([`speaker_at`]).
+    Turns(&'a [Turn]),
 }
 
-impl Labels {
+impl Labels<'_> {
     fn of_segment(&self, seg: &Segment) -> Option<String> {
         match self {
             Labels::None => None,
             Labels::Backend => seg.speaker.clone(),
+            Labels::Turns(turns) => speaker_at(turns, seg.start_ms, seg.end_ms).map(str::to_string),
         }
     }
 
@@ -163,6 +268,9 @@ impl Labels {
         match self {
             Labels::None => None,
             Labels::Backend => word.speaker.clone(),
+            Labels::Turns(turns) => {
+                speaker_at(turns, word.start_ms, word.end_ms).map(str::to_string)
+            }
         }
     }
 }
@@ -185,9 +293,10 @@ fn fill_gaps(labels: &mut [Option<String>]) {
 /// `seg` with each part labelled by its voice: split where its words change
 /// voice, each part keeping its words. The parts keep the backend's
 /// punctuated text when it has one token per word, else they join the
-/// words' own text ([`join_words`]). A segment without word timings takes
-/// the segment's own label. Labels are dropped with [`Labels::None`].
-pub fn split_segment(mut seg: Segment, labels: Labels) -> Vec<Segment> {
+/// words' own text ([`join_words`]). A segment without word timings (local
+/// whisper) takes the segment's own label: the backend's, or the turn it
+/// overlaps most. Labels are dropped with [`Labels::None`].
+pub fn split_segment(mut seg: Segment, labels: Labels<'_>) -> Vec<Segment> {
     if labels == Labels::None {
         seg.speaker = None;
         for word in seg.words.iter_mut().flatten() {
@@ -560,6 +669,69 @@ mod tests {
             .all(|w| w.speaker.is_none()));
     }
 
+    fn turn(start_ms: u64, end_ms: u64, speaker: &str) -> Turn {
+        Turn {
+            start_ms,
+            end_ms,
+            speaker: speaker.into(),
+        }
+    }
+
+    /// A word takes the turn it overlaps most, else the nearest within a
+    /// second, else none.
+    #[test]
+    fn words_take_the_turn_they_overlap_most_else_the_nearest() {
+        let turns = [
+            turn(0, 2000, "A"),
+            turn(1800, 4000, "B"),
+            turn(6000, 8000, "A"),
+        ];
+        assert_eq!(speaker_at(&turns, 500, 900), Some("A"));
+        // 300 ms in A, 500 ms in B; on a tie, the earlier turn.
+        assert_eq!(speaker_at(&turns, 1700, 2300), Some("B"));
+        assert_eq!(speaker_at(&turns, 1700, 2100), Some("A"));
+        // In the gap: B ends 500 ms before, A starts 1500 ms after.
+        assert_eq!(speaker_at(&turns, 4500, 4600), Some("B"));
+        // 1000 ms from B and from the next A: the earlier turn wins a tie.
+        assert_eq!(speaker_at(&turns, 5000, 5000), Some("B"));
+        // 900 ms from B, 1000 ms from A... then 1100 from B, 900 from A.
+        assert_eq!(speaker_at(&turns, 4900, 5000), Some("B"));
+        assert_eq!(speaker_at(&turns, 5100, 5100), Some("A"));
+        // More than a second from every turn.
+        assert_eq!(speaker_at(&turns, 9100, 9500), None);
+        assert_eq!(speaker_at(&[], 0, 100), None);
+        // A point inside a turn.
+        assert_eq!(speaker_at(&turns, 7000, 7000), Some("A"));
+    }
+
+    /// A segment splits where its words cross from one turn to another; a
+    /// segment without words takes the turn it overlaps most; one far from
+    /// every turn keeps no voice.
+    #[test]
+    fn segments_split_at_the_sidecars_turns() {
+        let turns = [turn(0, 2000, "SPEAKER_00"), turn(2000, 5000, "SPEAKER_01")];
+        let mut s = seg(500, 3500, "Ready? Yes, go.", None);
+        s.words = Some(vec![
+            word(500, 1200, "ready", None),
+            word(2200, 2600, "yes", None),
+            word(2700, 3500, "go", None),
+        ]);
+        let out = split_segment(s, Labels::Turns(&turns));
+        assert_eq!(
+            lines(&out),
+            [
+                (500, 1200, "Ready?", Some("SPEAKER_00")),
+                (2200, 3500, "Yes, go.", Some("SPEAKER_01")),
+            ]
+        );
+
+        // Local whisper: no words, so the whole segment goes by overlap.
+        let out = split_segment(seg(1500, 4000, "yes go", None), Labels::Turns(&turns));
+        assert_eq!(lines(&out), [(1500, 4000, "yes go", Some("SPEAKER_01"))]);
+        let out = split_segment(seg(9000, 9500, "late", None), Labels::Turns(&turns));
+        assert_eq!(lines(&out), [(9000, 9500, "late", None)]);
+    }
+
     fn config(text: &str) -> Config {
         toml::from_str(text).unwrap()
     }
@@ -596,6 +768,48 @@ mod tests {
                 "{line:?} {backend}"
             );
         }
+
+        // A sidecar that is set up wins `auto`, whatever the backend; one
+        // that is not leaves `sidecar` off.
+        let url = "diarization_url = \"http://127.0.0.1:8770/diarize\"";
+        let sidecar = Method::Sidecar {
+            url: "http://127.0.0.1:8770/diarize".into(),
+            label: "sidecar:127.0.0.1:8770".into(),
+        };
+        for (line, backend, want) in [
+            (url.to_string(), "deepgram", sidecar.clone()),
+            (url.to_string(), "local-whisper", sidecar.clone()),
+            (
+                format!("{url}\ndiarization = \"sidecar\""),
+                "groq",
+                sidecar.clone(),
+            ),
+            (
+                format!("{url}\ndiarization = \"backend\""),
+                "deepgram",
+                deepgram.clone(),
+            ),
+            (
+                format!("{url}\ndiarization = \"off\""),
+                "deepgram",
+                Method::Off,
+            ),
+            ("diarization = \"sidecar\"".to_string(), "groq", Method::Off),
+        ] {
+            let cfg = config(&format!("[recording]\n{line}\n"));
+            assert_eq!(
+                plan(&cfg, backend, false).method,
+                want,
+                "{line:?} {backend}"
+            );
+        }
+        assert_eq!(
+            Method::sidecar("https://diar.lan/x").label(),
+            "sidecar:diar.lan"
+        );
+        // The sidecar never makes the transcription request ask.
+        let cfg = config(&format!("[recording]\n{url}\n"));
+        assert!(!plan(&cfg, "deepgram", true).requests_speakers(TrackKind::System));
         let whisper = config("[deepgram]\napi_key = \"k\"\nmodel = \"whisper-large\"\n");
         assert_eq!(plan(&whisper, "deepgram", false).method, Method::Off);
 

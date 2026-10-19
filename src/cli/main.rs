@@ -124,6 +124,7 @@ impl LanguageArgs {
             system_language: self.system_language,
             others,
             shared_mic: speakers.shared_mic,
+            num_speakers: speakers.num_speakers,
         }
     }
 }
@@ -142,6 +143,14 @@ struct SpeakerArgs {
         default_missing_value = "true"
     )]
     shared_mic: Option<bool>,
+    /// How many voices the diarization sidecar should find on the system
+    /// audio (on your mic when there is no system audio); 0 lets it decide
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(0..=i64::from(whisrs::recording::NUM_SPEAKERS_MAX))
+    )]
+    num_speakers: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -850,6 +859,7 @@ mod tests {
             system_language: Some("auto".into()),
             others: Some("Video".into()),
             shared_mic: None,
+            num_speakers: None,
         };
         for action in ["start", "toggle"] {
             let cmd = parse_recording(&[
@@ -961,6 +971,32 @@ mod tests {
                 assert_eq!(speakers.shared_mic, Some(true));
             }
             _ => panic!("expected retry"),
+        }
+    }
+
+    /// `--num-speakers` takes 0 (let the sidecar decide) to 20 on `start`,
+    /// `toggle` and `retry`, and reaches the options sent to the daemon.
+    #[test]
+    fn recording_num_speakers_parses() {
+        for head in [&["start"][..], &["toggle"], &["retry", "last"]] {
+            for (value, want) in [("0", 0), ("3", 3), ("20", 20)] {
+                let mut args = head.to_vec();
+                args.extend_from_slice(&["--num-speakers", value]);
+                let speakers = match parse_recording(&args) {
+                    RecordingCmd::Start { speakers, .. }
+                    | RecordingCmd::Toggle { speakers, .. }
+                    | RecordingCmd::Retry { speakers, .. } => speakers,
+                    _ => panic!("expected start, toggle or retry"),
+                };
+                let options = LanguageArgs::default().into_options(None, speakers);
+                assert_eq!(options.num_speakers, Some(want), "{args:?}");
+            }
+            for bad in ["21", "-1", "two"] {
+                let mut argv = vec!["whisrs", "recording"];
+                argv.extend_from_slice(head);
+                argv.extend_from_slice(&["--num-speakers", bad]);
+                assert!(Cli::try_parse_from(argv).is_err(), "{head:?} {bad}");
+            }
         }
     }
 

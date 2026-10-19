@@ -414,7 +414,10 @@ max_duration_minutes = 180    # recording stops by itself after this long (1 to 
 audio_retention_days = 7      # 0 = delete audio once transcribed, negative = keep forever
 # dir = "~/Recordings"        # default: ~/.local/share/whisrs/recordings
 # diarization = "auto"        # tell apart the voices on the system audio (see "Speakers"
-#                             #   below): "auto" (Deepgram does it), "backend" or "off"
+#                             #   below): "auto" (the sidecar below when set, else
+#                             #   Deepgram), "backend", "sidecar" or "off"
+# diarization_url = "http://127.0.0.1:8770/diarize"  # a diarization sidecar (local server)
+# num_speakers = 0            # voices the sidecar should find; 0 = let it decide (0 to 20)
 # shared_mic = false          # several people share your mic: tell its voices apart too
 
 # Built-in global hotkeys (optional, works without WM keybinds)
@@ -597,9 +600,11 @@ label.
 `diarization = "backend"` takes the speakers the transcription backend labels:
 Deepgram (`diarize_model=latest`, sent only with the recording's own
 requests, never with dictation) or an `asr-sidecar` that returns
-`segments[].speaker`. `"auto"` (the default) does this with Deepgram and
-keeps one speaker per track with every other backend. `"off"` always keeps
-one speaker per track. Deepgram includes speaker separation in its
+`segments[].speaker`. `diarization = "sidecar"` asks a diarization sidecar at
+`diarization_url` (see below) while any backend transcribes the words.
+`"auto"` (the default) uses the sidecar when `diarization_url` is set, else
+Deepgram's speakers with Deepgram, and keeps one speaker per track with every
+other backend. `"off"` always keeps one speaker per track. Deepgram includes speaker separation in its
 pre-recorded price, but not with its Whisper models: with one of those as
 `[deepgram] model`, each track stays one speaker. A backend labels voices
 per request, so a track sent as several chunks has its voices told apart per
@@ -613,6 +618,42 @@ In an in-person meeting where several people share your mic, set
 then told apart too (`M1`, `M2`, ...), and the mic is you only when it holds
 a single voice. A recording keeps the `shared_mic` it started with; a retry
 given the option replaces it.
+
+**A diarization sidecar.** A local server that only finds who speaks when,
+so speakers can be told apart offline or with a backend that cannot do it
+(Groq, OpenAI, `local-whisper`). whisrs sends it each separated track once,
+as the speech only (the silences cut out, as for transcription), and lines up
+the transcript's words with the turns it returns: each word takes the turn it
+overlaps most, else the nearest one within a second. A line whose words fall
+in two turns is split between them; a line without word timings
+(`local-whisper`) takes the turn it overlaps most. The contract:
+
+```
+POST {diarization_url}   multipart form: file = the track's speech as a 16 kHz mono WAV,
+                         num_speakers = N (only when N > 0)
+200 {"segments": [{"start": 1.20, "end": 4.85, "speaker": "SPEAKER_00"}]}
+```
+
+`start` and `end` are seconds into the WAV, and `speaker` is a string or a
+number that only has to be consistent within one request. `num_speakers`
+(or `--num-speakers N` on `start`, `toggle` and `retry`, 0 to 20) tells the
+sidecar how many voices the system audio holds, or your mic when the
+recording has no system audio; 0, the default, lets the sidecar decide. A
+recording keeps the number it started with, and a retry given the option
+replaces it.
+
+whisrs waits for the sidecar's answer for twice the length of the speech it
+sent, and at least 10 minutes. A sidecar that cannot be reached is tried
+again like a transcript chunk (5, 15, 30 and 60 seconds apart). The
+sidecar's own error (HTTP 500), a crash on the request, no answer in time and
+an answer that does not follow the contract are not retried. Whatever
+fails, the recording does not: its transcript is written with one speaker
+per track, as with `"off"`, `recording.json` notes why under `errors` (the
+transcript's notes show it too), and the notification that the transcript
+is ready says it has no speakers. The voices the sidecar found are kept in
+the recording's `.cache/` folder after the transcript is written, so a retry
+with the same sidecar, number of voices and audio reuses them instead of
+asking again; they are deleted with the audio.
 
 **Languages.** Each track is transcribed in its own language. `language`
 defaults to `[general] language`, and `mic_language` and `system_language`
@@ -760,8 +801,9 @@ such as a 524 timeout on a long upload) is retried three times, 5, 15 and 30
 seconds apart, except a 500 from `asr-sidecar`, which is usually an error in
 the sidecar itself. Each finished chunk is saved in the recording's `.cache/`
 folder, so a retry after a failure only sends what was not transcribed yet.
-The cache is deleted once the transcript is written, so a retry of a finished
-recording sends both tracks again.
+The chunks are deleted once the transcript is written, so a retry of a
+finished recording sends both tracks again (a diarization sidecar's voices
+stay, see "Speakers").
 
 **No network.** A chunk that gets no answer at all (no network, a name that
 does not resolve, a refused or dropped connection, a TLS error) is retried 5,

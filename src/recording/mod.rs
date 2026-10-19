@@ -5,6 +5,7 @@
 //! [`store`]): `recording.json` holds [`RecordingMeta`], `audio/` holds one WAV
 //! per track, and `<id>.md` is the rendered transcript.
 
+pub mod diarize;
 pub mod echo;
 pub mod process;
 pub mod recorder;
@@ -28,6 +29,21 @@ pub const DEFAULT_OTHERS_LABEL: &str = "Others";
 /// Longest label of the system track (`--others`), in characters.
 pub const OTHERS_LABEL_MAX: usize = 64;
 
+/// Most voices a recording may ask the diarization sidecar to find
+/// (`--num-speakers`, `[recording] num_speakers`).
+pub const NUM_SPEAKERS_MAX: u32 = 20;
+
+/// Check `--num-speakers`: 0 (let the sidecar decide) to
+/// [`NUM_SPEAKERS_MAX`].
+pub fn validate_num_speakers(n: u32) -> Result<u32, String> {
+    if n > NUM_SPEAKERS_MAX {
+        return Err(format!(
+            "num_speakers is {n}: use 0 (let the sidecar decide) to {NUM_SPEAKERS_MAX}"
+        ));
+    }
+    Ok(n)
+}
+
 /// Validate and normalize the label of the system track (`--others`):
 /// trimmed, non-empty, one line, at most [`OTHERS_LABEL_MAX`] characters.
 pub fn validate_others_label(label: &str) -> Result<String, String> {
@@ -48,9 +64,10 @@ pub fn validate_others_label(label: &str) -> Result<String, String> {
 }
 
 /// Per-recording settings a `recording` command may carry, all optional.
-/// The languages and `shared_mic` apply to `start`, a `toggle` that starts,
-/// and `retry`; `others` to `start` and `toggle`. What is left out keeps the
-/// config default, or for a retry what the recording stored.
+/// The languages, `num_speakers` and `shared_mic` apply to `start`, a
+/// `toggle` that starts, and `retry`; `others` to `start` and `toggle`. What
+/// is left out keeps the config default, or for a retry what the recording
+/// stored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingOptions {
     /// Language of both tracks.
@@ -69,6 +86,10 @@ pub struct RecordingOptions {
     /// (`[recording] shared_mic`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_mic: Option<bool>,
+    /// How many voices the diarization sidecar should find; 0 lets it
+    /// decide (`[recording] num_speakers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_speakers: Option<u32>,
 }
 
 impl RecordingOptions {
@@ -85,6 +106,7 @@ impl RecordingOptions {
             system_language: language(self.system_language)?,
             others: self.others.map(|o| validate_others_label(&o)).transpose()?,
             shared_mic: self.shared_mic,
+            num_speakers: self.num_speakers.map(validate_num_speakers).transpose()?,
         })
     }
 
@@ -320,6 +342,12 @@ pub struct RecordingMeta {
     /// this was stored, until processing fills it from the config.
     #[serde(default)]
     pub shared_mic: Option<bool>,
+    /// How many voices the diarization sidecar is asked to find, 0 to let
+    /// it decide. Set at start (a retry may change it); `None` in a
+    /// recording made before this was stored, until processing fills it
+    /// from the config.
+    #[serde(default)]
+    pub num_speakers: Option<u32>,
     /// How the voices were told apart, set by processing: `"off"`, or the
     /// method and model, e.g. `"deepgram:latest"`. `None` in a recording
     /// processed before speakers were separated.
@@ -379,6 +407,7 @@ impl RecordingMeta {
             system_language: None,
             others_label: None,
             shared_mic: None,
+            num_speakers: None,
             diarization: None,
             backend: None,
             model: None,
@@ -422,11 +451,29 @@ impl RecordingMeta {
     }
 
     /// Replace what a retry's `options` give: the languages
-    /// ([`Self::apply_languages`]) and `shared_mic`. The rest keep theirs.
+    /// ([`Self::apply_languages`]), `shared_mic` and `num_speakers`. The
+    /// rest keep theirs.
     pub fn apply_options(&mut self, options: &RecordingOptions) {
         self.apply_languages(options);
         if let Some(shared) = options.shared_mic {
             self.shared_mic = Some(shared);
+        }
+        if let Some(n) = options.num_speakers {
+            self.num_speakers = Some(n);
+        }
+    }
+
+    /// How many voices the diarization sidecar is asked to find on track
+    /// `kind`: the stored `num_speakers` on the system track, and on the mic
+    /// only when the recording has no system track (an in-person meeting),
+    /// since the people on a call and those in the room are not counted
+    /// together. 0 lets the sidecar decide.
+    pub fn num_speakers_for(&self, kind: TrackKind) -> u32 {
+        let has_system = self.tracks.iter().any(|t| t.kind == TrackKind::System);
+        match kind {
+            TrackKind::System => self.num_speakers.unwrap_or(0),
+            TrackKind::Mic if !has_system => self.num_speakers.unwrap_or(0),
+            TrackKind::Mic => 0,
         }
     }
 
@@ -480,6 +527,7 @@ mod tests {
         meta.system_language = Some("auto".into());
         meta.others_label = Some("Video".into());
         meta.shared_mic = Some(true);
+        meta.num_speakers = Some(3);
         meta.diarization = Some("deepgram:latest".into());
         meta.speakers = vec![Speaker {
             id: "S1".into(),
@@ -517,6 +565,7 @@ mod tests {
         assert_eq!(meta.network_wait, None);
         assert_eq!(meta.network_deadline(), None);
         assert_eq!(meta.shared_mic, None);
+        assert_eq!(meta.num_speakers, None);
         assert_eq!(meta.diarization, None);
     }
 
@@ -549,8 +598,30 @@ mod tests {
         );
     }
 
-    /// A retry replaces the languages and `shared_mic` it gives and keeps
-    /// the rest.
+    /// The number of voices goes to the system track, and to the mic only
+    /// in a recording without system audio.
+    #[test]
+    fn num_speakers_go_to_one_track() {
+        let mut meta = RecordingMeta::new("m".into(), None, Local::now());
+        meta.num_speakers = Some(3);
+        let track = |kind| TrackMeta {
+            kind,
+            file: String::new(),
+            device: String::new(),
+            offset_ms: 0,
+            samples: 0,
+        };
+        meta.tracks = vec![track(TrackKind::Mic)];
+        assert_eq!(meta.num_speakers_for(TrackKind::Mic), 3, "mic only");
+        meta.tracks.push(track(TrackKind::System));
+        assert_eq!(meta.num_speakers_for(TrackKind::Mic), 0);
+        assert_eq!(meta.num_speakers_for(TrackKind::System), 3);
+        meta.num_speakers = None;
+        assert_eq!(meta.num_speakers_for(TrackKind::System), 0);
+    }
+
+    /// A retry replaces the languages, `shared_mic` and `num_speakers` it
+    /// gives and keeps the rest.
     #[test]
     fn retry_options_replace_what_they_give() {
         let mut meta = RecordingMeta::new("m".into(), None, Local::now());
@@ -564,10 +635,14 @@ mod tests {
         assert_eq!(meta.shared_mic, Some(true), "kept");
         meta.apply_options(&RecordingOptions {
             shared_mic: Some(false),
+            num_speakers: Some(4),
             ..Default::default()
         });
         assert_eq!(meta.shared_mic, Some(false));
+        assert_eq!(meta.num_speakers, Some(4));
         assert_eq!(meta.language(TrackKind::Mic), Some("de"), "kept");
+        meta.apply_options(&RecordingOptions::default());
+        assert_eq!(meta.num_speakers, Some(4), "kept");
     }
 
     /// A waiting recording gives up a day after its first failed try,
@@ -598,6 +673,7 @@ mod tests {
             system_language: Some("Auto".into()),
             others: Some("  Video  ".into()),
             shared_mic: Some(true),
+            num_speakers: Some(NUM_SPEAKERS_MAX),
         }
         .validated()
         .unwrap();
@@ -609,6 +685,7 @@ mod tests {
                 system_language: Some("auto".into()),
                 others: Some("Video".into()),
                 shared_mic: Some(true),
+                num_speakers: Some(NUM_SPEAKERS_MAX),
             }
         );
         assert_eq!(
@@ -648,6 +725,14 @@ mod tests {
         }
         let longest = "é".repeat(OTHERS_LABEL_MAX);
         assert_eq!(validate_others_label(&longest), Ok(longest.clone()));
+        // The daemon refuses a number of voices the CLI would not send.
+        let err = RecordingOptions {
+            num_speakers: Some(NUM_SPEAKERS_MAX + 1),
+            ..Default::default()
+        }
+        .validated()
+        .unwrap_err();
+        assert!(err.contains("num_speakers is 21"), "{err}");
     }
 
     /// A track's own language wins over `language`, which covers the

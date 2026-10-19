@@ -38,7 +38,7 @@ whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
 whisrs config    # interactive config editor
-whisrs recording start [-t TITLE] [--shared-mic] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
+whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
 whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id>
 
 # Dev loop: rebuild this checkout and restart the daemon
@@ -74,7 +74,8 @@ src/
 │   ├── echo.rs             #   Remove speaker echo from the mic track (system track as reference)
 │   ├── speech.rs           #   Speech regions, condensed chunks + time maps, segments mapped back
 │   ├── process.rs          #   Echo-cancel, send the speech, transcribe (cached, rate-limit retry), merge, write
-│   ├── speakers.rs         #   Speaker separation: plan, split segments by voice, ids by first appearance
+│   ├── speakers.rs         #   Speaker separation: plan, align words to voices, ids by first appearance
+│   ├── diarize.rs          #   Diarization sidecar client (contract, timeout, retries)
 │   ├── split.rs            #   Cut long tracks into backend-sized chunks at silence
 │   └── render.rs           #   Markdown transcript rendering
 ├── audio/
@@ -221,9 +222,10 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
 {"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy", "title": "...", "id": "...",
  "language": "de", "mic_language": "de", "system_language": "auto", "others": "Video",
- "shared_mic": true}
+ "shared_mic": true, "num_speakers": 3}
                                      // all but action optional: title (start/toggle), id (retry/copy,
-                                     // default "last"), the languages and shared_mic (start/toggle/retry;
+                                     // default "last"), the languages, shared_mic and num_speakers
+                                     // (start/toggle/retry;
                                      // a track's own language wins over "language"), others = system track
                                      // label (start/toggle). Validated by the daemon
                                      // (RecordingOptions::validated)
@@ -248,10 +250,12 @@ Word replacements: the top-level `[replacements]` table (`"package build" = "PKG
 
 Recording (mic + system audio, transcribed after the stop): the `[recording]` section (`backend`,
 `user_name`, `language`, `mic_language`, `system_language`, `mic_device`, `system_device`,
-`max_duration_minutes`, `audio_retention_days`, `dir`, `diarization`, `shared_mic`)
+`max_duration_minutes`, `audio_retention_days`, `dir`, `diarization`, `diarization_url`,
+`num_speakers`, `shared_mic`)
 plus `[hotkeys] recording`. Recordings live in `~/.local/share/whisrs/recordings/<id>/`
 (`recording.json`, `<id>.md`, `audio/`, and a `.cache/` of finished chunks kept until the
-transcript is written or the audio is deleted). The recording backend
+transcript is written or the audio is deleted; a diarization sidecar's voices stay until the
+audio is deleted). The recording backend
 must be file-capable, a backend that can transcribe a recorded file: groq, openai, deepgram,
 asr-sidecar or local-whisper (`deepgram-streaming` maps to `deepgram`; realtime backends are
 refused).

@@ -26,9 +26,10 @@ use prompt_echo::is_prompt_echo;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use super::diarize::{DiarizationSidecar, Timing};
 use super::echo::{cancel_echo, EchoOutcome};
 use super::render::render_markdown;
-use super::speakers::{self, Labels};
+use super::speakers::{self, Labels, Method, Turn};
 use super::speech::{self, TimeMap};
 use super::split::frame_len;
 use super::store::{self, CACHE_DIR};
@@ -71,6 +72,17 @@ pub async fn process_recording(
     dir: &Path,
     config: &Config,
     dictation_backend: Option<Arc<dyn TranscriptionBackend>>,
+) -> anyhow::Result<RecordingMeta> {
+    process_with_timing(dir, config, dictation_backend, Timing::default()).await
+}
+
+/// [`process_recording`] with the diarization sidecar's waits given, so a
+/// test need not sit through its retries and timeout.
+async fn process_with_timing(
+    dir: &Path,
+    config: &Config,
+    dictation_backend: Option<Arc<dyn TranscriptionBackend>>,
+    sidecar_timing: Timing,
 ) -> anyhow::Result<RecordingMeta> {
     let mut meta = store::read_meta(dir)?;
     meta.status = RecordingState::Processing;
@@ -172,7 +184,7 @@ pub async fn process_recording(
             kind: track.kind,
             near_end,
         };
-        let segments = transcribe_track(backend.as_ref(), &request.tcfg, track_cache, &job)
+        let speech = transcribe_track(backend.as_ref(), &request.tcfg, track_cache, &job)
             .await
             .with_context(|| {
                 format!("failed to transcribe the {} track", track.kind.file_stem())
@@ -182,27 +194,70 @@ pub async fn process_recording(
             meta.id,
             track.kind.file_stem(),
             request.tcfg.language,
-            segments.len()
+            speech.segments.len()
         );
         transcribed.push(Transcribed {
             kind: track.kind,
             offset_ms: track.offset_ms,
-            segments,
+            path,
+            speech,
+            turns: Vec::new(),
         });
     }
     if readable_tracks == 0 {
         bail!("no recorded audio found for recording {}", meta.id);
     }
 
+    // A note from an earlier attempt goes; this attempt adds its own.
+    meta.errors
+        .retain(|note| !note.starts_with(speakers::SEPARATION_FAILED));
+    let mut plan = plan;
+    if let Method::Sidecar { url, .. } = &plan.method {
+        let sidecar = DiarizationSidecar::new(url, sidecar_timing);
+        let cache_dir = dir.join(CACHE_DIR);
+        let mut failure = None;
+        for track in transcribed.iter_mut() {
+            if !plan.separates(track.kind) || track.speech.segments.is_empty() {
+                continue;
+            }
+            let num_speakers = meta.num_speakers_for(track.kind);
+            match diarize_track(&sidecar, track, num_speakers, &cache_dir).await {
+                Ok(turns) => {
+                    info!(
+                        "recording {}: the diarization sidecar found {} turn(s) on the {} track",
+                        meta.id,
+                        turns.len(),
+                        track.kind.file_stem()
+                    );
+                    track.turns = turns;
+                }
+                Err(e) => {
+                    failure = Some(format!(
+                        "the diarization sidecar failed on the {} track: {e:#}",
+                        track.kind.file_stem()
+                    ));
+                    break;
+                }
+            }
+        }
+        // Never worth the recording: the transcript goes out as with
+        // `off`, and says why.
+        if let Some(why) = failure {
+            warn!("recording {}: {why}; each track stays one speaker", meta.id);
+            meta.errors.push(speakers::separation_note(&why));
+            plan.method = Method::Off;
+        }
+    }
+
     let mut mic = Vec::new();
     let mut system = Vec::new();
     for track in transcribed {
-        let labels = if plan.separates(track.kind) {
-            Labels::Backend
-        } else {
-            Labels::None
+        let labels = match &plan.method {
+            _ if !plan.separates(track.kind) => Labels::None,
+            Method::Sidecar { .. } => Labels::Turns(&track.turns),
+            _ => Labels::Backend,
         };
-        let segments = finish_track(track.segments, labels, &filters, track.offset_ms);
+        let segments = finish_track(track.speech.segments, labels, &filters, track.offset_ms);
         match track.kind {
             TrackKind::Mic => mic.extend(segments),
             TrackKind::System => system.extend(segments),
@@ -251,7 +306,8 @@ pub async fn process_recording(
 
 /// Give a track with no stored language (a recording made before languages
 /// were stored) the one the config gives it ([`RecordingConfig::language_for`]),
-/// and a recording with no stored `shared_mic` the config's, so
+/// and a recording with no stored `shared_mic` or `num_speakers` the
+/// config's, so
 /// `recording.json` says what the transcript was made with and a later
 /// retry keeps it.
 fn fill_stored_settings(meta: &mut RecordingMeta, config: &Config) {
@@ -262,14 +318,81 @@ fn fill_stored_settings(meta: &mut RecordingMeta, config: &Config) {
     meta.system_language
         .get_or_insert_with(|| recording.language_for(TrackKind::System, general));
     meta.shared_mic.get_or_insert(recording.shared_mic);
+    meta.num_speakers.get_or_insert(recording.num_speakers);
 }
 
-/// One track's raw transcript: its segments on the track's own timeline,
-/// before filtering ([`transcribe_track`]).
+/// One track's raw transcript ([`transcribe_track`]), with what the
+/// diarization sidecar needs to send the same speech.
 struct Transcribed {
     kind: TrackKind,
     offset_ms: i64,
+    /// The file transcribed: the echo-cancelled mic, or the track as
+    /// recorded.
+    path: PathBuf,
+    speech: TrackSpeech,
+    /// The voices' turns on the track's timeline, from the diarization
+    /// sidecar ([`diarize_track`]).
+    turns: Vec<Turn>,
+}
+
+/// What [`transcribe_track`] found in one track.
+struct TrackSpeech {
+    /// Raw segments on the track's own timeline: not filtered, not yet
+    /// moved by the track's offset.
     segments: Vec<Segment>,
+    /// The sample ranges of the track that were sent.
+    regions: Vec<Range<usize>>,
+}
+
+/// The turns of each voice in a track, from the diarization sidecar, on the
+/// track's own timeline. The speech transcribed ([`TrackSpeech::regions`])
+/// goes in one request, condensed as one uncapped chunk, so silence is not
+/// diarized and the turns map back exactly as transcript segments do. A
+/// result cached by an earlier attempt for the same sidecar, number of
+/// voices and audio is reused ([`TurnCache`]).
+async fn diarize_track(
+    sidecar: &DiarizationSidecar,
+    track: &Transcribed,
+    num_speakers: u32,
+    cache_dir: &Path,
+) -> anyhow::Result<Vec<Turn>> {
+    let Some(map) = speech::pack(&track.speech.regions, &[], None).pop() else {
+        return Ok(Vec::new());
+    };
+    let wav = {
+        let path = track.path.clone();
+        let map = map.clone();
+        blocking(move || read_condensed_wav(&path, &map)).await?
+    };
+    let cache = TurnCache::new(cache_dir, track.kind, sidecar.url(), num_speakers, &wav);
+    let turns = match cache.load() {
+        Some(turns) => {
+            info!(
+                "reusing the cached voices of the {} track",
+                track.kind.file_stem()
+            );
+            turns
+        }
+        None => {
+            let turns = sidecar.diarize(wav, num_speakers).await?;
+            if let Err(e) = cache.store(&turns) {
+                warn!("could not cache the voices of a track: {e:#}");
+            }
+            turns
+        }
+    };
+    Ok(turns
+        .into_iter()
+        .flat_map(|turn| {
+            map.map_span(turn.start_ms, turn.end_ms)
+                .into_iter()
+                .map(move |(start_ms, end_ms)| Turn {
+                    start_ms,
+                    end_ms,
+                    speaker: turn.speaker.clone(),
+                })
+        })
+        .collect())
 }
 
 /// A track's raw segments as they go into the transcript: split where the
@@ -563,6 +686,40 @@ fn read_range(path: &Path, range: Range<usize>) -> anyhow::Result<Vec<i16>> {
         .with_context(|| format!("failed to read {}", path.display()))
 }
 
+/// [`read_condensed`] as a WAV, written as it is read: one buffer the size
+/// of the speech, not a copy of the samples beside it. Blocking.
+fn read_condensed_wav(path: &Path, map: &TimeMap) -> anyhow::Result<Vec<u8>> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut out = std::io::Cursor::new(Vec::with_capacity(44 + 2 * map.condensed_len()));
+    {
+        let mut writer = hound::WavWriter::new(&mut out, spec)?;
+        let mut written = 0usize;
+        for piece in &map.pieces {
+            for _ in written..piece.condensed {
+                writer.write_sample(0i16)?;
+            }
+            let samples = read_range(path, piece.original..piece.original + piece.len)?;
+            anyhow::ensure!(
+                samples.len() == piece.len,
+                "{} ended before sample {}",
+                path.display(),
+                piece.original + piece.len
+            );
+            for sample in samples {
+                writer.write_sample(sample)?;
+            }
+            written = piece.condensed + piece.len;
+        }
+        writer.finalize()?;
+    }
+    Ok(out.into_inner())
+}
+
 /// Run a blocking track read off the async runtime.
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
@@ -643,7 +800,7 @@ async fn transcribe_track(
     tcfg: &TranscriptionConfig,
     cache: &ChunkCache,
     job: &TrackJob<'_>,
-) -> anyhow::Result<Vec<Segment>> {
+) -> anyhow::Result<TrackSpeech> {
     let path: PathBuf = job.path.to_path_buf();
     let scan = {
         let path = path.clone();
@@ -654,7 +811,10 @@ async fn transcribe_track(
     let regions = speech::regions(&active, scan.len);
     if regions.is_empty() {
         debug!("{stem} track holds no speech; skipping");
-        return Ok(Vec::new());
+        return Ok(TrackSpeech {
+            segments: Vec::new(),
+            regions,
+        });
     }
     let chunks = speech::pack(
         &regions,
@@ -671,7 +831,7 @@ async fn transcribe_track(
         scan.len as f64 / f64::from(SAMPLE_RATE),
         chunks.len()
     );
-    drop((scan, active, regions));
+    drop((scan, active));
 
     let several = chunks.len() > 1;
     let mut out = Vec::new();
@@ -714,7 +874,10 @@ async fn transcribe_track(
             out.push(seg);
         }
     }
-    Ok(out)
+    Ok(TrackSpeech {
+        segments: out,
+        regions,
+    })
 }
 
 /// Voice `label` of chunk `index` (from 0) of a track sent as several:
@@ -847,13 +1010,95 @@ impl ChunkCache {
         }
     }
 
-    /// Drop the cache once the transcript is written.
+    /// Drop the cache once the transcript is written, except the voices a
+    /// diarization sidecar found ([`TurnCache`]): they are slow to make and
+    /// small to keep, so a later retry that changes only what is done with
+    /// them does not run the sidecar again. They go with the audio.
     fn clear(&self) {
-        match fs::remove_dir_all(&self.dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!("failed to delete {}: {e}", self.dir.display()),
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                warn!("failed to read {}: {e}", self.dir.display());
+                return;
+            }
+        };
+        let mut kept = false;
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TURN_CACHE_PREFIX)
+            {
+                kept = true;
+                continue;
+            }
+            let path = entry.path();
+            let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            if let Err(e) = removed {
+                warn!("failed to delete {}: {e}", path.display());
+            }
         }
+        if !kept {
+            if let Err(e) = fs::remove_dir(&self.dir) {
+                warn!("failed to delete {}: {e}", self.dir.display());
+            }
+        }
+    }
+}
+
+/// File name prefix of a track's cached voices, under [`CACHE_DIR`].
+const TURN_CACHE_PREFIX: &str = "diarization-";
+
+/// The voices of one track, as cached on disk.
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedTurns {
+    fingerprint: String,
+    /// The sidecar's turns, in the time of the audio it was sent.
+    turns: Vec<Turn>,
+}
+
+/// Cache of the voices a diarization sidecar found in one track: reused
+/// when the same sidecar is asked for the same number of voices in the same
+/// audio (its bytes hashed), so a retry does not diarize again.
+struct TurnCache {
+    path: PathBuf,
+    fingerprint: String,
+}
+
+impl TurnCache {
+    fn new(dir: &Path, kind: TrackKind, url: &str, num_speakers: u32, wav: &[u8]) -> Self {
+        let key = serde_json::json!({
+            "version": 1,
+            "url": url,
+            "num_speakers": num_speakers,
+            "audio": format!("{:016x}", fnv1a64(wav)),
+        });
+        Self {
+            path: dir.join(format!("{TURN_CACHE_PREFIX}{}.json", kind.file_stem())),
+            fingerprint: format!("{:016x}", fnv1a64(key.to_string().as_bytes())),
+        }
+    }
+
+    fn load(&self) -> Option<Vec<Turn>> {
+        let data = fs::read(&self.path).ok()?;
+        let cached: CachedTurns = serde_json::from_slice(&data).ok()?;
+        (cached.fingerprint == self.fingerprint).then_some(cached.turns)
+    }
+
+    fn store(&self, turns: &[Turn]) -> anyhow::Result<()> {
+        let dir = self.path.parent().context("cache path has no parent")?;
+        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        let cached = CachedTurns {
+            fingerprint: self.fingerprint.clone(),
+            turns: turns.to_vec(),
+        };
+        write_private(&self.path, &serde_json::to_vec(&cached)?)
     }
 }
 
@@ -2486,6 +2731,17 @@ mod tests {
         assert_eq!(speaker_lines(&meta), [("M1", "one"), ("M2", "two")]);
     }
 
+    /// What a stand-in server was asked, or a failure (not a hang) when it
+    /// never got all the requests it was set up for.
+    async fn served(
+        server: tokio::task::JoinHandle<Vec<crate::transcription::test_server::Request>>,
+    ) -> Vec<crate::transcription::test_server::Request> {
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the stand-in server never got the requests it expected")
+            .unwrap()
+    }
+
     /// A local stand-in for Deepgram: answers each request in turn and
     /// hands back what was asked.
     async fn fake_deepgram(
@@ -2559,7 +2815,7 @@ mod tests {
         let meta = process_recording(tmp.path(), &deepgram_config(""), Some(backend))
             .await
             .unwrap();
-        let requests = server.await.unwrap();
+        let requests = served(server).await;
         let line = |i: usize| requests[i].head.lines().next().unwrap().to_string();
         assert!(!line(0).contains("diarize"), "mic: {}", line(0));
         assert!(
@@ -2613,7 +2869,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let requests = server.await.unwrap();
+        let requests = served(server).await;
         assert!(requests.iter().all(|r| !r.head.contains("diarize")));
         assert_eq!(
             speaker_names(&meta),
@@ -2631,10 +2887,248 @@ mod tests {
         )
         .await
         .unwrap();
-        let requests = server.await.unwrap();
+        let requests = served(server).await;
         assert!(requests
             .iter()
             .all(|r| r.head.contains("&diarize_model=latest")));
+    }
+
+    /// The sidecar's waits, short enough for a test.
+    const QUICK_SIDECAR: Timing = Timing {
+        min_timeout: Duration::from_millis(500),
+        per_audio_second: 0.0,
+        server_backoff: &[Duration::from_millis(1); 3],
+        network_backoff: &[Duration::from_millis(1); 4],
+    };
+
+    /// The sidecar's answer for [`call`]'s system track: its three bursts
+    /// are packed at 0, 3.6 and 7.2 s, and the first and last are one
+    /// voice.
+    const TWO_VOICES: &str = r#"{"segments": [
+        {"start": 0.0, "end": 2.6, "speaker": "SPEAKER_00"},
+        {"start": 3.6, "end": 6.2, "speaker": "SPEAKER_01"},
+        {"start": 7.2, "end": 9.8, "speaker": "SPEAKER_00"}
+    ]}"#;
+
+    fn sidecar_config(url: &str, extra: &str) -> Config {
+        toml::from_str(&format!(
+            "[general]\nbackend = \"groq\"\n[recording]\nuser_name = \"Tester\"\n\
+             diarization_url = \"{url}\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    /// A stand-in diarization sidecar answering each request in turn, and
+    /// its URL.
+    async fn fake_sidecar(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<Vec<crate::transcription::test_server::Request>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/diarize", listener.local_addr().unwrap());
+        let server = tokio::spawn(crate::transcription::test_server::serve_responses(
+            listener, responses,
+        ));
+        (url, server)
+    }
+
+    /// A URL nothing listens on.
+    async fn dead_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}/diarize", listener.local_addr().unwrap())
+    }
+
+    async fn process_call(dir: &Path, config: &Config) -> RecordingMeta {
+        let texts = [
+            (3000, "hi all"),
+            (5000, "hello there"),
+            (6000, "good morning"),
+            (7000, "so the plan"),
+        ];
+        let backend = FakeBackend::new(&texts, None) as Arc<dyn TranscriptionBackend>;
+        process_with_timing(dir, config, Some(backend), QUICK_SIDECAR)
+            .await
+            .unwrap()
+    }
+
+    /// The sidecar gets the system track's speech in one request (the
+    /// number of voices with it), the words take its turns mapped back onto
+    /// the track, and the voices become speakers. The mic, not shared, is
+    /// not sent.
+    #[tokio::test]
+    async fn a_diarization_sidecar_separates_the_system_voices() {
+        let (tmp, _) = call();
+        let (url, server) = fake_sidecar(vec![(200, TWO_VOICES)]).await;
+        let meta = process_call(tmp.path(), &sidecar_config(&url, "num_speakers = 2\n")).await;
+        let requests = served(server).await;
+        assert_eq!(requests.len(), 1, "one request, for the system track");
+        let (_, wav) = requests[0].file_part();
+        let samples = crate::transcription::decode_wav_samples(
+            &wav[..wav.len() - wav.iter().rev().position(|&b| b == b'\n').unwrap() - 2],
+        );
+        let system = store::audio_path(tmp.path(), TrackKind::System);
+        assert!(
+            samples.unwrap() == condensed(&system, None),
+            "the system track's condensed speech"
+        );
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            body.contains("name=\"num_speakers\"\r\n\r\n2\r\n"),
+            "{body}"
+        );
+
+        assert_eq!(
+            speaker_lines(&meta),
+            [
+                ("me", "hi all"),
+                ("S1", "hello there"),
+                ("S2", "good morning"),
+                ("S1", "so the plan"),
+            ]
+        );
+        assert_eq!(
+            speaker_names(&meta),
+            [("me", "Tester"), ("S1", "Speaker 1"), ("S2", "Speaker 2")]
+        );
+        let port = url.split(':').nth(2).unwrap().split('/').next().unwrap();
+        assert_eq!(meta.diarization, Some(format!("sidecar:127.0.0.1:{port}")));
+        assert_eq!(meta.num_speakers, Some(2), "the config's, stored");
+        assert!(meta.errors.is_empty(), "{:?}", meta.errors);
+    }
+
+    /// A sidecar that fails, in any way, never fails the recording: the
+    /// transcript is written as with `off`, and `errors` says why.
+    #[tokio::test]
+    async fn a_failing_sidecar_leaves_one_speaker_per_track() {
+        let check = |meta: &RecordingMeta, why: &str| {
+            assert_eq!(meta.status, RecordingState::Done);
+            assert_eq!(
+                speaker_lines(meta),
+                [
+                    ("me", "hi all"),
+                    ("others", "hello there"),
+                    ("others", "good morning"),
+                    ("others", "so the plan"),
+                ]
+            );
+            assert_eq!(meta.diarization.as_deref(), Some("off"));
+            let failure = speakers::separation_failure(meta).expect("a note");
+            assert!(failure.contains(why), "{failure}");
+        };
+
+        let (tmp, _) = call();
+        let (url, server) = fake_sidecar(vec![(500, r#"{"detail": "out of memory"}"#)]).await;
+        let meta = process_call(tmp.path(), &sidecar_config(&url, "")).await;
+        check(&meta, "(500)");
+        assert_eq!(served(server).await.len(), 1, "a 500 is not sent again");
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(
+            md.contains("## Notes\n\n- speakers were not separated: "),
+            "{md}"
+        );
+
+        let (tmp, _) = call();
+        let (url, server) = fake_sidecar(vec![(200, r#"{"text": "hello"}"#)]).await;
+        check(
+            &process_call(tmp.path(), &sidecar_config(&url, "")).await,
+            "segments",
+        );
+        served(server).await;
+
+        let (tmp, _) = call();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/diarize", listener.local_addr().unwrap());
+        let silent = tokio::spawn(async move {
+            let (stream, _) = crate::transcription::test_server::accept_request(&listener).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(stream);
+        });
+        let meta = process_call(tmp.path(), &sidecar_config(&url, "")).await;
+        check(&meta, "gave no answer within");
+        silent.abort();
+
+        let (tmp, _) = call();
+        let meta = process_call(tmp.path(), &sidecar_config(&dead_url().await, "")).await;
+        check(&meta, "the diarization sidecar could not be reached");
+    }
+
+    /// The voices a sidecar found are kept when the transcript is written
+    /// (the rest of the cache goes), so a retry reuses them without the
+    /// sidecar; asking for another number of voices asks the sidecar again.
+    /// A retry that succeeds drops the note of one that failed.
+    #[tokio::test]
+    async fn the_sidecars_voices_are_cached_across_retries() {
+        let (tmp, _) = call();
+        let (url, server) = fake_sidecar(vec![(200, TWO_VOICES)]).await;
+        let first = process_call(tmp.path(), &sidecar_config(&url, "")).await;
+        served(server).await;
+        let cache = tmp.path().join(CACHE_DIR);
+        let kept: Vec<String> = fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept, ["diarization-system.json"], "chunks go, voices stay");
+        let mode = fs::metadata(cache.join("diarization-system.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // The same sidecar URL, no sidecar running: the cache answers.
+        let again = process_call(tmp.path(), &sidecar_config(&url, "")).await;
+        assert_eq!(speaker_lines(&again), speaker_lines(&first));
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+
+        // Another number of voices is another request, and it fails.
+        let mut meta = store::read_meta(tmp.path()).unwrap();
+        meta.num_speakers = Some(3);
+        store::write_meta(tmp.path(), &meta).unwrap();
+        let failed = process_call(tmp.path(), &sidecar_config(&url, "")).await;
+        assert!(speakers::separation_failure(&failed).is_some());
+
+        // Back to the cached request: separated again, the note gone.
+        let mut meta = store::read_meta(tmp.path()).unwrap();
+        meta.num_speakers = Some(0);
+        store::write_meta(tmp.path(), &meta).unwrap();
+        let healed = process_call(tmp.path(), &sidecar_config(&url, "")).await;
+        assert_eq!(speaker_lines(&healed), speaker_lines(&first));
+        assert!(healed.errors.is_empty(), "{:?}", healed.errors);
+    }
+
+    /// With a shared mic and no system track (an in-person meeting) the
+    /// mic goes to the sidecar, with the number of voices.
+    #[tokio::test]
+    async fn a_shared_mic_goes_to_the_sidecar() {
+        let (tmp, _) = recording(&[(
+            TrackKind::Mic,
+            0,
+            Some(track(
+                20.0,
+                &[(4.0, 2.0, 5000), (9.0, 2.0, 6000), (14.0, 2.0, 7000)],
+            )),
+        )]);
+        let (url, server) = fake_sidecar(vec![(200, TWO_VOICES)]).await;
+        let meta = process_call(
+            tmp.path(),
+            &sidecar_config(&url, "shared_mic = true\nnum_speakers = 2\n"),
+        )
+        .await;
+        let requests = served(server).await;
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            body.contains("name=\"num_speakers\"\r\n\r\n2\r\n"),
+            "{body}"
+        );
+        assert_eq!(
+            speaker_lines(&meta),
+            [
+                ("M1", "hello there"),
+                ("M2", "good morning"),
+                ("M1", "so the plan"),
+            ]
+        );
     }
 
     fn fingerprint_of(toml_text: &str) -> String {

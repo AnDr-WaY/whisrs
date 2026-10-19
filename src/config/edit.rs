@@ -601,11 +601,15 @@ fn edit_recording(config: &mut Config) -> Result<()> {
     let modes = [
         (
             DiarizationMode::Auto,
-            "Auto: when the transcription backend can tell voices apart",
+            "Auto: the diarization sidecar when its URL is set, else Deepgram",
         ),
         (
             DiarizationMode::Backend,
-            "The transcription backend (an asr-sidecar that returns speakers)",
+            "The transcription backend (Deepgram, or an asr-sidecar that returns speakers)",
+        ),
+        (
+            DiarizationMode::Sidecar,
+            "A diarization sidecar (a local server at diarization_url)",
         ),
         (DiarizationMode::Off, "Off: one speaker per track"),
     ];
@@ -621,6 +625,25 @@ fn edit_recording(config: &mut Config) -> Result<()> {
         .interact()
         .context("failed to read speaker separation")?;
     recording.diarization = modes[choice].0;
+    if matches!(
+        recording.diarization,
+        DiarizationMode::Auto | DiarizationMode::Sidecar
+    ) {
+        let required = recording.diarization == DiarizationMode::Sidecar;
+        recording.diarization_url = prompt_optional_url(
+            "Diarization sidecar URL, e.g. http://127.0.0.1:8770/diarize",
+            &recording.diarization_url,
+            required,
+        )?;
+        if recording.diarization_url.is_some() {
+            recording.num_speakers = Input::new()
+                .with_prompt("How many voices on the system audio (0 = let the sidecar decide)")
+                .default(recording.num_speakers)
+                .validate_with(|n: &u32| crate::recording::validate_num_speakers(*n).map(|_| ()))
+                .interact_text()
+                .context("failed to read the number of voices")?;
+        }
+    }
     recording.shared_mic = Confirm::new()
         .with_prompt("Several people share your mic (tell its voices apart too)?")
         .default(recording.shared_mic)
@@ -848,6 +871,45 @@ fn prompt_optional_string(label: &str, current: &Option<String>) -> Result<Optio
     } else {
         Some(input)
     })
+}
+
+/// [`prompt_optional_string`] for an `http(s)://` URL: re-asked until it
+/// parses, and, when `required`, until it is given. An empty line always
+/// reaches the validator (`allow_empty`), which refuses it when required.
+fn prompt_optional_url(
+    label: &str,
+    current: &Option<String>,
+    required: bool,
+) -> Result<Option<String>> {
+    let input: String = Input::new()
+        .with_prompt(if required {
+            label.to_string()
+        } else {
+            format!("{label} (blank to unset)")
+        })
+        .with_initial_text(current.clone().unwrap_or_default())
+        .allow_empty(true)
+        .validate_with(move |input: &String| match parse_optional_url(input) {
+            Ok(None) if required => Err("a URL is needed here".to_string()),
+            other => other.map(|_| ()),
+        })
+        .interact_text()
+        .with_context(|| format!("failed to read {label}"))?;
+    Ok(parse_optional_url(&input).unwrap_or(None))
+}
+
+/// A URL typed into the editor: blank is unset, anything else must be an
+/// `http://` or `https://` URL, stored trimmed.
+fn parse_optional_url(input: &str) -> std::result::Result<Option<String>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let url = reqwest::Url::parse(input).map_err(|e| format!("not a URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("use http:// or https://, not {}://", url.scheme()));
+    }
+    Ok(Some(input.to_string()))
 }
 
 /// [`prompt_optional_string`] for a language: re-asked until it passes the
@@ -1512,8 +1574,8 @@ mod tests {
             .collect();
         assert_eq!(
             chains.len(),
-            20,
-            "the scan found {} `Input` chains, not 20. Fewer means a \
+            22,
+            "the scan found {} `Input` chains, not 22. Fewer means a \
              constructor spelling the needle misses, which makes this test \
              vacuous; more means a prompt was added — audit its chain against \
              the rules below, then bump this number",
@@ -1567,6 +1629,13 @@ mod tests {
     #[test]
     fn recording_section_is_written_only_when_used() {
         assert_eq!(apply_recording_edit(None, RecordingConfig::default()), None);
+        assert_eq!(parse_optional_url("  "), Ok(None));
+        assert_eq!(
+            parse_optional_url(" http://127.0.0.1:8770/diarize "),
+            Ok(Some("http://127.0.0.1:8770/diarize".to_string()))
+        );
+        assert!(parse_optional_url("ws://127.0.0.1:8770").is_err());
+        assert!(parse_optional_url("127.0.0.1:8770").is_err());
 
         let changed = RecordingConfig {
             user_name: Some("Ada".into()),

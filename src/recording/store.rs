@@ -21,8 +21,10 @@ const AUDIO_DIR: &str = "audio";
 
 /// Per-chunk results of finished requests, under the recording folder, so a
 /// retry or a recovery after a crash resumes instead of starting over.
-/// Dropped once the transcript is written; a failed recording keeps it until
-/// its audio is deleted, since a retry needs both.
+/// Dropped once the transcript is written, except the voices a diarization
+/// sidecar found (`diarization-*.json`), which a later retry reuses; a failed
+/// recording keeps all of it until its audio is deleted, since a retry needs
+/// both.
 pub const CACHE_DIR: &str = ".cache";
 const SLUG_MAX: usize = 40;
 
