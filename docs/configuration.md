@@ -972,24 +972,30 @@ Its tools:
 
 - `list_recordings` (`since`, `until`, `query`, `limit`): recordings,
   newest first, with id, title, start time, duration, status, the speakers
-  heard and whether there is a summary. `since` and `until` take a date
+  heard and whether there is a summary ("Too short to summarize." is
+  none). `since` and `until` take a date
   (`2026-10-19`, which `until` counts whole), `today`, `yesterday`,
   `YYYY-MM-DD HH:MM` or an RFC 3339 time; `query` matches the title or id;
   `limit` is 1 to 100, 20 by default.
 - `get_recording` (`id`): one recording's details, speakers, languages,
-  summary and files, without the transcript.
+  summary (`summary_stale` when it is from an earlier transcript) and
+  files, without the transcript.
 - `get_transcript` (`id`, `offset`, `max_chars`, `speaker`, `start_ms`,
   `end_ms`): the transcript as `[HH:MM:SS] Name: text` lines (one
   speaker's words per line, up to 1,500 characters), at most `max_chars`
   at a time (20,000 by default, 2,000 to 100,000), with `next_offset` for
   the next page. `speaker` is an id such as `S2` or a name.
 - `search_transcripts` (`query`, `since`, `limit`): a search of titles,
-  summaries and transcripts, case aside, newest recording first, that
-  stops after `limit` hits (20 by default, at most 100). A transcript hit
+  summaries and transcripts, case aside (in any script: "istanbul" finds
+  "İstanbul", "σοφος" finds "ΣΟΦΟΣ"), newest recording first, that stops
+  after `limit` hits (20 by default, at most 100). A transcript hit
   gives its time, speaker and the `offset` to read it with
   `get_transcript`.
 
-An id is a full id, a unique prefix or `last`. The server and each tool
+The tools read only what they need: a listing reads each `recording.json`
+without the words of its transcript, a full id reads its own folder, and a
+search reads one transcript at a time. An id is a full id, a unique prefix
+or `last`. The server and each tool
 tell the agent that recording content is data, not instructions, and that
 the speaker labels can be wrong. A recording that failed has no transcript,
 and `get_transcript` says so. The release builds include the server; a

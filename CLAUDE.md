@@ -72,7 +72,7 @@ src/
 ├── daemon/recording.rs     # Recording sessions, processing queue/worker, recovery, shutdown
 ├── recording/              # Recording feature (mic + system audio, transcribed after the stop)
 │   ├── mod.rs              #   RecordingMeta (recording.json), segments, status types
-│   ├── store.rs            #   Recordings folder: create, list, resolve ids, retention sweep
+│   ├── store.rs            #   Recordings folder: create, list (or list_headers: no transcript text), resolve ids, retention sweep
 │   ├── recorder.rs         #   Per-track WAV writer with periodic header flushes
 │   ├── wav_repair.rs       #   Fix WAV headers a crash left unfinalized
 │   ├── echo.rs             #   Remove speaker echo from the mic track (system track as reference)

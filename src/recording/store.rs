@@ -13,7 +13,9 @@ use anyhow::{bail, Context};
 use chrono::{DateTime, Local};
 use tracing::{debug, warn};
 
-use super::{RecordingMeta, RecordingState, TrackKind};
+use serde::Deserialize;
+
+use super::{RecordingMeta, RecordingState, Speaker, TitleSource, TrackKind, TrackMeta};
 
 const META_FILE: &str = "recording.json";
 const META_TMP: &str = ".recording.json.tmp";
@@ -189,9 +191,88 @@ pub fn write_meta(dir: &Path, meta: &RecordingMeta) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The fields of `recording.json` a listing needs, read without the words
+/// of the transcript ([`read_header`]): serde skips what the struct leaves
+/// out, so a six-hour transcript costs a scan, not its text in memory.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RecordingHeader {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub title_source: Option<TitleSource>,
+    pub status: RecordingState,
+    pub started_at: DateTime<Local>,
+    #[serde(default)]
+    pub ended_at: Option<DateTime<Local>>,
+    #[serde(default)]
+    pub sample_rate: u32,
+    #[serde(default)]
+    pub tracks: Vec<TrackMeta>,
+    #[serde(default)]
+    pub speakers: Vec<Speaker>,
+    /// Who speaks in each segment, without the words.
+    #[serde(default, rename = "segments")]
+    pub segment_speakers: Vec<SegmentSpeaker>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub summary_stale: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The speaker of one segment, as a [`RecordingHeader`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SegmentSpeaker {
+    pub speaker: String,
+}
+
+impl RecordingHeader {
+    /// The names of the speakers who have a line in the transcript, in the
+    /// order of `speakers`, as the Markdown front matter lists them.
+    pub fn heard_names(&self) -> Vec<String> {
+        let heard: std::collections::BTreeSet<&str> = self
+            .segment_speakers
+            .iter()
+            .map(|s| s.speaker.as_str())
+            .collect();
+        self.speakers
+            .iter()
+            .filter(|s| heard.contains(s.id.as_str()))
+            .map(|s| s.name.clone())
+            .collect()
+    }
+}
+
+/// Read the [`RecordingHeader`] of the recording in `dir`.
+pub fn read_header(dir: &Path) -> anyhow::Result<RecordingHeader> {
+    let path = dir.join(META_FILE);
+    let data = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&data).with_context(|| format!("failed to parse {}", path.display()))
+}
+
 /// All recordings under `root`, newest first by `started_at`. Directories
 /// without a readable `recording.json` are skipped. A missing root is empty.
 pub fn list(root: &Path) -> anyhow::Result<Vec<(PathBuf, RecordingMeta)>> {
+    list_by(root, read_meta, |meta| (meta.started_at, meta.id.as_str()))
+}
+
+/// [`list`] by headers ([`read_header`]): what a listing or a lookup reads,
+/// without holding every transcript in memory at once.
+pub fn list_headers(root: &Path) -> anyhow::Result<Vec<(PathBuf, RecordingHeader)>> {
+    list_by(root, read_header, |header| {
+        (header.started_at, header.id.as_str())
+    })
+}
+
+/// The recordings under `root` as `read` gives them, newest first by the
+/// start time and then the id `key` gives.
+fn list_by<T>(
+    root: &Path,
+    read: impl Fn(&Path) -> anyhow::Result<T>,
+    key: impl Fn(&T) -> (DateTime<Local>, &str),
+) -> anyhow::Result<Vec<(PathBuf, T)>> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -204,23 +285,38 @@ pub fn list(root: &Path) -> anyhow::Result<Vec<(PathBuf, RecordingMeta)>> {
             continue;
         }
         let dir = entry.path();
-        match read_meta(&dir) {
-            Ok(meta) => recordings.push((dir, meta)),
+        match read(&dir) {
+            Ok(item) => recordings.push((dir, item)),
             Err(e) => debug!("skipping {}: {e:#}", dir.display()),
         }
     }
     recordings.sort_by(|(_, a), (_, b)| {
-        b.started_at
-            .cmp(&a.started_at)
-            .then_with(|| b.id.cmp(&a.id))
+        let (a_start, a_id) = key(a);
+        let (b_start, b_id) = key(b);
+        b_start.cmp(&a_start).then_with(|| b_id.cmp(a_id))
     });
     Ok(recordings)
 }
 
-/// Find a recording by `"last"` (the newest), an exact id, or a unique id prefix.
+/// Whether `query` can only name a folder right under the root: not empty,
+/// and no `/` or `..` to climb out of it.
+fn is_plain_folder_name(query: &str) -> bool {
+    !query.is_empty() && !query.contains('/') && !query.contains("..") && !query.contains('\0')
+}
+
+/// Find a recording by `"last"` (the newest), an exact id, or a unique id
+/// prefix. An exact id that is also its folder's name is read directly;
+/// anything else reads the headers ([`list_headers`]), never every
+/// transcript.
 pub fn resolve(root: &Path, query: &str) -> anyhow::Result<PathBuf> {
     let query = query.trim();
-    let recordings = list(root)?;
+    if query != "last" && is_plain_folder_name(query) {
+        let dir = root.join(query);
+        if read_header(&dir).is_ok_and(|header| header.id == query) {
+            return Ok(dir);
+        }
+    }
+    let recordings = list_headers(root)?;
     if recordings.is_empty() {
         bail!("no recordings found in {}", root.display());
     }
@@ -230,7 +326,7 @@ pub fn resolve(root: &Path, query: &str) -> anyhow::Result<PathBuf> {
     if let Some((dir, _)) = recordings.iter().find(|(_, m)| m.id == query) {
         return Ok(dir.clone());
     }
-    let matches: Vec<&(PathBuf, RecordingMeta)> = if query.is_empty() {
+    let matches: Vec<&(PathBuf, RecordingHeader)> = if query.is_empty() {
         Vec::new()
     } else {
         recordings
@@ -741,6 +837,111 @@ mod tests {
         assert_eq!(recordings_dir_from(Some("/srv/m")), PathBuf::from("/srv/m"));
         assert!(recordings_dir_from(None).ends_with("whisrs/recordings"));
         assert_eq!(recordings_dir_from(Some("  ")), recordings_dir());
+    }
+
+    /// Headers list like the metas, newest first, with who speaks but
+    /// without the words.
+    #[test]
+    fn headers_list_like_the_metas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed(
+            root,
+            at(2026, 1, 1, 9, 0),
+            Some("a"),
+            RecordingState::Done,
+            None,
+        );
+        let dir = seed(
+            root,
+            at(2026, 3, 1, 9, 0),
+            None,
+            RecordingState::Failed,
+            None,
+        );
+        let mut meta = read_meta(&dir).unwrap();
+        meta.speakers = vec![
+            crate::recording::Speaker {
+                id: "me".into(),
+                name: "Yosif".into(),
+                source: "self".into(),
+                evidence: None,
+                talk_ms: 0,
+                channel: None,
+                minor: false,
+            },
+            crate::recording::Speaker {
+                id: "others".into(),
+                name: "Others".into(),
+                source: "channel".into(),
+                evidence: None,
+                talk_ms: 0,
+                channel: None,
+                minor: false,
+            },
+        ];
+        meta.segments = vec![crate::recording::TranscriptSegment {
+            start_ms: 0,
+            end_ms: 1,
+            speaker: "me".into(),
+            channel: TrackKind::Mic,
+            text: "hello".into(),
+        }];
+        meta.summary = Some("S.".into());
+        meta.error = Some("boom".into());
+        write_meta(&dir, &meta).unwrap();
+        fs::create_dir(root.join("junk")).unwrap();
+
+        let headers = list_headers(root).unwrap();
+        let metas = list(root).unwrap();
+        let ids = |v: Vec<String>| v;
+        assert_eq!(
+            ids(headers.iter().map(|(_, h)| h.id.clone()).collect()),
+            ids(metas.iter().map(|(_, m)| m.id.clone()).collect())
+        );
+        let header = &headers[0].1;
+        assert_eq!(
+            header.heard_names(),
+            ["Yosif"],
+            "the silent speaker is not heard"
+        );
+        assert_eq!(header.segment_speakers.len(), 1);
+        assert_eq!(
+            (header.summary.as_deref(), header.error.as_deref()),
+            (Some("S."), Some("boom"))
+        );
+        assert_eq!(header.status, RecordingState::Failed);
+    }
+
+    /// An exact id that is its folder's name is read directly; a query
+    /// with `/` or `..` never reads a folder outside the root, whatever its
+    /// `recording.json` says.
+    #[test]
+    fn resolve_reads_only_folders_under_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("recordings");
+        let inside = seed(
+            &root,
+            at(2026, 1, 1, 9, 0),
+            Some("in"),
+            RecordingState::Done,
+            None,
+        );
+        assert_eq!(resolve(&root, "2026-01-01_0900_in").unwrap(), inside);
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let meta = RecordingMeta::new("../outside".into(), None, at(2026, 2, 1, 9, 0));
+        write_meta(&outside, &meta).unwrap();
+        let err = resolve(&root, "../outside").unwrap_err().to_string();
+        assert!(err.contains("no recording matches"), "{err}");
+        // A folder whose recording.json names another id is not that id.
+        fs::rename(&inside, root.join("2026-09-09_0000")).unwrap();
+        assert!(resolve(&root, "2026-09-09_0000").is_err());
+        assert_eq!(
+            resolve(&root, "2026-01-01_0900_in").unwrap(),
+            root.join("2026-09-09_0000"),
+            "found by its id"
+        );
     }
 
     #[test]

@@ -5,7 +5,9 @@
 //! recording has one, then the transcript as speaker turns. Plain text is what `whisrs recording copy`
 //! puts on the clipboard.
 
-use super::{RecordingMeta, TrackKind};
+use chrono::{DateTime, Local};
+
+use super::{RecordingMeta, TrackKind, TrackMeta};
 
 /// Consecutive segments from one speaker, merged.
 pub(crate) struct Turn<'a> {
@@ -158,24 +160,43 @@ fn yaml_str(s: &str) -> String {
 
 /// The recording title, or a dated default.
 pub(crate) fn title(meta: &RecordingMeta) -> String {
-    meta.title
-        .as_deref()
+    title_or_default(meta.title.as_deref(), meta.started_at)
+}
+
+/// `title`, else `Recording YYYY-MM-DD HH:MM` for `started_at`.
+pub(crate) fn title_or_default(title: Option<&str>, started_at: DateTime<Local>) -> String {
+    title
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("Recording {}", meta.started_at.format("%Y-%m-%d %H:%M")))
+        .unwrap_or_else(|| format!("Recording {}", started_at.format("%Y-%m-%d %H:%M")))
 }
 
 /// Recording length: `ended_at - started_at`, else the longest track.
 pub(crate) fn duration_ms(meta: &RecordingMeta) -> u64 {
-    if let Some(ended) = meta.ended_at {
-        let ms = (ended - meta.started_at).num_milliseconds();
+    duration_ms_of(
+        meta.started_at,
+        meta.ended_at,
+        meta.sample_rate,
+        &meta.tracks,
+    )
+}
+
+/// [`duration_ms`] from the fields it reads.
+pub(crate) fn duration_ms_of(
+    started_at: DateTime<Local>,
+    ended_at: Option<DateTime<Local>>,
+    sample_rate: u32,
+    tracks: &[TrackMeta],
+) -> u64 {
+    if let Some(ended) = ended_at {
+        let ms = (ended - started_at).num_milliseconds();
         if ms > 0 {
             return ms as u64;
         }
     }
-    let rate = u64::from(meta.sample_rate.max(1));
-    meta.tracks
+    let rate = u64::from(sample_rate.max(1));
+    tracks
         .iter()
         .map(|t| t.offset_ms.max(0) as u64 + t.samples * 1000 / rate)
         .max()
