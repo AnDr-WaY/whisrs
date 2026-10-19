@@ -525,6 +525,15 @@ pub struct RecordingMeta {
     /// When `summary` was made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summarized_at: Option<DateTime<Local>>,
+    /// `summary` was made from an earlier transcript: a retry transcribed
+    /// the recording again since. The next summary clears it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary_stale: bool,
+    /// A summary is queued or running for this recording. Set when the job
+    /// is queued and cleared when it ends, so a summary that a shutdown or
+    /// a crash interrupted is queued again at the next start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary_pending: bool,
 }
 
 /// Whether `text` holds more than whitespace.
@@ -577,6 +586,8 @@ impl RecordingMeta {
             summary: None,
             summary_model: None,
             summarized_at: None,
+            summary_stale: false,
+            summary_pending: false,
         }
     }
 
@@ -732,6 +743,8 @@ mod tests {
         meta.summary = Some("Moving on Friday.\n\n### Next steps\n- [ ] Book a van".into());
         meta.summary_model = Some("gpt-4o-mini".into());
         meta.summarized_at = Some(meta.started_at);
+        meta.summary_stale = true;
+        meta.summary_pending = true;
         meta.network_wait = Some(NetworkWait {
             since: meta.started_at,
             attempts: 2,

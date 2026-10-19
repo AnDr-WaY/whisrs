@@ -141,6 +141,27 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatResponseMessage,
+    /// Why the model stopped: `stop`, or `length` for a reply cut off at
+    /// its output limit. Not every server sends it.
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+/// A reply from [`chat_reply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatReply {
+    /// The reply as it arrived.
+    pub content: String,
+    /// Why the model stopped, when the server says: `length` means the
+    /// reply was cut off at the model's output limit.
+    pub finish_reason: Option<String>,
+}
+
+impl ChatReply {
+    /// The model stopped at its output limit: the reply is cut off.
+    pub fn is_cut_off(&self) -> bool {
+        self.finish_reason.as_deref() == Some("length")
+    }
 }
 
 #[derive(Deserialize)]
@@ -403,6 +424,7 @@ pub async fn rewrite_text(
         rewrite_messages(selected_text, instruction),
     )
     .await
+    .map(|reply| reply.content)
 }
 
 /// Send `messages` to the configured `/chat/completions` endpoint and return
@@ -414,6 +436,17 @@ pub async fn chat(
     messages: Vec<ChatMessage>,
     timeout: Duration,
 ) -> anyhow::Result<String> {
+    chat_reply(config, messages, timeout)
+        .await
+        .map(|reply| reply.content)
+}
+
+/// [`chat`], with why the model stopped ([`ChatReply::finish_reason`]).
+pub async fn chat_reply(
+    config: &LlmConfig,
+    messages: Vec<ChatMessage>,
+    timeout: Duration,
+) -> anyhow::Result<ChatReply> {
     let api_key = resolve_api_key(config)?;
     info!("llm: sending a chat request (model={})", config.model);
     match tokio::time::timeout(timeout, chat_with_key(config, &api_key, messages)).await {
@@ -455,7 +488,7 @@ async fn chat_with_key(
     config: &LlmConfig,
     api_key: &str,
     messages: Vec<ChatMessage>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ChatReply> {
     let request = ChatRequest {
         model: config.model.clone(),
         messages,
@@ -491,14 +524,21 @@ async fn chat_with_key(
         .map_err(reqwest::Error::without_url)
         .context("failed to parse LLM response")?;
 
-    let result = chat_response
+    let reply = chat_response
         .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .unwrap_or_default();
+        .into_iter()
+        .next()
+        .map(|c| ChatReply {
+            content: c.message.content,
+            finish_reason: c.finish_reason,
+        })
+        .unwrap_or(ChatReply {
+            content: String::new(),
+            finish_reason: None,
+        });
 
-    info!("llm: LLM returned {} chars", result.len());
-    Ok(result)
+    info!("llm: LLM returned {} chars", reply.content.len());
+    Ok(reply)
 }
 
 #[cfg(test)]

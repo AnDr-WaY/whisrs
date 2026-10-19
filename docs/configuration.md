@@ -881,14 +881,18 @@ Folders are created private (0700) and `recording.json` is 0600; an existing
 latest transcript and `whisrs recording copy last` copies it.
 
 **Summaries and titles.** With `summary = true`, each transcript gets a
-summary once it is written, from the LLM of the `[llm]` section (the one
-command mode uses). `whisrs recording summarize <id>` makes one for any
-transcribed recording, whatever `summary` says, without transcribing it
-again: it waits behind any recording being transcribed, and a notification
-says when it is ready. The summary goes into the Markdown file as a
-`## Summary` section before the transcript, and into `recording.json` as
-`summary`, with the model that wrote it (`summary_model`) and when
-(`summarized_at`).
+summary from the LLM of the `[llm]` section (the one command mode uses).
+The summary is a job of its own: the transcript is written and notified
+first, then the summary is made, `whisrs recording status` shows
+"Summarizing" meanwhile, and a second notification says when it is ready.
+`whisrs recording summarize <id>` makes one for any transcribed recording,
+whatever `summary` says, without transcribing it again. Summaries wait
+behind any recording being transcribed, so a slow LLM never holds up the
+next transcript. A summary that a shutdown or a crash interrupted is made
+at the next start (`recording.json` marks it `summary_pending` until it
+is done). The summary goes into the Markdown file as a `## Summary`
+section before the transcript, and into `recording.json` as `summary`,
+with the model that wrote it (`summary_model`) and when (`summarized_at`).
 
 By default a summary starts with a TL;DR of one or two sentences, then
 short sections by topic in the order they came up. It has a "Decisions"
@@ -904,12 +908,15 @@ summary_instruction = "List each mistake Ada made in German with the right sente
 ```
 
 Whatever the rules, the LLM is told that the transcript is data, not
-instructions, and that the speaker labels can be wrong. A transcript of 50
-words or fewer is not sent: its summary is "Too short to summarize.". A
-long one (over about 24,000 characters, half an hour of talk or so) is
-summarized in parts, at most 20, and the notes on the parts are then
-summarized together, so nothing is left out. The LLM gets 120 seconds for
-each call.
+instructions, and that the speaker labels can be wrong. It gets the
+transcript as timed lines, one speaker's words at a time, so even a long
+lecture keeps its timestamps. A transcript of 50 words or fewer is not
+sent: its summary is "Too short to summarize.". A long one (over about
+16,000 characters, 20 minutes of talk or so) is summarized in parts, at
+most 20, and the notes on the parts are then summarized together, so
+nothing is left out. The LLM gets 10 minutes for each call; the first call
+that fails ends the summary. A reply cut off at the model's output limit,
+or one that is not the JSON asked for, is never stored as the summary.
 
 A recording you gave no title (`-t`) also gets one from the summary: 3 to 6
 words in the language of the transcript, shown in the Markdown file,
@@ -918,14 +925,21 @@ they are. A title you gave is never changed, and `recording.json` says
 where the title came from: `title_source` is `user`, `default` or `llm`.
 
 If the summary fails (no `[llm]` section, no answer in time, an error from
-the API), the transcript is still written, `recording.json` notes why under
-`errors` (the transcript's notes show it too), and a summary the recording
-already had stays. `whisrs recording retry` makes a new summary when
-`summary = true`, and keeps the old one when it is off.
+the API, a reply cut off or malformed), the transcript is untouched,
+`recording.json` notes why under `errors` (the transcript's notes show it
+too), and a summary the recording already had stays. `whisrs recording
+retry` makes a new summary when `summary = true`. When it is off, the old
+summary stays, marked `summary_stale` in `recording.json` and with a line
+in the transcript saying it is from an earlier transcript, until
+`whisrs recording summarize` makes a new one.
 
 A summary sends the whole transcript to the `[llm]` endpoint, which is why
 `summary` is off by default. Point `[llm] api_url` at a local server to
-keep transcripts on your machine.
+keep transcripts on your machine. Give the local model a context of at
+least 8k tokens, or the start of a long prompt (the rules included) is cut
+off without a word: Ollama's default is smaller, so set `num_ctx` (for
+example `PARAMETER num_ctx 8192` in a Modelfile, or `OLLAMA_CONTEXT_LENGTH=8192`
+for the server). On a CPU a summary can take minutes.
 
 **Agents.** An AI agent can find and read your recordings for you: ask it
 what was decided in yesterday's call, for notes on a lecture, or for the

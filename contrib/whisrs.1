@@ -287,7 +287,8 @@ queues it again. After a failure, chunks already transcribed with the same
 backend and settings, language included, are reused; a recording that finished
 keeps none, so its retry sends both tracks again. With
 .B [recording] summary
-on, a retry makes a new summary; with it off, the summary is kept.
+on, a retry makes a new summary; with it off, the summary is kept and
+marked as from an earlier transcript.
 .TP
 \fBsummarize\fR \fIID\fR
 Summarize a transcribed recording with the
@@ -304,7 +305,8 @@ and next steps only when there are any) can be replaced with
 .BR "[recording] summary_instruction" .
 A transcript of 50 words or fewer is not sent. The job waits behind any
 recording being transcribed, and a notification says when it is done; if it
-fails, the recording keeps the summary it had and notes why.
+fails, the recording keeps the summary it had and notes why. A summary
+interrupted by a shutdown is made at the next start.
 .RE
 .IP
 .BR list ,

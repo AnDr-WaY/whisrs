@@ -38,6 +38,84 @@ pub(crate) fn turns(meta: &RecordingMeta) -> Vec<Turn<'_>> {
     out
 }
 
+/// Longest line of [`capped_lines`], in characters.
+pub(crate) const LINE_CHARS: usize = 1_500;
+
+/// A line of the transcript as the summary and `whisrs mcp` give it ([`capped_lines`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Line<'a> {
+    /// When the segment its first words come from starts.
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+    /// A [`super::Speaker::id`].
+    pub(crate) speaker: &'a str,
+    /// On one line: whitespace runs made one space.
+    pub(crate) text: String,
+}
+
+/// The transcript as lines of at most `max_chars` characters: one speaker's
+/// consecutive segments merged until the next would not fit, a segment
+/// longer than that split at spaces (a single longer word stays whole), and
+/// each line stamped with the start of its first segment. Unlike
+/// [`turns`], a long monologue (a lecture) keeps a timestamp every
+/// `max_chars` or so.
+pub(crate) fn capped_lines(meta: &RecordingMeta, max_chars: usize) -> Vec<Line<'_>> {
+    let mut out: Vec<Line<'_>> = Vec::new();
+    // The length of each line of `out`, in characters.
+    let mut lens: Vec<usize> = Vec::new();
+    for seg in &meta.segments {
+        let text = seg.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for piece in split_at_spaces(&text, max_chars) {
+            let piece_len = piece.chars().count();
+            match (out.last_mut(), lens.last_mut()) {
+                (Some(line), Some(len))
+                    if line.speaker == seg.speaker && *len + 1 + piece_len <= max_chars =>
+                {
+                    line.text.push(' ');
+                    line.text.push_str(&piece);
+                    line.end_ms = line.end_ms.max(seg.end_ms);
+                    *len += 1 + piece_len;
+                }
+                _ => {
+                    out.push(Line {
+                        start_ms: seg.start_ms,
+                        end_ms: seg.end_ms,
+                        speaker: &seg.speaker,
+                        text: piece,
+                    });
+                    lens.push(piece_len);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `text` (on one line) in pieces of at most `max` characters, split at
+/// spaces; a longer word is a piece of its own. Empty text has none.
+fn split_at_spaces(text: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut piece = String::new();
+    let mut len = 0usize;
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let word_len = word.chars().count();
+        if len > 0 && len + 1 + word_len > max {
+            out.push(std::mem::take(&mut piece));
+            len = 0;
+        }
+        if len > 0 {
+            piece.push(' ');
+            len += 1;
+        }
+        piece.push_str(word);
+        len += word_len;
+    }
+    if !piece.is_empty() {
+        out.push(piece);
+    }
+    out
+}
+
 /// Display name for a speaker id, falling back to the id itself.
 pub(crate) fn speaker_name<'a>(meta: &'a RecordingMeta, id: &'a str) -> &'a str {
     meta.speakers
@@ -174,7 +252,15 @@ pub fn render_markdown(meta: &RecordingMeta) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        out.push_str(&format!("## Summary\n\n{summary}\n\n"));
+        out.push_str("## Summary\n\n");
+        if meta.summary_stale {
+            out.push_str(&format!(
+                "_This summary is from an earlier transcript. `whisrs recording summarize {}` \
+                 makes a new one._\n\n",
+                meta.id
+            ));
+        }
+        out.push_str(&format!("{summary}\n\n"));
     }
     out.push_str("## Transcript\n\n");
 
@@ -461,6 +547,85 @@ mod tests {
         assert_eq!(m.speakers.len(), 3, "kept in the meta");
         m.segments.clear();
         assert!(render_markdown(&m).contains("speakers: []\n"));
+    }
+
+    /// A summary from an earlier transcript says so, with the command
+    /// that makes a new one.
+    #[test]
+    fn a_stale_summary_says_so() {
+        let mut m = meta();
+        m.summary = Some("Old.".into());
+        m.summary_stale = true;
+        assert!(
+            render_markdown(&m).contains(
+                "## Summary\n\n_This summary is from an earlier transcript. \
+                 `whisrs recording summarize 2026-10-02_1405_standup` makes a new one._\n\n\
+                 Old.\n\n## Transcript"
+            ),
+            "{}",
+            render_markdown(&m)
+        );
+        m.summary_stale = false;
+        assert!(!render_markdown(&m).contains("earlier transcript"));
+    }
+
+    /// One voice for two hours stays many lines, each with its own time and
+    /// at most the cap; a new speaker starts a new line; a segment longer
+    /// than the cap is split at spaces; no word is lost or reordered.
+    #[test]
+    fn capped_lines_keep_a_timestamp_through_a_monologue() {
+        let mut m = meta();
+        m.speakers = vec![speaker("others", "Video", "channel", TrackKind::System)];
+        m.segments = (0..1200)
+            .map(|i| {
+                seg(
+                    i * 6_000,
+                    "others",
+                    &format!("Sentence {i} of the lecture,\n  about verbs."),
+                )
+            })
+            .collect();
+        let lines = capped_lines(&m, LINE_CHARS);
+        assert!(lines.len() > 30, "{}", lines.len());
+        assert_eq!(lines[0].start_ms, 0);
+        assert!(lines.windows(2).all(|w| w[0].start_ms < w[1].start_ms));
+        assert!(lines.iter().all(|l| l.text.chars().count() <= LINE_CHARS));
+        assert!(
+            lines[1].text.starts_with("Sentence "),
+            "{:?}",
+            lines[1].text
+        );
+        let joined: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
+        let want: Vec<String> = (0..1200)
+            .map(|i| format!("Sentence {i} of the lecture, about verbs."))
+            .collect();
+        assert_eq!(joined.join(" "), want.join(" "));
+
+        m.speakers
+            .push(speaker("me", "Yosif", "self", TrackKind::Mic));
+        m.segments = vec![
+            seg(0, "others", &"word ".repeat(40)),
+            seg(1_000, "others", "short"),
+            seg(2_000, "me", "mine"),
+            seg(3_000, "others", "back"),
+        ];
+        let lines = capped_lines(&m, 50);
+        let shown: Vec<(u64, &str, usize)> = lines
+            .iter()
+            .map(|l| (l.start_ms, l.speaker, l.text.chars().count()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (0, "others", 49),
+                (0, "others", 49),
+                (0, "others", 49),
+                (0, "others", 49),
+                (1_000, "others", 5),
+                (2_000, "me", 4),
+                (3_000, "others", 4),
+            ]
+        );
     }
 
     #[test]

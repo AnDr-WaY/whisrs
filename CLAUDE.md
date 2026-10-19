@@ -275,9 +275,13 @@ audio is deleted). The recording backend
 must be file-capable, a backend that can transcribe a recorded file: groq, openai, deepgram,
 asr-sidecar or local-whisper (`deepgram-streaming` maps to `deepgram`; realtime backends are
 refused). Every processing job goes through one queue in `daemon/recording.rs` (`reserve` +
-`dispatch`; a `Job` is `Transcribe` or `Summarize`); short rewrites that are no job (`recording
-name`, the retention sweep) `hold`/`release` the recording instead. A summary never re-transcribes:
-it re-renders `<id>.md` from `recording.json` (`process::save`), as `recording name` does.
+`dispatch`; a `Job` is `Transcribe` or `Summarize`, and the worker runs waiting transcriptions
+before waiting summaries, `next_job`); short rewrites that are no job (`recording name`, the
+retention sweep) `hold`/`release` the recording instead. `process_recording` ends at the
+transcript; with `[recording] summary` the worker then queues a `Summarize` job
+(`queue_summary`, which sets `summary_pending` so `resume_summaries` re-queues it at startup).
+A summary never re-transcribes: it re-renders `<id>.md` from `recording.json` (`process::save`),
+as `recording name` does. A retry over an existing summary marks it `summary_stale`.
 
 Environment variable overrides:
 - `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key` (also used by the `deepgram` TTS backend)

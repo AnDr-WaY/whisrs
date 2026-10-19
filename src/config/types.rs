@@ -2755,7 +2755,7 @@ impl Config {
     /// stop at groq, openai and asr-sidecar. It is a real backend and it does
     /// send the prompt, but the `whisrs-linux-{x86_64,aarch64}-minimal`
     /// release artifacts are built `--no-default-features --features
-    /// tray,overlay,hooks`, and in those binaries the stub that stands in for
+    /// tray,overlay,hooks,mcp`, and in those binaries the stub that stands in for
     /// it bails with "local-whisper feature not enabled". Half the artifacts
     /// this project ships cannot act on that advice, and a warning cannot tell
     /// which binary it is running in. The test helper
@@ -4261,7 +4261,7 @@ mod tests {
     /// `local-whisper` is the third name no warning may send the user to, for
     /// a different reason. It is a real backend in the default build, but the
     /// `whisrs-linux-{x86_64,aarch64}-minimal` release artifacts are built
-    /// `--no-default-features --features tray,overlay,hooks` (see
+    /// `--no-default-features --features tray,overlay,hooks,mcp` (see
     /// `.github/workflows/release.yml`), and in those binaries the stub that
     /// stands in for it bails with "local-whisper feature not enabled". Half
     /// the artifacts this project ships cannot act on the advice, and the
