@@ -432,13 +432,11 @@ pub fn list(root: &Path, params: &ListParams) -> Result<ListOutput, String> {
     Ok(ListOutput { recordings, more })
 }
 
-/// The recording `id` means under `root`, read whole: the one recording
-/// ([`store::resolve`] reads an exact id's folder directly, a prefix by
-/// headers).
+/// The recording `id` means under `root`, read whole once
+/// ([`store::resolve_meta`]: an exact id's folder directly, `last` and a
+/// prefix by headers, landing only on a recording that reads).
 fn load(root: &Path, id: &str) -> Result<(PathBuf, RecordingMeta), String> {
-    let dir = store::resolve(root, id).map_err(|e| format!("{e:#}"))?;
-    let meta = store::read_meta(&dir).map_err(|e| format!("{e:#}"))?;
-    Ok((dir, meta))
+    store::resolve_meta(root, id).map_err(|e| format!("{e:#}"))
 }
 
 /// `get_recording`.
@@ -698,7 +696,7 @@ fn holds(meta: &RecordingMeta, needle: &str) -> bool {
 /// the limit. The recordings are listed by headers and read whole one at
 /// a time, each dropped before the next.
 pub fn search(root: &Path, params: &SearchParams) -> Result<SearchOutput, String> {
-    let needle = fold(params.query.trim());
+    let needle = fold(&flat(params.query.trim()));
     if needle.is_empty() {
         return Err("the query is empty: give the words to find".to_string());
     }
@@ -714,7 +712,10 @@ pub fn search(root: &Path, params: &SearchParams) -> Result<SearchOutput, String
         if since.is_some_and(|s| header.started_at < s) {
             continue;
         }
-        let title = render::title_or_default(header.title.as_deref(), header.started_at);
+        let title = flat(&render::title_or_default(
+            header.title.as_deref(),
+            header.started_at,
+        ));
         let hit = |field: &str, snippet: String| SearchHit {
             id: header.id.clone(),
             title: title.clone(),
@@ -1323,6 +1324,9 @@ mod tests {
             snippet.starts_with("Sentence 0 of the lecture") && snippet.ends_with('…'),
             "{snippet}"
         );
+        // Spaces in the query count once, as in the text.
+        let spaced = find(root, "the   Budget", |_| {}).unwrap();
+        assert_eq!(spaced.hits.len(), budget.hits.len(), "{:?}", spaced.hits);
         // Words across two segments of one line are found: the quick check
         // joins the segments as the line does.
         let across = find(root, "la . sentence 1 of", |_| {}).unwrap();

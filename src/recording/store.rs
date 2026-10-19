@@ -198,6 +198,8 @@ pub fn write_meta(dir: &Path, meta: &RecordingMeta) -> anyhow::Result<()> {
 /// out, so a six-hour transcript costs a scan, not its text in memory.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RecordingHeader {
+    /// Required as [`read_meta`] requires it, like `sample_rate`.
+    pub version: u32,
     pub id: String,
     #[serde(default)]
     pub title: Option<String>,
@@ -207,7 +209,6 @@ pub struct RecordingHeader {
     pub started_at: DateTime<Local>,
     #[serde(default)]
     pub ended_at: Option<DateTime<Local>>,
-    #[serde(default)]
     pub sample_rate: u32,
     #[serde(default)]
     pub tracks: Vec<TrackMeta>,
@@ -309,15 +310,27 @@ fn is_plain_folder_name(query: &str) -> bool {
 }
 
 /// Find a recording by `"last"` (the newest), an exact id, or a unique id
-/// prefix. An exact id that is also its folder's name is read directly;
-/// anything else reads the headers ([`list_headers`]), never every
-/// transcript.
+/// prefix ([`resolve_meta`]).
 pub fn resolve(root: &Path, query: &str) -> anyhow::Result<PathBuf> {
+    resolve_meta(root, query).map(|(dir, _)| dir)
+}
+
+/// [`resolve`], with the recording read whole. An exact id that is also
+/// the name of a real folder right under the root (not a symlink) is read
+/// directly; anything else is found by the headers ([`list_headers`]),
+/// and only the candidates are read whole: `last` is the newest recording
+/// that reads, a prefix must match exactly one that reads, and an exact id
+/// whose `recording.json` does not read is that error.
+pub fn resolve_meta(root: &Path, query: &str) -> anyhow::Result<(PathBuf, RecordingMeta)> {
     let query = query.trim();
     if query != "last" && is_plain_folder_name(query) {
         let dir = root.join(query);
-        if read_header(&dir).is_ok_and(|header| header.id == query) {
-            return Ok(dir);
+        if fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            if let Ok(meta) = read_meta(&dir) {
+                if meta.id == query {
+                    return Ok((dir, meta));
+                }
+            }
         }
     }
     let recordings = list_headers(root)?;
@@ -325,24 +338,31 @@ pub fn resolve(root: &Path, query: &str) -> anyhow::Result<PathBuf> {
         bail!("no recordings found in {}", root.display());
     }
     if query == "last" {
-        return Ok(recordings[0].0.clone());
+        return recordings
+            .iter()
+            .find_map(|(dir, _)| read_meta(dir).ok().map(|meta| (dir.clone(), meta)))
+            .with_context(|| format!("no readable recording in {}", root.display()));
     }
-    if let Some((dir, _)) = recordings.iter().find(|(_, m)| m.id == query) {
-        return Ok(dir.clone());
+    if let Some((dir, _)) = recordings.iter().find(|(_, h)| h.id == query) {
+        return read_meta(dir).map(|meta| (dir.clone(), meta));
     }
     let matches: Vec<&(PathBuf, RecordingHeader)> = if query.is_empty() {
         Vec::new()
     } else {
         recordings
             .iter()
-            .filter(|(_, m)| m.id.starts_with(query))
+            .filter(|(_, h)| h.id.starts_with(query))
             .collect()
     };
-    match matches.as_slice() {
-        [] => bail!("no recording matches '{query}'"),
-        [(dir, _)] => Ok(dir.clone()),
-        many => {
-            let ids: Vec<&str> = many.iter().map(|(_, m)| m.id.as_str()).collect();
+    // The ones that read, up to two: one is the answer, two are too many.
+    let mut readable = matches
+        .iter()
+        .filter_map(|(dir, _)| read_meta(dir).ok().map(|meta| (dir.clone(), meta)));
+    match (readable.next(), readable.next()) {
+        (None, _) => bail!("no recording matches '{query}'"),
+        (Some(found), None) => Ok(found),
+        (Some(_), Some(_)) => {
+            let ids: Vec<&str> = matches.iter().map(|(_, h)| h.id.as_str()).collect();
             bail!(
                 "'{query}' matches {} recordings: {}",
                 ids.len(),
@@ -951,6 +971,76 @@ mod tests {
             root.join("2026-09-09_0000"),
             "found by its id"
         );
+    }
+
+    /// An exact id that names a symlink is not read through it: the link
+    /// may point anywhere, and the listing does not show it either.
+    #[test]
+    fn resolve_never_follows_a_symlinked_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("recordings");
+        seed(
+            &root,
+            at(2026, 1, 1, 9, 0),
+            Some("in"),
+            RecordingState::Done,
+            None,
+        );
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let meta = RecordingMeta::new("linked".into(), None, at(2026, 2, 1, 9, 0));
+        write_meta(&outside, &meta).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        let err = resolve(&root, "linked").unwrap_err().to_string();
+        assert!(err.contains("no recording matches 'linked'"), "{err}");
+        assert_eq!(list_headers(&root).unwrap().len(), 1, "not listed");
+    }
+
+    /// A recording whose header reads but whose recording.json does not
+    /// is never `last` nor a prefix's one match; named exactly, its error
+    /// says why. A header needs what read_meta needs.
+    #[test]
+    fn resolve_lands_only_on_recordings_that_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let good = seed(
+            root,
+            at(2026, 1, 1, 9, 0),
+            Some("good"),
+            RecordingState::Done,
+            None,
+        );
+        let bad = seed(
+            root,
+            at(2026, 1, 1, 10, 0),
+            Some("bad"),
+            RecordingState::Done,
+            None,
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(bad.join(META_FILE)).unwrap()).unwrap();
+        json["segments"] = serde_json::json!([{"start_ms": 0, "end_ms": 1, "speaker": "me",
+            "channel": "mic", "text": 42}]);
+        fs::write(bad.join(META_FILE), json.to_string()).unwrap();
+        assert!(read_meta(&bad).is_err() && read_header(&bad).is_ok());
+
+        assert_eq!(
+            resolve(root, "last").unwrap(),
+            good,
+            "the newest that reads"
+        );
+        assert_eq!(
+            resolve(root, "2026-01-01").unwrap(),
+            good,
+            "the one match that reads"
+        );
+        let err = resolve(root, "2026-01-01_1000_bad").unwrap_err();
+        assert!(format!("{err:#}").contains("failed to parse"), "{err:#}");
+
+        let mut no_rate = json.clone();
+        no_rate.as_object_mut().unwrap().remove("sample_rate");
+        fs::write(bad.join(META_FILE), no_rate.to_string()).unwrap();
+        assert!(read_header(&bad).is_err(), "a header needs sample_rate too");
     }
 
     #[test]

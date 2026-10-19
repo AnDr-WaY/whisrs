@@ -995,8 +995,9 @@ Its tools:
   at a time (20,000 by default, 2,000 to 100,000), with `next_offset` for
   the next page. `speaker` is an id such as `S2` or a name.
 - `search_transcripts` (`query`, `since`, `limit`): a search of titles,
-  summaries and transcripts, case aside (in any script: "istanbul" finds
-  "İstanbul", "σοφος" finds "ΣΟΦΟΣ"), newest recording first, that stops
+  summaries and transcripts that ignores case, including accented and
+  non-Latin letters ("istanbul" finds "İstanbul", "σοφος" finds "ΣΟΦΟΣ"),
+  and counts a run of spaces as one, newest recording first, that stops
   after `limit` hits (20 by default, at most 100). A transcript hit
   gives its time, speaker and the `offset` to read it with
   `get_transcript`.
