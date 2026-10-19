@@ -413,6 +413,9 @@ response_format = "wav"     # audio format requested from the API
 max_duration_minutes = 180    # recording stops by itself after this long (1 to 2160)
 audio_retention_days = 7      # 0 = delete audio once transcribed, negative = keep forever
 # dir = "~/Recordings"        # default: ~/.local/share/whisrs/recordings
+# diarization = "auto"        # tell apart the voices on the system audio (see "Speakers"
+#                             #   below): "auto", "backend" or "off"
+# shared_mic = false          # several people share your mic: tell its voices apart too
 
 # Built-in global hotkeys (optional, works without WM keybinds)
 # Triggers: A-Z, 0-9, F1-F24, space, enter, escape, tab, backspace, delete,
@@ -576,8 +579,35 @@ none is in progress and stop the one that is.
 **Two tracks.** Your microphone and the system audio (what your speakers or
 headphones play) are recorded as separate files and transcribed separately.
 Your track is labeled with `user_name`, and everything from the system track is
-labeled "Others" (`--others NAME` on `start` or `toggle` names it otherwise).
-There is no per-person speaker detection on the system track.
+labeled "Others" (`--others NAME` on `start` or `toggle` names it otherwise),
+unless its voices are told apart (see "Speakers" below).
+
+**Speakers.** whisrs can tell apart the voices on the system track
+(`diarization`). Each voice becomes a speaker, numbered in the order they
+first speak: the transcript shows them as "Speaker 1", "Speaker 2" and so on,
+and `recording.json` lists them under `speakers` with their ids (`S1`, `S2`,
+...), how long each one talks (`talk_ms`) and the method used
+(`diarization`). Nothing is guessed: when the system audio holds a single
+voice, it keeps the others label ("Others", or the name given with
+`--others`). A voice with less than 5 seconds of talk and under 2 % of its
+track is marked `minor` in `recording.json`, and its lines stay in the
+transcript. Speech the voices could not be matched to stays under the others
+label.
+
+`diarization = "backend"` takes the speakers the transcription backend labels:
+an `asr-sidecar` that returns `segments[].speaker`. `"auto"` (the default)
+does the same for the backends that tell voices apart by default, and keeps
+one speaker per track for the others. `"off"` always keeps one speaker per
+track. A backend labels voices per request, so a track sent as several
+chunks (over 10 minutes of speech for `asr-sidecar`) has its voices told
+apart per chunk: the same person in two chunks becomes two speakers.
+
+In an in-person meeting where several people share your mic, set
+`shared_mic = true`, or pass `--shared-mic` to `start`, `toggle` or `retry`
+(`--shared-mic=false` turns it off for one recording). The mic's voices are
+then told apart too (`M1`, `M2`, ...), and the mic is you only when it holds
+a single voice. A recording keeps the `shared_mic` it started with; a retry
+given the option replaces it.
 
 **Languages.** Each track is transcribed in its own language. `language`
 defaults to `[general] language`, and `mic_language` and `system_language`

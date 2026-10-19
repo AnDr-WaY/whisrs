@@ -220,6 +220,18 @@ mod tests {
         }
     }
 
+    fn speaker(id: &str, name: &str, source: &str, channel: TrackKind) -> Speaker {
+        Speaker {
+            id: id.into(),
+            name: name.into(),
+            source: source.into(),
+            evidence: None,
+            talk_ms: 0,
+            channel: Some(channel),
+            minor: false,
+        }
+    }
+
     fn meta() -> RecordingMeta {
         let started = Local.with_ymd_and_hms(2026, 10, 2, 14, 5, 0).unwrap();
         let mut meta = RecordingMeta::new(
@@ -243,16 +255,8 @@ mod tests {
         meta.mic_language = Some("de".into());
         meta.system_language = Some("de".into());
         meta.speakers = vec![
-            Speaker {
-                id: "me".into(),
-                name: "Yosif".into(),
-                source: "self".into(),
-            },
-            Speaker {
-                id: "others".into(),
-                name: "Others".into(),
-                source: "channel".into(),
-            },
+            speaker("me", "Yosif", "self", TrackKind::Mic),
+            speaker("others", "Others", "channel", TrackKind::System),
         ];
         meta.segments = vec![
             seg(1_000, "me", "Hi all."),
@@ -363,6 +367,43 @@ mod tests {
         assert!(md.contains("  - \"Video\"\n"), "{md}");
         assert!(md.contains("**[00:01:05] Video:** Sounds good."), "{md}");
         assert!(render_text(&m).contains("[00:01:05] Video: Sounds good.\n"));
+    }
+
+    /// Separated voices render by name: two voices on the system track,
+    /// one of them unnamed, in turns of their own, and in the front matter
+    /// as a flat list.
+    #[test]
+    fn separated_voices_render_by_name() {
+        let mut m = meta();
+        m.speakers = vec![
+            speaker("me", "Yosif", "self", TrackKind::Mic),
+            speaker("S1", "Speaker 1", "none", TrackKind::System),
+            speaker("S2", "Speaker 2", "none", TrackKind::System),
+        ];
+        m.segments = vec![
+            seg(1_000, "me", "Hi all."),
+            seg(5_000, "S1", "Hello."),
+            seg(6_000, "S1", "Good to see you."),
+            seg(9_000, "S2", "Morning."),
+        ];
+        let md = render_markdown(&m);
+        assert!(
+            md.contains("speakers:\n  - \"Yosif\"\n  - \"Speaker 1\"\n  - \"Speaker 2\"\n"),
+            "{md}"
+        );
+        assert!(
+            md.contains(
+                "**[00:00:05] Speaker 1:** Hello. Good to see you.\n\n\
+                 **[00:00:09] Speaker 2:** Morning.\n"
+            ),
+            "{md}"
+        );
+        assert_eq!(
+            render_text(&m),
+            "[00:00:01] Yosif: Hi all.\n\
+             [00:00:05] Speaker 1: Hello. Good to see you.\n\
+             [00:00:09] Speaker 2: Morning.\n"
+        );
     }
 
     #[test]

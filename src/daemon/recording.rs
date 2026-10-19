@@ -751,7 +751,8 @@ fn open_tracks(
 
 /// The meta of a recording that is starting: each track's language from
 /// `options` ([`RecordingOptions::language_for`]), else from the config
-/// ([`RecordingConfig::language_for`]), and the label of the system track.
+/// ([`RecordingConfig::language_for`]), the label of the system track, and
+/// whether the mic is shared, from `options` else the config.
 fn new_meta(
     id: String,
     title: Option<String>,
@@ -775,6 +776,7 @@ fn new_meta(
             .clone()
             .unwrap_or_else(|| DEFAULT_OTHERS_LABEL.to_string()),
     );
+    meta.shared_mic = Some(options.shared_mic.unwrap_or(recording.shared_mic));
     meta
 }
 
@@ -1366,8 +1368,9 @@ fn has_audio(dir: &Path, meta: &RecordingMeta) -> bool {
     !meta.audio_deleted && meta.tracks.iter().any(|t| dir.join(&t.file).exists())
 }
 
-/// Queue a recording for transcription again. The languages `options` give
-/// replace the stored ones (and are saved); the rest keep theirs.
+/// Queue a recording for transcription again. The languages and
+/// `shared_mic` `options` give replace the stored ones (and are saved); the
+/// rest keep theirs.
 async fn retry(
     context: &Arc<DaemonContext>,
     query: &str,
@@ -1821,13 +1824,13 @@ fn recover_meta(
 
 /// Repair an interrupted recording's WAVs and update its meta. Blocking.
 /// `retry` (a manual retry) zeroes the crash-loop count first and replaces
-/// the languages it gives ([`RecordingMeta::apply_languages`]).
+/// the settings it gives ([`RecordingMeta::apply_options`]).
 fn recover_dir(dir: &Path, retry: Option<&RecordingOptions>) -> Result<RecordingMeta> {
     let mut meta = store::read_meta(dir)?;
     if let Some(options) = retry {
         meta.attempts = 0;
         meta.network_wait = None;
-        meta.apply_languages(options);
+        meta.apply_options(options);
     }
     let mut repaired = Vec::new();
     let mut newest: Option<std::time::SystemTime> = None;
@@ -2575,6 +2578,44 @@ mod tests {
         assert_eq!(meta.mic_language.as_deref(), Some("it"));
         assert_eq!(meta.system_language.as_deref(), Some("fr"));
         assert_eq!(meta.others_label.as_deref(), Some("Others"));
+        assert_eq!(meta.shared_mic, Some(false), "the config's");
+
+        let meta = stored(r#"{"cmd":"recording","action":"start","shared_mic":true}"#);
+        assert_eq!(meta.shared_mic, Some(true));
+    }
+
+    /// `shared_mic` is stored at start from the config when the command
+    /// gives none, kept by a retry without it, and replaced by one with it.
+    #[tokio::test]
+    async fn shared_mic_is_stored_and_a_retry_replaces_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (context, mut queue) =
+            test_context_with(tmp.path(), working_backend(), "shared_mic = true\n");
+        let (id, dir) = store::create(tmp.path(), Local::now(), None).unwrap();
+        let mut meta = new_meta(id, None, Local::now(), &Default::default(), &context.config);
+        assert_eq!(meta.shared_mic, Some(true), "from the config");
+        meta.status = RecordingState::Failed;
+        meta.tracks.push(track_meta(TrackKind::Mic, "test".into()));
+        store::write_meta(&dir, &meta).unwrap();
+        std::fs::write(
+            store::audio_path(&dir, TrackKind::Mic),
+            whisrs::audio::wav::encode_wav(&[0; 1600]).unwrap(),
+        )
+        .unwrap();
+
+        retry(&context, "last", &RecordingOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(store::read_meta(&dir).unwrap().shared_mic, Some(true));
+        process_one(&context, queue.try_recv().unwrap()).await;
+
+        let options = options_from_ipc(
+            r#"{"cmd":"recording","action":"retry","id":"last","shared_mic":false}"#,
+        );
+        retry(&context, "last", &options.validated().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(store::read_meta(&dir).unwrap().shared_mic, Some(false));
     }
 
     /// Bad values from a client other than the CLI are refused before a

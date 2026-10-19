@@ -338,7 +338,7 @@ impl TimeMap {
 /// `words` joined the way the backend's own `text` joins them: with a
 /// space, or with none where the text runs two of them together, or holds
 /// no space at all (Chinese, Japanese).
-fn join_words<'a>(text: &str, words: impl IntoIterator<Item = &'a str>) -> String {
+pub(super) fn join_words<'a>(text: &str, words: impl IntoIterator<Item = &'a str>) -> String {
     let unspaced = !text.contains(char::is_whitespace);
     let mut out = String::new();
     let mut previous: Option<&str> = None;

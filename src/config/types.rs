@@ -108,6 +108,27 @@ pub struct RecordingConfig {
     /// Recordings directory. `None` = `$XDG_DATA_HOME/whisrs/recordings`.
     #[serde(default)]
     pub dir: Option<String>,
+    /// How the voices on the system track are told apart.
+    #[serde(default)]
+    pub diarization: DiarizationMode,
+    /// Several people share the mic (an in-person meeting): its voices are
+    /// told apart too. `false` makes the whole mic track the user.
+    #[serde(default)]
+    pub shared_mic: bool,
+}
+
+/// `[recording] diarization`: how the voices of a recording are told apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiarizationMode {
+    /// `backend` when the recording backend can label speakers, else `off`.
+    #[default]
+    Auto,
+    /// The transcription backend labels speakers (an `asr-sidecar` that
+    /// returns `segments[].speaker`).
+    Backend,
+    /// One speaker per track, as before speakers were separated.
+    Off,
 }
 
 fn default_recording_max_duration_minutes() -> u32 {
@@ -131,6 +152,8 @@ impl Default for RecordingConfig {
             max_duration_minutes: default_recording_max_duration_minutes(),
             audio_retention_days: default_recording_audio_retention_days(),
             dir: None,
+            diarization: DiarizationMode::default(),
+            shared_mic: false,
         }
     }
 }
@@ -2253,6 +2276,22 @@ impl Config {
                              until you set [recording] backend to a batch backend: \
                              {RECORDING_BATCH_BACKENDS}. Failed recordings keep their audio, so \
                              `whisrs recording retry` works after the fix."
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Speaker separation by the backend needs a backend that labels
+        // speakers; otherwise each track stays one speaker, as with "off".
+        if recording.diarization == DiarizationMode::Backend {
+            if let Ok(backend) = crate::transcription::factory::recording_backend_name(self) {
+                if crate::recording::speakers::backend_speakers(&backend, self).is_none() {
+                    warnings.push(ConfigWarning {
+                        message: format!(
+                            "[recording] diarization = \"backend\", but the {backend} backend \
+                             does not tell voices apart, so each track stays one speaker. Use \
+                             a backend that does, or remove the key."
                         ),
                     });
                 }
@@ -5139,6 +5178,74 @@ mod tests {
             // The feature's own warnings, and a collision on its hotkey.
             .filter(|m| m.contains("[recording]") || m.contains("[hotkeys] recording"))
             .collect()
+    }
+
+    /// `diarization` defaults to `auto`, takes the four documented values
+    /// as written, and refuses anything else when the file is read.
+    #[test]
+    fn recording_speaker_keys_parse() {
+        let recording = RecordingConfig::default();
+        assert_eq!(recording.diarization, DiarizationMode::Auto);
+        assert!(!recording.shared_mic);
+        for (value, want) in [
+            ("auto", DiarizationMode::Auto),
+            ("backend", DiarizationMode::Backend),
+            ("off", DiarizationMode::Off),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "[recording]\ndiarization = \"{value}\"\nshared_mic = true\n"
+            ))
+            .unwrap();
+            let recording = RecordingConfig::effective(&config);
+            assert_eq!(recording.diarization, want, "{value}");
+            assert!(recording.shared_mic);
+        }
+        for bad in ["on", "Backend", ""] {
+            let parsed: Result<Config, _> =
+                toml::from_str(&format!("[recording]\ndiarization = \"{bad}\"\n"));
+            let err = parsed.expect_err(bad).to_string();
+            assert!(err.contains("diarization"), "{bad}: {err}");
+        }
+        // Known keys: no unknown-key warning.
+        assert!(
+            unknown_config_keys("[recording]\ndiarization = \"off\"\nshared_mic = true\n")
+                .is_empty()
+        );
+    }
+
+    /// `diarization = "backend"` with a backend that labels no speakers
+    /// warns: each track would stay one speaker. An `asr-sidecar` may label
+    /// them, so it does not.
+    #[test]
+    fn backend_diarization_needs_a_backend_that_labels_speakers() {
+        let mut config = validatable_config("groq");
+        config.recording = recording_config(|r| r.diarization = DiarizationMode::Backend);
+        let warnings = recording_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("does not tell voices apart"),
+            "{warnings:?}"
+        );
+
+        config.recording = recording_config(|r| {
+            r.diarization = DiarizationMode::Backend;
+            r.backend = Some("asr-sidecar".into());
+        });
+        config.asr_sidecar = Some(AsrSidecarConfig {
+            url: "http://127.0.0.1:8765/transcribe".into(),
+            model: default_asr_sidecar_model(),
+            api_key: None,
+        });
+        assert!(recording_warnings(&config)
+            .iter()
+            .all(|w| !w.contains("voices apart")));
+
+        // `auto` and `off` never warn.
+        for mode in [DiarizationMode::Auto, DiarizationMode::Off] {
+            let mut config = validatable_config("groq");
+            config.recording = recording_config(|r| r.diarization = mode);
+            assert!(recording_warnings(&config).is_empty(), "{mode:?}");
+        }
     }
 
     #[test]

@@ -5,10 +5,11 @@
 //! the mic track ([`super::echo`]). Only the speech in each track is sent
 //! ([`super::speech`]): its active stretches are packed into condensed,
 //! backend-sized chunks, each chunk is transcribed into timed segments, and
-//! the segments are mapped back, filtered and moved onto the recording
-//! timeline. Mic segments that still echo the system track are dropped, and
-//! the two channels are labelled and merged. The result lands in
-//! `recording.json` and `<id>.md`.
+//! the segments are mapped back, split where the voice changes when the
+//! track's voices are told apart ([`super::speakers`]), filtered and moved
+//! onto the recording timeline. Mic segments that still echo the system
+//! track are dropped, the voices become speakers, and the two channels are
+//! merged. The result lands in `recording.json` and `<id>.md`.
 
 use std::ffi::CStr;
 use std::fs;
@@ -27,10 +28,11 @@ use tracing::{debug, info, warn};
 
 use super::echo::{cancel_echo, EchoOutcome};
 use super::render::render_markdown;
+use super::speakers::{self, Labels};
 use super::speech::{self, TimeMap};
 use super::split::frame_len;
 use super::store::{self, CACHE_DIR};
-use super::{RecordingMeta, RecordingState, Segment, Speaker, TrackKind, TranscriptSegment};
+use super::{RecordingMeta, RecordingState, Segment, TrackKind, TranscriptSegment};
 use crate::audio::wav::encode_wav;
 use crate::replacements::Replacer;
 use crate::transcription::factory::{
@@ -73,7 +75,7 @@ pub async fn process_recording(
     let mut meta = store::read_meta(dir)?;
     meta.status = RecordingState::Processing;
     meta.error = None;
-    fill_languages(&mut meta, config);
+    fill_stored_settings(&mut meta, config);
     store::write_meta(dir, &meta)?;
 
     let name = recording_backend_name(config)?;
@@ -104,9 +106,14 @@ pub async fn process_recording(
     // Only the language differs between the two requests, so the model and
     // the prompt are the mic's.
     let model = recording_model_label(&name, config, &mic_request.tcfg);
+    let plan = speakers::plan(config, &name, meta.shared_mic.unwrap_or(false));
     info!(
-        "processing recording {} with {name} (model {model}, mic in {}, system audio in {})",
-        meta.id, mic_request.tcfg.language, system_request.tcfg.language
+        "processing recording {} with {name} (model {model}, mic in {}, system audio in {}, \
+         speakers {})",
+        meta.id,
+        mic_request.tcfg.language,
+        system_request.tcfg.language,
+        plan.method.label()
     );
 
     let filler = if config.general.remove_filler_words {
@@ -130,8 +137,7 @@ pub async fn process_recording(
 
     let echo_cache = mic_request.cache.echo_cancelled();
     let cancelled_mic = echo_cancelled_mic(dir, &meta).await;
-    let mut mic = Vec::new();
-    let mut system = Vec::new();
+    let mut transcribed = Vec::new();
     let mut readable_tracks = 0usize;
     for track in meta.tracks.clone() {
         let path = dir.join(&track.file);
@@ -160,15 +166,13 @@ pub async fn process_recording(
         let job = TrackJob {
             path: &path,
             kind: track.kind,
-            offset_ms: track.offset_ms,
             near_end,
         };
-        let segments =
-            transcribe_track(backend.as_ref(), &request.tcfg, &filters, track_cache, &job)
-                .await
-                .with_context(|| {
-                    format!("failed to transcribe the {} track", track.kind.file_stem())
-                })?;
+        let segments = transcribe_track(backend.as_ref(), &request.tcfg, track_cache, &job)
+            .await
+            .with_context(|| {
+                format!("failed to transcribe the {} track", track.kind.file_stem())
+            })?;
         info!(
             "recording {}: {} track ({}) gave {} segment(s)",
             meta.id,
@@ -176,17 +180,33 @@ pub async fn process_recording(
             request.tcfg.language,
             segments.len()
         );
-        match track.kind {
-            TrackKind::Mic => mic.extend(segments),
-            TrackKind::System => system.extend(segments),
-        }
+        transcribed.push(Transcribed {
+            kind: track.kind,
+            offset_ms: track.offset_ms,
+            segments,
+        });
     }
     if readable_tracks == 0 {
         bail!("no recorded audio found for recording {}", meta.id);
     }
 
+    let mut mic = Vec::new();
+    let mut system = Vec::new();
+    for track in transcribed {
+        let labels = if plan.separates(track.kind) {
+            Labels::Backend
+        } else {
+            Labels::None
+        };
+        let segments = finish_track(track.segments, labels, &filters, track.offset_ms);
+        match track.kind {
+            TrackKind::Mic => mic.extend(segments),
+            TrackKind::System => system.extend(segments),
+        }
+    }
+
     let before = mic.len();
-    let mic = drop_echo_segments(mic, &system, ECHO_TOLERANCE_MS);
+    let mut mic = drop_echo_segments(mic, &system, ECHO_TOLERANCE_MS);
     if mic.len() < before {
         info!(
             "recording {}: dropped {} mic segment(s) echoing the system audio",
@@ -195,8 +215,20 @@ pub async fn process_recording(
         );
     }
 
-    meta.speakers = speakers_for(&meta, config);
+    let has = |kind| meta.tracks.iter().any(|t| t.kind == kind);
+    let user = user_name(&RecordingConfig::effective(config));
+    let others_label = meta.others_label().to_string();
+    let context = speakers::Context {
+        has_mic: has(TrackKind::Mic),
+        has_system: has(TrackKind::System),
+        separate_mic: plan.separates(TrackKind::Mic),
+        separate_system: plan.separates(TrackKind::System),
+        user_name: &user,
+        others_label: &others_label,
+    };
+    meta.speakers = speakers::assign(&mut mic, &mut system, &context);
     meta.segments = merge_channels(mic, system);
+    meta.diarization = Some(plan.method.label().to_string());
     meta.backend = Some(name);
     meta.model = Some(model);
     meta.status = RecordingState::Done;
@@ -215,15 +247,59 @@ pub async fn process_recording(
 
 /// Give a track with no stored language (a recording made before languages
 /// were stored) the one the config gives it ([`RecordingConfig::language_for`]),
-/// so `recording.json` says what the transcript was made in and a later
+/// and a recording with no stored `shared_mic` the config's, so
+/// `recording.json` says what the transcript was made with and a later
 /// retry keeps it.
-fn fill_languages(meta: &mut RecordingMeta, config: &Config) {
+fn fill_stored_settings(meta: &mut RecordingMeta, config: &Config) {
     let recording = RecordingConfig::effective(config);
     let general = &config.general.language;
     meta.mic_language
         .get_or_insert_with(|| recording.language_for(TrackKind::Mic, general));
     meta.system_language
         .get_or_insert_with(|| recording.language_for(TrackKind::System, general));
+    meta.shared_mic.get_or_insert(recording.shared_mic);
+}
+
+/// One track's raw transcript: its segments on the track's own timeline,
+/// before filtering ([`transcribe_track`]).
+struct Transcribed {
+    kind: TrackKind,
+    offset_ms: i64,
+    segments: Vec<Segment>,
+}
+
+/// A track's raw segments as they go into the transcript: split where the
+/// voice changes ([`speakers::split_segment`], by `labels`), filtered, and
+/// moved onto the recording timeline by the track's offset.
+fn finish_track(
+    raw: Vec<Segment>,
+    labels: Labels,
+    filters: &SegmentFilters,
+    offset_ms: i64,
+) -> Vec<Segment> {
+    let shift = |ms: u64| (offset_ms + ms as i64).max(0) as u64;
+    raw.into_iter()
+        .flat_map(|seg| speakers::split_segment(seg, labels))
+        .filter_map(|seg| {
+            let text = filters.apply(&seg.text)?;
+            Some(Segment {
+                start_ms: shift(seg.start_ms),
+                end_ms: shift(seg.end_ms),
+                text,
+                speaker: seg.speaker,
+                words: seg.words.map(|words| {
+                    words
+                        .into_iter()
+                        .map(|mut w| {
+                            w.start_ms = shift(w.start_ms);
+                            w.end_ms = shift(w.end_ms);
+                            w
+                        })
+                        .collect()
+                }),
+            })
+        })
+        .collect()
 }
 
 /// One track's request and the cache of its finished chunks. The two
@@ -539,24 +615,27 @@ fn speech_activity(near_end: Option<&[bool]>, energies: &[f64], stem: &str) -> V
 struct TrackJob<'a> {
     path: &'a Path,
     kind: TrackKind,
-    offset_ms: i64,
     /// Where the user speaks, from the echo canceller, for the cancelled
     /// mic; every other track goes by frame energy.
     near_end: Option<&'a [bool]>,
 }
 
-/// Transcribe the speech in one track into filtered segments on the
-/// recording timeline.
+/// Transcribe the speech in one track into raw segments on the track's own
+/// timeline: not filtered, not yet moved by the track's offset.
 ///
 /// Peak memory is one chunk: the track is scanned once for its frame
 /// energies, its speech found ([`speech::regions`]) and packed into
 /// condensed chunks ([`speech::pack`]), and each chunk is read from disk
 /// only when it is sent. A track without speech sends nothing. A chunk
 /// already in `cache` is not sent again.
+///
+/// A backend labels voices per request, so in a track sent as several
+/// chunks a label is made unique by its chunk ([`chunk_label`]): voice `0`
+/// of the first chunk and voice `0` of the second are not taken for one
+/// person.
 async fn transcribe_track(
     backend: &dyn TranscriptionBackend,
     tcfg: &TranscriptionConfig,
-    filters: &SegmentFilters,
     cache: &ChunkCache,
     job: &TrackJob<'_>,
 ) -> anyhow::Result<Vec<Segment>> {
@@ -589,8 +668,9 @@ async fn transcribe_track(
     );
     drop((scan, active, regions));
 
+    let several = chunks.len() > 1;
     let mut out = Vec::new();
-    for map in chunks {
+    for (index, map) in chunks.into_iter().enumerate() {
         let raw = match cache.load(job.kind, &map) {
             Some(segments) => {
                 debug!(
@@ -614,31 +694,28 @@ async fn transcribe_track(
                 transcript.segments
             }
         };
-        let offset_ms = job.offset_ms;
-        let shift = |ms: u64| (offset_ms + ms as i64).max(0) as u64;
-        for seg in raw.into_iter().flat_map(|seg| map.map_segment(seg)) {
-            let Some(text) = filters.apply(&seg.text) else {
-                continue;
-            };
-            out.push(Segment {
-                start_ms: shift(seg.start_ms),
-                end_ms: shift(seg.end_ms),
-                text,
-                speaker: seg.speaker,
-                words: seg.words.map(|words| {
-                    words
-                        .into_iter()
-                        .map(|mut w| {
-                            w.start_ms = shift(w.start_ms);
-                            w.end_ms = shift(w.end_ms);
-                            w
-                        })
-                        .collect()
-                }),
-            });
+        for mut seg in raw.into_iter().flat_map(|seg| map.map_segment(seg)) {
+            if several {
+                let label = |l: &mut Option<String>| {
+                    if let Some(l) = l {
+                        *l = chunk_label(index, l);
+                    }
+                };
+                label(&mut seg.speaker);
+                for word in seg.words.iter_mut().flatten() {
+                    label(&mut word.speaker);
+                }
+            }
+            out.push(seg);
         }
     }
     Ok(out)
+}
+
+/// Voice `label` of chunk `index` (from 0) of a track sent as several:
+/// `c1:0` is voice `0` of the first chunk.
+fn chunk_label(index: usize, label: &str) -> String {
+    format!("c{}:{label}", index + 1)
 }
 
 /// Transcribe one chunk, waiting out rate limits within
@@ -789,12 +866,14 @@ pub fn drop_echo_segments(mic: Vec<Segment>, system: &[Segment], tol_ms: u64) ->
         .collect()
 }
 
-/// Label and merge both channels into the transcript, ordered by start time.
+/// Merge both channels into the transcript, ordered by start time. Each
+/// segment keeps its speaker ([`speakers::assign`]); one without falls back
+/// to its track's own speaker.
 fn merge_channels(mic: Vec<Segment>, system: Vec<Segment>) -> Vec<TranscriptSegment> {
     let label = |seg: Segment, kind: TrackKind| TranscriptSegment {
         start_ms: seg.start_ms,
         end_ms: seg.end_ms,
-        speaker: speaker_id(kind).to_string(),
+        speaker: seg.speaker.unwrap_or_else(|| speaker_id(kind).to_string()),
         channel: kind,
         text: seg.text,
     };
@@ -807,33 +886,12 @@ fn merge_channels(mic: Vec<Segment>, system: Vec<Segment>) -> Vec<TranscriptSegm
     merged
 }
 
+/// The id of a track that is one speaker.
 fn speaker_id(kind: TrackKind) -> &'static str {
     match kind {
-        TrackKind::Mic => "me",
-        TrackKind::System => "others",
+        TrackKind::Mic => speakers::ME,
+        TrackKind::System => speakers::OTHERS,
     }
-}
-
-/// One speaker per recorded channel; the system one is named by the
-/// recording's others label.
-fn speakers_for(meta: &RecordingMeta, config: &Config) -> Vec<Speaker> {
-    let has = |kind| meta.tracks.iter().any(|t| t.kind == kind);
-    let mut speakers = Vec::new();
-    if has(TrackKind::Mic) {
-        speakers.push(Speaker {
-            id: speaker_id(TrackKind::Mic).into(),
-            name: user_name(&RecordingConfig::effective(config)),
-            source: "self".into(),
-        });
-    }
-    if has(TrackKind::System) {
-        speakers.push(Speaker {
-            id: speaker_id(TrackKind::System).into(),
-            name: meta.others_label().into(),
-            source: "channel".into(),
-        });
-    }
-    speakers
 }
 
 /// Name for the "me" speaker: `[recording] user_name`, else the passwd full
@@ -2065,6 +2123,354 @@ mod tests {
             &system_regions,
             &system_scan.energies,
         );
+    }
+
+    /// [`FakeBackend`] with a voice label on every segment and its one
+    /// word, looked up by the segment's text: like a backend that labels
+    /// speakers per request (an `asr-sidecar` returning
+    /// `segments[].speaker`).
+    struct Labelled {
+        inner: Arc<FakeBackend>,
+        voices: Vec<(&'static str, &'static str)>,
+    }
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for Labelled {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> anyhow::Result<String> {
+            unreachable!("recordings ask for segments")
+        }
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+        async fn transcribe_segments(
+            &self,
+            audio: &[u8],
+            config: &TranscriptionConfig,
+        ) -> anyhow::Result<Transcript> {
+            let mut transcript = self.inner.transcribe_segments(audio, config).await?;
+            for seg in &mut transcript.segments {
+                let voice = self
+                    .voices
+                    .iter()
+                    .find(|(text, _)| *text == seg.text)
+                    .map(|(_, voice)| voice.to_string());
+                seg.speaker = voice.clone();
+                seg.words = Some(vec![crate::recording::Word {
+                    start_ms: seg.start_ms,
+                    end_ms: seg.end_ms,
+                    text: seg.text.clone(),
+                    speaker: voice,
+                }]);
+            }
+            Ok(transcript)
+        }
+        fn max_segment_chunk_secs(&self, config: &TranscriptionConfig) -> Option<u32> {
+            self.inner.max_segment_chunk_secs(config)
+        }
+    }
+
+    /// A config whose recording backend labels speakers, with `extra`
+    /// lines in `[recording]`.
+    fn speaker_config(extra: &str) -> Config {
+        toml::from_str(&format!(
+            "[general]\nbackend = \"asr-sidecar\"\n\
+             [asr-sidecar]\nurl = \"http://127.0.0.1:1/t\"\n\
+             [recording]\nuser_name = \"Tester\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    async fn run_labelled(dir: &Path, backend: Labelled, config: &Config) -> RecordingMeta {
+        process_recording(
+            dir,
+            config,
+            Some(Arc::new(backend) as Arc<dyn TranscriptionBackend>),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn speaker_lines(meta: &RecordingMeta) -> Vec<(&str, &str)> {
+        meta.segments
+            .iter()
+            .map(|s| (s.speaker.as_str(), s.text.as_str()))
+            .collect()
+    }
+
+    fn speaker_names(meta: &RecordingMeta) -> Vec<(&str, &str)> {
+        meta.speakers
+            .iter()
+            .map(|s| (s.id.as_str(), s.name.as_str()))
+            .collect()
+    }
+
+    /// A call: the user once, then two remote voices on the system track.
+    fn call() -> (tempfile::TempDir, RecordingMeta) {
+        recording(&[
+            (TrackKind::Mic, 0, Some(track(20.0, &[(1.0, 1.0, 3000)]))),
+            (
+                TrackKind::System,
+                0,
+                Some(track(
+                    20.0,
+                    &[(4.0, 2.0, 5000), (9.0, 2.0, 6000), (14.0, 2.0, 7000)],
+                )),
+            ),
+        ])
+    }
+
+    fn call_voices() -> Labelled {
+        Labelled {
+            inner: FakeBackend::new(
+                &[
+                    (3000, "hi all"),
+                    (5000, "hello there"),
+                    (6000, "good morning"),
+                    (7000, "so the plan"),
+                ],
+                None,
+            ),
+            voices: vec![
+                ("hi all", "0"),
+                ("hello there", "1"),
+                ("good morning", "0"),
+                ("so the plan", "1"),
+            ],
+        }
+    }
+
+    /// The voices a backend labels on the system track reach the
+    /// transcript as speakers by first appearance (its own labels play no
+    /// part), unnamed ones as `Speaker N`; the mic stays the user.
+    #[tokio::test]
+    async fn backend_voices_become_speakers() {
+        let (tmp, _) = call();
+        let config = speaker_config("diarization = \"backend\"\n");
+        let meta = run_labelled(tmp.path(), call_voices(), &config).await;
+        assert_eq!(
+            speaker_lines(&meta),
+            [
+                ("me", "hi all"),
+                ("S1", "hello there"),
+                ("S2", "good morning"),
+                ("S1", "so the plan"),
+            ]
+        );
+        assert_eq!(
+            speaker_names(&meta),
+            [("me", "Tester"), ("S1", "Speaker 1"), ("S2", "Speaker 2")]
+        );
+        assert_eq!(meta.speakers[1].talk_ms, 4000);
+        assert_eq!(meta.diarization.as_deref(), Some("asr-sidecar"));
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        for line in [
+            "speakers:\n  - \"Tester\"\n  - \"Speaker 1\"\n  - \"Speaker 2\"\n",
+            "**[00:00:04] Speaker 1:** hello there\n",
+            "**[00:00:09] Speaker 2:** good morning\n",
+            "**[00:00:14] Speaker 1:** so the plan\n",
+        ] {
+            assert!(md.contains(line), "{line:?} missing from:\n{md}");
+        }
+        assert_eq!(store::read_meta(tmp.path()).unwrap(), meta, "persisted");
+    }
+
+    /// Answers every request with one segment whose two words are two
+    /// voices, timed in the first second of the chunk.
+    struct TwoVoicesInOneLine;
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for TwoVoicesInOneLine {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> anyhow::Result<String> {
+            unreachable!("recordings ask for segments")
+        }
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> anyhow::Result<Transcript> {
+            let word = |start_ms, end_ms, text: &str, voice: &str| crate::recording::Word {
+                start_ms,
+                end_ms,
+                text: text.into(),
+                speaker: Some(voice.into()),
+            };
+            Ok(Transcript {
+                segments: vec![Segment {
+                    start_ms: 300,
+                    end_ms: 1200,
+                    text: "Ready? Yes.".into(),
+                    speaker: Some("0".into()),
+                    words: Some(vec![
+                        word(300, 600, "ready", "0"),
+                        word(800, 1200, "yes", "1"),
+                    ]),
+                }],
+            })
+        }
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A line the backend gives two voices is split by voice only when the
+    /// track's voices are told apart; otherwise it stays one line.
+    #[tokio::test]
+    async fn a_line_is_split_by_voice_only_when_separating() {
+        let process = |extra: &'static str| async move {
+            let (tmp, _) =
+                recording(&[(TrackKind::System, 0, Some(track(4.0, &[(1.0, 1.0, 3000)])))]);
+            let meta = process_recording(
+                tmp.path(),
+                &speaker_config(extra),
+                Some(Arc::new(TwoVoicesInOneLine) as Arc<dyn TranscriptionBackend>),
+            )
+            .await
+            .unwrap();
+            let lines: Vec<(String, String)> = meta
+                .segments
+                .iter()
+                .map(|s| (s.speaker.clone(), s.text.clone()))
+                .collect();
+            lines
+        };
+        let pair = |speaker: &str, text: &str| (speaker.to_string(), text.to_string());
+        assert_eq!(
+            process("diarization = \"backend\"\n").await,
+            [pair("S1", "Ready?"), pair("S2", "Yes.")]
+        );
+        assert_eq!(
+            process("diarization = \"off\"\n").await,
+            [pair("others", "Ready? Yes.")]
+        );
+    }
+
+    /// `off`, and `auto` with a backend that does not separate voices by
+    /// default, keep one speaker per track whatever the backend labels.
+    #[tokio::test]
+    async fn without_separation_backend_labels_are_ignored() {
+        for extra in ["diarization = \"off\"\n", ""] {
+            let (tmp, _) = call();
+            let meta = run_labelled(tmp.path(), call_voices(), &speaker_config(extra)).await;
+            assert_eq!(
+                speaker_lines(&meta),
+                [
+                    ("me", "hi all"),
+                    ("others", "hello there"),
+                    ("others", "good morning"),
+                    ("others", "so the plan"),
+                ],
+                "{extra:?}"
+            );
+            assert_eq!(
+                speaker_names(&meta),
+                [("me", "Tester"), ("others", "Others")]
+            );
+            assert_eq!(meta.diarization.as_deref(), Some("off"));
+        }
+    }
+
+    /// Each chunk of a long track is its own request, whose labels restart:
+    /// voice `0` in two chunks is two speakers, not one.
+    #[tokio::test]
+    async fn voice_labels_are_per_chunk() {
+        let (tmp, _) = recording(&[(
+            TrackKind::System,
+            0,
+            Some(track(
+                27.0,
+                &[(2.0, 1.0, 3000), (12.0, 1.0, 4000), (22.0, 1.0, 5000)],
+            )),
+        )]);
+        // A 3 s cap: one chunk per burst, each labelled `0` by its request.
+        let backend = Labelled {
+            inner: FakeBackend::new(
+                &[(3000, "first"), (4000, "second"), (5000, "third")],
+                Some(3),
+            ),
+            voices: vec![("first", "0"), ("second", "0"), ("third", "0")],
+        };
+        let config = speaker_config("diarization = \"backend\"\n");
+        let meta = run_labelled(tmp.path(), backend, &config).await;
+        assert_eq!(
+            speaker_lines(&meta),
+            [("S1", "first"), ("S2", "second"), ("S3", "third")]
+        );
+    }
+
+    /// One remote voice keeps the others label (here `--others Video`).
+    #[tokio::test]
+    async fn one_remote_voice_keeps_the_others_label() {
+        let (tmp, _) = call();
+        let mut meta = store::read_meta(tmp.path()).unwrap();
+        meta.others_label = Some("Video".into());
+        store::write_meta(tmp.path(), &meta).unwrap();
+        let mut backend = call_voices();
+        backend.voices = vec![
+            ("hi all", "0"),
+            ("hello there", "1"),
+            ("good morning", "1"),
+            ("so the plan", "1"),
+        ];
+        let config = speaker_config("diarization = \"backend\"\n");
+        let meta = run_labelled(tmp.path(), backend, &config).await;
+        assert_eq!(speaker_names(&meta), [("me", "Tester"), ("S1", "Video")]);
+        assert_eq!(meta.speakers[1].source, "channel");
+        let md = fs::read_to_string(store::transcript_path(tmp.path(), &meta.id)).unwrap();
+        assert!(
+            md.contains("**[00:00:04] Video:** hello there good morning so the plan\n"),
+            "{md}"
+        );
+    }
+
+    /// The mic is the user unless it is shared: then its voices are told
+    /// apart too, and with two of them neither is named.
+    #[tokio::test]
+    async fn a_shared_mic_is_separated() {
+        let mic_voices = || Labelled {
+            inner: FakeBackend::new(&[(3000, "one"), (4000, "two")], None),
+            voices: vec![("one", "0"), ("two", "1")],
+        };
+        let two_on_the_mic = || {
+            recording(&[(
+                TrackKind::Mic,
+                0,
+                Some(track(20.0, &[(1.0, 2.0, 3000), (8.0, 2.0, 4000)])),
+            )])
+        };
+        let config = speaker_config("diarization = \"backend\"\n");
+        let (tmp, _) = two_on_the_mic();
+        let meta = run_labelled(tmp.path(), mic_voices(), &config).await;
+        assert_eq!(speaker_lines(&meta), [("me", "one"), ("me", "two")]);
+        assert_eq!(meta.shared_mic, Some(false), "the config's, stored");
+
+        let shared = speaker_config("diarization = \"backend\"\nshared_mic = true\n");
+        let (tmp, _) = two_on_the_mic();
+        let meta = run_labelled(tmp.path(), mic_voices(), &shared).await;
+        assert_eq!(speaker_lines(&meta), [("M1", "one"), ("M2", "two")]);
+        assert_eq!(
+            speaker_names(&meta),
+            [("M1", "Speaker 1"), ("M2", "Speaker 2")]
+        );
+        assert_eq!(meta.shared_mic, Some(true));
+
+        // A recording that stored `shared_mic` keeps it over the config.
+        let (tmp, _) = two_on_the_mic();
+        let mut stored = store::read_meta(tmp.path()).unwrap();
+        stored.shared_mic = Some(true);
+        store::write_meta(tmp.path(), &stored).unwrap();
+        let meta = run_labelled(tmp.path(), mic_voices(), &config).await;
+        assert_eq!(speaker_lines(&meta), [("M1", "one"), ("M2", "two")]);
     }
 
     fn fingerprint_of(toml_text: &str) -> String {

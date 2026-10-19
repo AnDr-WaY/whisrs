@@ -141,7 +141,10 @@ lecture, a video or language practice. The tracks are transcribed after
 into a Markdown transcript whose speaker labels are your name
 .RB ( [recording]
 .BR user_name )
-and \(lqOthers\(rq.
+and \(lqOthers\(rq, or, when
+.B [recording] diarization
+tells the voices on the system audio apart, \(lqSpeaker 1\(rq,
+\(lqSpeaker 2\(rq and so on (a single voice keeps \(lqOthers\(rq).
 Each track is transcribed in its own language:
 .B [recording] mic_language
 and
@@ -168,7 +171,7 @@ is taken, it may be a full id, a unique id prefix, or
 for the newest recording. Requires an action:
 .RS
 .TP
-\fBstart\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR] [\fB\-l\fR, \fB\-\-language\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR]
+\fBstart\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR] [\fB\-l\fR, \fB\-\-language\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]]
 Start a recording. The optional title goes into the transcript and the
 folder name.
 .B \-l
@@ -184,11 +187,16 @@ set one track's, over
 .BR \-l .
 .B \-\-others
 names the system track in the transcript instead of \(lqOthers\(rq.
+.B \-\-shared\-mic
+says several people share your mic, so its voices are told apart too
+(\fB\-\-shared\-mic=false\fR turns
+.B [recording] shared_mic
+off for this recording).
 .TP
 .B stop
 Stop the recording and queue it for transcription.
 .TP
-\fBtoggle\fR [\fB\-t\fR \fITITLE\fR] [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR]
+\fBtoggle\fR [\fB\-t\fR \fITITLE\fR] [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]]
 Start a recording when none is in progress, otherwise stop the one that is.
 Meant for a compositor hotkey. The options are those of
 .B start
@@ -223,12 +231,14 @@ Print the recording's folder.
 \fBcopy\fR \fIID\fR
 Copy the transcript to the clipboard.
 .TP
-\fBretry\fR \fIID\fR [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR]
+\fBretry\fR \fIID\fR [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]]
 Transcribe the recording again, for example after a failure or in another
 language. A language given here replaces the one the recording saved (as for
 .BR start ,
 .B \-l
-covers both tracks); a track left out keeps its own. A recording whose
+covers both tracks); a track left out keeps its own.
+.B \-\-shared\-mic
+likewise replaces the saved setting, and leaving it out keeps it. A recording whose
 transcription was interrupted three times (by a crash each time) is marked
 failed instead of being resumed at startup; retry resets that count and
 queues it again. After a failure, chunks already transcribed with the same

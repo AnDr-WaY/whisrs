@@ -16,7 +16,7 @@ use dialoguer::{Confirm, Editor, Input, Select};
 
 use crate::config::{setup, vocabulary};
 use crate::service::ServiceManager;
-use crate::{Config, HotkeyConfig, RecordingConfig, RestartOutcome};
+use crate::{Config, DiarizationMode, HotkeyConfig, RecordingConfig, RestartOutcome};
 
 use setup::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
@@ -596,6 +596,36 @@ fn edit_recording(config: &mut Config) -> Result<()> {
         "Language of the system audio, defaults to the one above",
         &recording.system_language,
     )?;
+
+    // Speakers.
+    let modes = [
+        (
+            DiarizationMode::Auto,
+            "Auto: when the transcription backend can tell voices apart",
+        ),
+        (
+            DiarizationMode::Backend,
+            "The transcription backend (an asr-sidecar that returns speakers)",
+        ),
+        (DiarizationMode::Off, "Off: one speaker per track"),
+    ];
+    let mode_labels: Vec<&str> = modes.iter().map(|(_, label)| *label).collect();
+    let mode_default = modes
+        .iter()
+        .position(|(mode, _)| *mode == recording.diarization)
+        .unwrap_or(0);
+    let choice = Select::new()
+        .with_prompt("Tell the voices on the system audio apart")
+        .items(&mode_labels)
+        .default(mode_default)
+        .interact()
+        .context("failed to read speaker separation")?;
+    recording.diarization = modes[choice].0;
+    recording.shared_mic = Confirm::new()
+        .with_prompt("Several people share your mic (tell its voices apart too)?")
+        .default(recording.shared_mic)
+        .interact()
+        .context("failed to read shared mic")?;
 
     // Devices.
     let devices = list_input_devices();

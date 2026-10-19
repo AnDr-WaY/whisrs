@@ -9,6 +9,7 @@ pub mod echo;
 pub mod process;
 pub mod recorder;
 pub mod render;
+pub mod speakers;
 pub mod speech;
 pub mod split;
 pub mod store;
@@ -47,9 +48,9 @@ pub fn validate_others_label(label: &str) -> Result<String, String> {
 }
 
 /// Per-recording settings a `recording` command may carry, all optional.
-/// The languages apply to `start`, a `toggle` that starts, and `retry`;
-/// `others` to `start` and `toggle`. What is left out keeps the config
-/// default, or for a retry what the recording stored.
+/// The languages and `shared_mic` apply to `start`, a `toggle` that starts,
+/// and `retry`; `others` to `start` and `toggle`. What is left out keeps the
+/// config default, or for a retry what the recording stored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingOptions {
     /// Language of both tracks.
@@ -64,6 +65,10 @@ pub struct RecordingOptions {
     /// Label of the system track in the transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub others: Option<String>,
+    /// Several people share the mic: its voices are told apart too
+    /// (`[recording] shared_mic`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_mic: Option<bool>,
 }
 
 impl RecordingOptions {
@@ -79,6 +84,7 @@ impl RecordingOptions {
             mic_language: language(self.mic_language)?,
             system_language: language(self.system_language)?,
             others: self.others.map(|o| validate_others_label(&o)).transpose()?,
+            shared_mic: self.shared_mic,
         })
     }
 
@@ -243,11 +249,31 @@ pub struct Word {
 /// A speaker in the transcript.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Speaker {
-    /// `"me"` or `"others"`.
+    /// `"me"` and `"others"` for a track whose voices are not told apart;
+    /// `S1`, `S2`, ... for the voices of the system track and `M1`, `M2`,
+    /// ... for those of a shared mic, numbered by first appearance
+    /// ([`speakers`]). `"mic"` holds a shared mic's speech no voice was found
+    /// for, as `"others"` does on the system track.
     pub id: String,
     pub name: String,
-    /// `"self"` or `"channel"`.
+    /// How the name was found: `"self"` (the user), `"channel"` (the track's
+    /// label: the others label), or `"none"` (unnamed: `Speaker N`).
     pub source: String,
+    /// The words that named the speaker, when a name came from the
+    /// transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    /// How long the speaker talks in the transcript, in milliseconds.
+    #[serde(default)]
+    pub talk_ms: u64,
+    /// The track the speaker was heard on. `None` in a recording processed
+    /// before this was stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<TrackKind>,
+    /// A voice with little talk time ([`speakers::is_minor`]): kept in the
+    /// transcript, but never named after a participant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub minor: bool,
 }
 
 /// One line of the final transcript, on the recording timeline.
@@ -289,6 +315,16 @@ pub struct RecordingMeta {
     /// (a recording made before this was stored) is [`DEFAULT_OTHERS_LABEL`].
     #[serde(default)]
     pub others_label: Option<String>,
+    /// Several people share the mic, so its voices are told apart too. Set
+    /// at start (a retry may change it); `None` in a recording made before
+    /// this was stored, until processing fills it from the config.
+    #[serde(default)]
+    pub shared_mic: Option<bool>,
+    /// How the voices were told apart, set by processing: `"off"`, or the
+    /// method and model, e.g. `"deepgram:latest"`. `None` in a recording
+    /// processed before speakers were separated.
+    #[serde(default)]
+    pub diarization: Option<String>,
     /// Transcription backend, set by processing.
     #[serde(default)]
     pub backend: Option<String>,
@@ -342,6 +378,8 @@ impl RecordingMeta {
             mic_language: None,
             system_language: None,
             others_label: None,
+            shared_mic: None,
+            diarization: None,
             backend: None,
             model: None,
             speakers: Vec::new(),
@@ -380,6 +418,15 @@ impl RecordingMeta {
         }
         if let Some(language) = options.language_for(TrackKind::System) {
             self.system_language = Some(language.to_string());
+        }
+    }
+
+    /// Replace what a retry's `options` give: the languages
+    /// ([`Self::apply_languages`]) and `shared_mic`. The rest keep theirs.
+    pub fn apply_options(&mut self, options: &RecordingOptions) {
+        self.apply_languages(options);
+        if let Some(shared) = options.shared_mic {
+            self.shared_mic = Some(shared);
         }
     }
 
@@ -432,6 +479,17 @@ mod tests {
         meta.mic_language = Some("de".into());
         meta.system_language = Some("auto".into());
         meta.others_label = Some("Video".into());
+        meta.shared_mic = Some(true);
+        meta.diarization = Some("deepgram:latest".into());
+        meta.speakers = vec![Speaker {
+            id: "S1".into(),
+            name: "Speaker 1".into(),
+            source: "none".into(),
+            evidence: None,
+            talk_ms: 4200,
+            channel: Some(TrackKind::System),
+            minor: true,
+        }];
         meta.model = Some("ggml-large-v3-turbo.bin".into());
         meta.network_wait = Some(NetworkWait {
             since: meta.started_at,
@@ -458,6 +516,58 @@ mod tests {
         assert_eq!(meta.others_label(), DEFAULT_OTHERS_LABEL);
         assert_eq!(meta.network_wait, None);
         assert_eq!(meta.network_deadline(), None);
+        assert_eq!(meta.shared_mic, None);
+        assert_eq!(meta.diarization, None);
+    }
+
+    /// A `recording.json` processed before speakers were separated loads:
+    /// its speakers have no talk time, channel or minor mark.
+    #[test]
+    fn meta_with_old_speakers_still_loads() {
+        let old = r#"{"version":1,"id":"m","title":null,"status":"done",
+            "started_at":"2026-10-02T14:00:00+02:00","sample_rate":16000,"tracks":[],
+            "speakers":[{"id":"me","name":"Yosif","source":"self"},
+                        {"id":"others","name":"Others","source":"channel"}],
+            "segments":[{"start_ms":0,"end_ms":900,"speaker":"others",
+                         "channel":"system","text":"hi"}]}"#;
+        let meta: RecordingMeta = serde_json::from_str(old).unwrap();
+        assert_eq!(meta.speakers.len(), 2);
+        let others = &meta.speakers[1];
+        assert_eq!(
+            (others.id.as_str(), others.name.as_str()),
+            ("others", "Others")
+        );
+        assert_eq!(others.talk_ms, 0);
+        assert_eq!(others.channel, None);
+        assert!(!others.minor);
+        assert_eq!(others.evidence, None);
+        // Written back without the fields an old file never had.
+        let json = serde_json::to_string(&meta.speakers[0]).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"me","name":"Yosif","source":"self","talk_ms":0}"#
+        );
+    }
+
+    /// A retry replaces the languages and `shared_mic` it gives and keeps
+    /// the rest.
+    #[test]
+    fn retry_options_replace_what_they_give() {
+        let mut meta = RecordingMeta::new("m".into(), None, Local::now());
+        meta.mic_language = Some("en".into());
+        meta.shared_mic = Some(true);
+        meta.apply_options(&RecordingOptions {
+            language: Some("de".into()),
+            ..Default::default()
+        });
+        assert_eq!(meta.language(TrackKind::Mic), Some("de"));
+        assert_eq!(meta.shared_mic, Some(true), "kept");
+        meta.apply_options(&RecordingOptions {
+            shared_mic: Some(false),
+            ..Default::default()
+        });
+        assert_eq!(meta.shared_mic, Some(false));
+        assert_eq!(meta.language(TrackKind::Mic), Some("de"), "kept");
     }
 
     /// A waiting recording gives up a day after its first failed try,
@@ -487,6 +597,7 @@ mod tests {
             mic_language: Some("en_us".into()),
             system_language: Some("Auto".into()),
             others: Some("  Video  ".into()),
+            shared_mic: Some(true),
         }
         .validated()
         .unwrap();
@@ -497,6 +608,7 @@ mod tests {
                 mic_language: Some("en-US".into()),
                 system_language: Some("auto".into()),
                 others: Some("Video".into()),
+                shared_mic: Some(true),
             }
         );
         assert_eq!(
