@@ -6,24 +6,37 @@
 //! the bytes. Only the native-timestamp `transcribe_segments` of Deepgram,
 //! Groq and OpenAI send it: dictation, the phrase fallback, asr-sidecar and
 //! local-whisper keep WAV.
+//!
+//! The encoder (`flacenc`) comes with the `recording` feature. A build
+//! without it has no recordings, so no chunk is ever sent, and
+//! [`recording_upload`] would hand back the WAV as it is.
 
 use std::borrow::Cow;
 
+#[cfg(feature = "recording")]
 use flacenc::bitsink::ByteSink;
+#[cfg(feature = "recording")]
 use flacenc::component::{BitRepr, Stream};
+#[cfg(feature = "recording")]
 use flacenc::error::{SourceError, Verify};
+#[cfg(feature = "recording")]
 use flacenc::source::{Context, Fill, FrameBuf, Source};
+#[cfg(feature = "recording")]
 use tracing::{debug, warn};
 
+#[cfg(feature = "recording")]
 use super::SEGMENT_SAMPLE_RATE;
 
 /// Channels of a recording chunk.
+#[cfg(feature = "recording")]
 const CHANNELS: usize = 1;
 
 /// Bits per sample of a recording chunk.
+#[cfg(feature = "recording")]
 const BITS_PER_SAMPLE: usize = 16;
 
 /// Bytes per sample in the WAV data chunk.
+#[cfg(feature = "recording")]
 const BYTES_PER_SAMPLE: usize = BITS_PER_SAMPLE / 8;
 
 /// How an upload is labelled on the wire.
@@ -40,6 +53,7 @@ impl UploadFormat {
         mime: "audio/wav",
         file_name: "audio.wav",
     };
+    #[cfg(feature = "recording")]
     pub(crate) const FLAC: Self = Self {
         mime: "audio/flac",
         file_name: "audio.flac",
@@ -58,6 +72,7 @@ pub(crate) struct Upload<'a> {
 /// The encoder runs on the blocking pool, so a one-hour Deepgram chunk does
 /// not stall the daemon's runtime. Empty audio is passed through for the
 /// backend's own check to reject.
+#[cfg(feature = "recording")]
 pub(crate) async fn recording_upload(wav: &[u8]) -> Upload<'_> {
     let unchanged = Upload {
         bytes: Cow::Borrowed(wav),
@@ -95,14 +110,26 @@ pub(crate) async fn recording_upload(wav: &[u8]) -> Upload<'_> {
     }
 }
 
+/// Without the `recording` feature there is no encoder: the WAV, unchanged.
+/// Nothing calls it in such a build, since it records nothing.
+#[cfg(not(feature = "recording"))]
+pub(crate) async fn recording_upload(wav: &[u8]) -> Upload<'_> {
+    Upload {
+        bytes: Cow::Borrowed(wav),
+        format: UploadFormat::WAV,
+    }
+}
+
 /// The PCM payload of a 16 kHz mono 16-bit WAV, handed to the encoder one
 /// block at a time straight from the WAV bytes, so no decoded copy of the
 /// samples is ever held.
+#[cfg(feature = "recording")]
 struct PcmSource<'a> {
     /// Little-endian samples not read yet.
     pcm: &'a [u8],
 }
 
+#[cfg(feature = "recording")]
 impl<'a> PcmSource<'a> {
     /// Find the data chunk of `wav`. A WAV in any other format is an error,
     /// which sends the WAV as it is.
@@ -136,6 +163,7 @@ impl<'a> PcmSource<'a> {
     }
 }
 
+#[cfg(feature = "recording")]
 impl Source for PcmSource<'_> {
     fn channels(&self) -> usize {
         CHANNELS
@@ -170,6 +198,7 @@ impl Source for PcmSource<'_> {
 /// audio. The frames are byte-identical to its output; only the STREAMINFO
 /// minimum block size differs (see below). Besides `wav`, memory is the FLAC
 /// output and one block.
+#[cfg(feature = "recording")]
 pub(crate) fn wav_to_flac(wav: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut source = PcmSource::new(wav)?;
     let config = flacenc::config::Encoder::default()
@@ -241,11 +270,12 @@ pub(crate) fn wav_to_flac(wav: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 /// flacenc's errors are not `Send` (some hold an `Rc`), so keep the message.
+#[cfg(feature = "recording")]
 fn flac_error(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("FLAC encoder: {e}")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "recording"))]
 mod tests {
     use super::*;
     use crate::audio::wav::encode_wav;

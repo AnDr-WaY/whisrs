@@ -1011,6 +1011,21 @@ the speaker labels can be wrong. A recording that failed has no transcript,
 and `get_transcript` says so. The release builds include the server; a
 source build without the `mcp` feature says so when you run `whisrs mcp`.
 
+**Leaving recording out of a build.** Both release downloads (the full one
+and the minimal one) include the recording feature and the MCP server, and
+so does `cargo install whisrs`. A source build can leave them out by
+dropping the `recording` feature; `mcp` needs it, so it goes too:
+
+```
+cargo install whisrs --locked --no-default-features --features local-whisper,tray,overlay,hooks
+```
+
+Dictation works the same in such a build. `whisrs recording` and the daemon
+answer that the build has no recording feature, the tray has no recording
+items, and a `[recording]` section that differs from the defaults or a
+`[hotkeys] recording` binding is ignored, with one warning in the daemon log
+(and when `whisrs config` saves). Both stay in the file.
+
 **Audio retention.** `audio_retention_days` controls how long the `audio/`
 folder of a transcribed recording is kept: `7` (the default) deletes it at the first
 cleanup after a week (cleanup runs when the daemon starts and after each

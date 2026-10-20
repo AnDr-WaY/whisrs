@@ -2,21 +2,39 @@
 //! afterwards.
 //!
 //! Each recording lives in its own directory under the recordings root (see
-//! [`store`]): `recording.json` holds [`RecordingMeta`], `audio/` holds one WAV
+//! `store`): `recording.json` holds [`RecordingMeta`], `audio/` holds one WAV
 //! per track, and `<id>.md` is the rendered transcript.
+//!
+//! This file holds the data types, which every build has: the IPC wire
+//! (`Command::Recording`, [`RecordingStatus`]) and `recording.json`, so a CLI
+//! and a daemon built with and without the `recording` feature still talk.
+//! The submodules are the feature itself and exist only with it.
 
+#[cfg(feature = "recording")]
 pub mod diarize;
+#[cfg(feature = "recording")]
 pub mod echo;
+#[cfg(feature = "recording")]
 pub mod llm_names;
+#[cfg(feature = "recording")]
 pub mod naming;
+#[cfg(feature = "recording")]
 pub mod process;
+#[cfg(feature = "recording")]
 pub mod recorder;
+#[cfg(feature = "recording")]
 pub mod render;
+#[cfg(feature = "recording")]
 pub mod speakers;
+#[cfg(feature = "recording")]
 pub mod speech;
+#[cfg(feature = "recording")]
 pub mod split;
+#[cfg(feature = "recording")]
 pub mod store;
+#[cfg(feature = "recording")]
 pub mod summary;
+#[cfg(feature = "recording")]
 pub mod wav_repair;
 
 use chrono::{DateTime, Local};
@@ -25,6 +43,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(feature = "recording")]
 use crate::ipc::validate_language_override;
 
 /// Label of the system track in a transcript when the recording names none.
@@ -114,6 +133,7 @@ impl RecordingOptions {
     /// [`naming::validate_participants`]. The daemon runs this on every
     /// request: the socket is open to any client, not only the CLI that
     /// checks first.
+    #[cfg(feature = "recording")]
     pub fn validated(self) -> Result<Self, String> {
         let language =
             |value: Option<String>| value.map(|v| validate_language_override(&v)).transpose();
@@ -681,7 +701,9 @@ impl RecordingMeta {
     }
 }
 
-#[cfg(test)]
+// Tests of `recording.json` and of the options' validation, which only the
+// feature writes and runs.
+#[cfg(all(test, feature = "recording"))]
 mod tests {
     use super::*;
 

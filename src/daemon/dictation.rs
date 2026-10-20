@@ -17,6 +17,7 @@ use crate::pipeline::{
     process_recording_batch, run_streaming_pipeline, save_history_entry, DictationOutcome,
     StreamingPipelineParams,
 };
+#[cfg(feature = "recording")]
 use crate::recording::{refuse_while_recording, DictationStart};
 
 pub(crate) async fn handle_toggle(
@@ -30,7 +31,9 @@ pub(crate) async fn handle_toggle(
     match current_state {
         State::Idle => {
             // Refused first while a recording is in progress: no capture, no state
-            // change, no start cue. The stop arm below is never refused.
+            // change, no start cue. The stop arm below is never refused. A
+            // build without the recording feature has no recordings to wait for.
+            #[cfg(feature = "recording")]
             if let Some(refused) = refuse_while_recording(&context, DictationStart::Dictation) {
                 return refused;
             }

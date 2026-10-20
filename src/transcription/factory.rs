@@ -18,8 +18,14 @@ use super::local_whisper::LocalWhisperBackend;
 use super::openai_compatible_realtime::OpenAiCompatibleRealtimeBackend;
 use super::openai_realtime::OpenAIRealtimeBackend;
 use super::openai_rest::OpenAIRestBackend;
-use super::{transcription_prompt, TranscriptionBackend, TranscriptionConfig};
-use crate::{Config, LocalWhisperConfig, RecordingConfig};
+#[cfg(feature = "recording")]
+use super::transcription_prompt;
+use super::TranscriptionBackend;
+#[cfg(feature = "recording")]
+use super::TranscriptionConfig;
+#[cfg(feature = "recording")]
+use crate::RecordingConfig;
+use crate::{Config, LocalWhisperConfig};
 
 fn resolve_groq_api_key(config: &Config) -> Option<String> {
     if let Ok(key) = std::env::var("WHISRS_GROQ_API_KEY") {
@@ -389,6 +395,7 @@ pub fn backend_identity(name: &str, config: &Config) -> String {
 /// model), and the two OpenAI realtime backends are an error that names the
 /// batch backends. Unknown names are an error too: unlike dictation, a
 /// recording never silently falls back to Groq.
+#[cfg(feature = "recording")]
 pub fn recording_backend_name(config: &Config) -> anyhow::Result<String> {
     let recording = RecordingConfig::effective(config);
     let name = recording
@@ -422,6 +429,7 @@ pub fn recording_backend_name(config: &Config) -> anyhow::Result<String> {
 /// `n_max_text_ctx` 0, so no pass is conditioned on earlier text, and in
 /// this whisper.cpp that leaves the initial prompt unused too. Sending none
 /// keeps the prompt-echo filter and the chunk cache honest about it.
+#[cfg(feature = "recording")]
 pub fn recording_transcription_config(
     name: &str,
     config: &Config,
@@ -450,6 +458,7 @@ pub fn recording_transcription_config(
 /// model, except for local whisper, whose request carries a fixed name while
 /// `[local-whisper] model_path` decides, so its file name. Nothing sent or
 /// cached depends on this.
+#[cfg(feature = "recording")]
 pub fn recording_model_label(name: &str, config: &Config, request: &TranscriptionConfig) -> String {
     match canonical_backend_name(name) {
         "local-whisper" => {
@@ -471,6 +480,7 @@ pub fn recording_model_label(name: &str, config: &Config, request: &Transcriptio
 /// one of them could not run recordings on `openai` at all, since there is no
 /// separate recording model to set. Those map to gpt-transcribe, the model
 /// OpenAI points recorded audio at; every other model is sent as written.
+#[cfg(feature = "recording")]
 fn openai_recording_model(model: String) -> String {
     let realtime_only = ["gpt-live-transcribe", "gpt-realtime-whisper"];
     if realtime_only.iter().any(|m| model.eq_ignore_ascii_case(m)) {
@@ -483,6 +493,7 @@ fn openai_recording_model(model: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcription::TranscriptionConfig;
 
     /// A bare config carrying only the `[asr-sidecar]` section under test.
     fn config_with_sidecar_key(api_key: Option<&str>) -> Config {
@@ -796,319 +807,328 @@ mod tests {
         );
     }
 
-    /// How recordings treat one `[general] backend` name.
-    struct RecordingCase {
-        name: &'static str,
-        /// What [`recording_backend_name`] resolves it to, `None` = refused.
-        resolves_to: Option<&'static str>,
-        /// The real backend the resolved name builds.
-        backend: Box<dyn TranscriptionBackend>,
-        /// Its declared chunk cap.
-        chunk_secs: Option<u32>,
-    }
+    /// The recording backend rules, in a build with the feature.
+    #[cfg(feature = "recording")]
+    mod recording {
+        use super::*;
 
-    /// The names `Config::validate` routes, read off its unknown-backend
-    /// error because `BACKEND_NAMES` is private to `config::types`. Aliases are
-    /// not advertised there, so they are listed by hand below.
-    fn routed_backend_names() -> Vec<String> {
-        let config: Config = toml::from_str("[general]\nbackend = \"no-such-backend\"\n").unwrap();
-        let msg = config.validate().unwrap_err().to_string();
-        let primaries = msg
-            .split("Valid options: ")
-            .nth(1)
-            .and_then(|rest| rest.split(". (").next())
-            .expect("unknown-backend error lists the valid options");
-        let stubs = msg
-            .split(". (")
-            .nth(1)
-            .and_then(|rest| rest.split(" are also").next())
-            .expect("unknown-backend error lists the stub backends");
-        primaries
-            .split(", ")
-            .chain(stubs.split(" and "))
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// Every backend name a user can select has a decided recording behavior,
-    /// asked of the real impls: what the name resolves to, the chunk cap of the
-    /// backend it builds, and that live-only backends are refused up front.
-    /// Mirrors `config_inert_prompt_gate_agrees_with_every_sends_prompt_impl`.
-    #[tokio::test]
-    async fn every_backend_name_has_a_recording_behavior() {
-        let sidecar = || {
-            Box::new(AsrSidecarBackend::new(
-                "http://127.0.0.1:8765/transcribe".to_string(),
-                None,
-            )) as Box<dyn TranscriptionBackend>
-        };
-        let whisper =
-            || Box::new(LocalWhisperBackend::new(String::new())) as Box<dyn TranscriptionBackend>;
-        let cases = vec![
-            RecordingCase {
-                name: "groq",
-                resolves_to: Some("groq"),
-                backend: Box::new(GroqBackend::new(String::new())),
-                chunk_secs: Some(600),
-            },
-            RecordingCase {
-                name: "openai",
-                resolves_to: Some("openai"),
-                backend: Box::new(OpenAIRestBackend::new(String::new())),
-                chunk_secs: Some(600),
-            },
-            RecordingCase {
-                name: "deepgram",
-                resolves_to: Some("deepgram"),
-                backend: Box::new(DeepgramRestBackend::new(String::new())),
-                chunk_secs: Some(3600),
-            },
-            // Mapped to REST; the streaming impl agrees if it is ever asked.
-            RecordingCase {
-                name: "deepgram-streaming",
-                resolves_to: Some("deepgram"),
-                backend: Box::new(DeepgramStreamingBackend::new(String::new())),
-                chunk_secs: Some(3600),
-            },
-            RecordingCase {
-                name: "local-whisper",
-                resolves_to: Some("local-whisper"),
-                backend: whisper(),
-                chunk_secs: Some(600),
-            },
-            RecordingCase {
-                name: "local",
-                resolves_to: Some("local"),
-                backend: whisper(),
-                chunk_secs: Some(600),
-            },
-            RecordingCase {
-                name: "asr-sidecar",
-                resolves_to: Some("asr-sidecar"),
-                backend: sidecar(),
-                chunk_secs: Some(600),
-            },
-            RecordingCase {
-                name: "asr",
-                resolves_to: Some("asr"),
-                backend: sidecar(),
-                chunk_secs: Some(600),
-            },
-            RecordingCase {
-                name: "vibevoice",
-                resolves_to: Some("vibevoice"),
-                backend: sidecar(),
-                chunk_secs: Some(600),
-            },
-            // Built the way the factory builds a GPT Live Transcribe setup
-            // (`[openai] languages`): language hints do not make it a batch
-            // backend.
-            RecordingCase {
-                name: "openai-realtime",
-                resolves_to: None,
-                backend: Box::new(openai_realtime_backend(
-                    &toml::from_str(
-                        "[general]\nbackend = \"openai-realtime\"\n\
-                         [openai]\napi_key = \"\"\nmodel = \"gpt-live-transcribe\"\n\
-                         languages = [\"en\", \"de\"]\n",
-                    )
-                    .unwrap(),
-                )),
-                chunk_secs: None,
-            },
-            RecordingCase {
-                name: "openai-compatible-realtime",
-                resolves_to: None,
-                backend: Box::new(
-                    OpenAiCompatibleRealtimeBackend::new(
-                        "ws://localhost:1234/realtime".to_string(),
-                        "Whisper-Tiny".to_string(),
-                        "lemonade".to_string(),
-                        "server-vad".to_string(),
-                        None,
-                    )
-                    .unwrap(),
-                ),
-                chunk_secs: None,
-            },
-            // Stubs resolve (dictation accepts them too) and then fail at
-            // transcription time with "not yet implemented".
-            RecordingCase {
-                name: "local-vosk",
-                resolves_to: Some("local-vosk"),
-                backend: Box::new(VoskBackend::new(String::new())),
-                chunk_secs: None,
-            },
-            RecordingCase {
-                name: "local-parakeet",
-                resolves_to: Some("local-parakeet"),
-                backend: Box::new(ParakeetBackend::new(String::new())),
-                chunk_secs: None,
-            },
-        ];
-
-        let request = TranscriptionConfig {
-            language: "en".to_string(),
-            model: String::new(),
-            prompt: None,
-            keyterms: Vec::new(),
-            diarize: false,
-        };
-        let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
-        for case in &cases {
-            let mut config: Config = toml::from_str("").unwrap();
-            config.general.backend = case.name.to_string();
-            let resolved = recording_backend_name(&config);
-            match case.resolves_to {
-                Some(expected) => assert_eq!(resolved.unwrap(), expected, "{}", case.name),
-                None => {
-                    let err = resolved.expect_err(case.name).to_string();
-                    assert!(err.contains("batch backend"), "{}: {err}", case.name);
-                    // The impl refuses too, without touching the network.
-                    let err = case
-                        .backend
-                        .transcribe_segments(&wav, &request)
-                        .await
-                        .expect_err(case.name);
-                    assert!(err.to_string().contains("batch backend"), "{}", case.name);
-                }
-            }
-            assert_eq!(
-                case.backend.max_segment_chunk_secs(&request),
-                case.chunk_secs,
-                "{}",
-                case.name
-            );
+        /// How recordings treat one `[general] backend` name.
+        struct RecordingCase {
+            name: &'static str,
+            /// What [`recording_backend_name`] resolves it to, `None` = refused.
+            resolves_to: Option<&'static str>,
+            /// The real backend the resolved name builds.
+            backend: Box<dyn TranscriptionBackend>,
+            /// Its declared chunk cap.
+            chunk_secs: Option<u32>,
         }
 
-        let routed = routed_backend_names();
-        assert!(
-            routed.iter().any(|n| n == "groq") && routed.iter().any(|n| n == "local-vosk"),
-            "parsing the unknown-backend error went wrong: {routed:?}"
-        );
-        for name in routed {
+        /// The names `Config::validate` routes, read off its unknown-backend
+        /// error because `BACKEND_NAMES` is private to `config::types`. Aliases are
+        /// not advertised there, so they are listed by hand below.
+        fn routed_backend_names() -> Vec<String> {
+            let config: Config =
+                toml::from_str("[general]\nbackend = \"no-such-backend\"\n").unwrap();
+            let msg = config.validate().unwrap_err().to_string();
+            let primaries = msg
+                .split("Valid options: ")
+                .nth(1)
+                .and_then(|rest| rest.split(". (").next())
+                .expect("unknown-backend error lists the valid options");
+            let stubs = msg
+                .split(". (")
+                .nth(1)
+                .and_then(|rest| rest.split(" are also").next())
+                .expect("unknown-backend error lists the stub backends");
+            primaries
+                .split(", ")
+                .chain(stubs.split(" and "))
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// Every backend name a user can select has a decided recording behavior,
+        /// asked of the real impls: what the name resolves to, the chunk cap of the
+        /// backend it builds, and that live-only backends are refused up front.
+        /// Mirrors `config_inert_prompt_gate_agrees_with_every_sends_prompt_impl`.
+        #[tokio::test]
+        async fn every_backend_name_has_a_recording_behavior() {
+            let sidecar = || {
+                Box::new(AsrSidecarBackend::new(
+                    "http://127.0.0.1:8765/transcribe".to_string(),
+                    None,
+                )) as Box<dyn TranscriptionBackend>
+            };
+            let whisper = || {
+                Box::new(LocalWhisperBackend::new(String::new())) as Box<dyn TranscriptionBackend>
+            };
+            let cases = vec![
+                RecordingCase {
+                    name: "groq",
+                    resolves_to: Some("groq"),
+                    backend: Box::new(GroqBackend::new(String::new())),
+                    chunk_secs: Some(600),
+                },
+                RecordingCase {
+                    name: "openai",
+                    resolves_to: Some("openai"),
+                    backend: Box::new(OpenAIRestBackend::new(String::new())),
+                    chunk_secs: Some(600),
+                },
+                RecordingCase {
+                    name: "deepgram",
+                    resolves_to: Some("deepgram"),
+                    backend: Box::new(DeepgramRestBackend::new(String::new())),
+                    chunk_secs: Some(3600),
+                },
+                // Mapped to REST; the streaming impl agrees if it is ever asked.
+                RecordingCase {
+                    name: "deepgram-streaming",
+                    resolves_to: Some("deepgram"),
+                    backend: Box::new(DeepgramStreamingBackend::new(String::new())),
+                    chunk_secs: Some(3600),
+                },
+                RecordingCase {
+                    name: "local-whisper",
+                    resolves_to: Some("local-whisper"),
+                    backend: whisper(),
+                    chunk_secs: Some(600),
+                },
+                RecordingCase {
+                    name: "local",
+                    resolves_to: Some("local"),
+                    backend: whisper(),
+                    chunk_secs: Some(600),
+                },
+                RecordingCase {
+                    name: "asr-sidecar",
+                    resolves_to: Some("asr-sidecar"),
+                    backend: sidecar(),
+                    chunk_secs: Some(600),
+                },
+                RecordingCase {
+                    name: "asr",
+                    resolves_to: Some("asr"),
+                    backend: sidecar(),
+                    chunk_secs: Some(600),
+                },
+                RecordingCase {
+                    name: "vibevoice",
+                    resolves_to: Some("vibevoice"),
+                    backend: sidecar(),
+                    chunk_secs: Some(600),
+                },
+                // Built the way the factory builds a GPT Live Transcribe setup
+                // (`[openai] languages`): language hints do not make it a batch
+                // backend.
+                RecordingCase {
+                    name: "openai-realtime",
+                    resolves_to: None,
+                    backend: Box::new(openai_realtime_backend(
+                        &toml::from_str(
+                            "[general]\nbackend = \"openai-realtime\"\n\
+                         [openai]\napi_key = \"\"\nmodel = \"gpt-live-transcribe\"\n\
+                         languages = [\"en\", \"de\"]\n",
+                        )
+                        .unwrap(),
+                    )),
+                    chunk_secs: None,
+                },
+                RecordingCase {
+                    name: "openai-compatible-realtime",
+                    resolves_to: None,
+                    backend: Box::new(
+                        OpenAiCompatibleRealtimeBackend::new(
+                            "ws://localhost:1234/realtime".to_string(),
+                            "Whisper-Tiny".to_string(),
+                            "lemonade".to_string(),
+                            "server-vad".to_string(),
+                            None,
+                        )
+                        .unwrap(),
+                    ),
+                    chunk_secs: None,
+                },
+                // Stubs resolve (dictation accepts them too) and then fail at
+                // transcription time with "not yet implemented".
+                RecordingCase {
+                    name: "local-vosk",
+                    resolves_to: Some("local-vosk"),
+                    backend: Box::new(VoskBackend::new(String::new())),
+                    chunk_secs: None,
+                },
+                RecordingCase {
+                    name: "local-parakeet",
+                    resolves_to: Some("local-parakeet"),
+                    backend: Box::new(ParakeetBackend::new(String::new())),
+                    chunk_secs: None,
+                },
+            ];
+
+            let request = TranscriptionConfig {
+                language: "en".to_string(),
+                model: String::new(),
+                prompt: None,
+                keyterms: Vec::new(),
+                diarize: false,
+            };
+            let wav = crate::audio::wav::encode_wav(&[0i16; 1600]).unwrap();
+            for case in &cases {
+                let mut config: Config = toml::from_str("").unwrap();
+                config.general.backend = case.name.to_string();
+                let resolved = recording_backend_name(&config);
+                match case.resolves_to {
+                    Some(expected) => assert_eq!(resolved.unwrap(), expected, "{}", case.name),
+                    None => {
+                        let err = resolved.expect_err(case.name).to_string();
+                        assert!(err.contains("batch backend"), "{}: {err}", case.name);
+                        // The impl refuses too, without touching the network.
+                        let err = case
+                            .backend
+                            .transcribe_segments(&wav, &request)
+                            .await
+                            .expect_err(case.name);
+                        assert!(err.to_string().contains("batch backend"), "{}", case.name);
+                    }
+                }
+                assert_eq!(
+                    case.backend.max_segment_chunk_secs(&request),
+                    case.chunk_secs,
+                    "{}",
+                    case.name
+                );
+            }
+
+            let routed = routed_backend_names();
             assert!(
+                routed.iter().any(|n| n == "groq") && routed.iter().any(|n| n == "local-vosk"),
+                "parsing the unknown-backend error went wrong: {routed:?}"
+            );
+            for name in routed {
+                assert!(
                 cases.iter().any(|c| c.name == name),
                 "{name} is a backend validate() routes but has no recording behavior here. Add a \
                  case with its real impl."
             );
+            }
         }
-    }
 
-    #[test]
-    fn recording_backend_override_and_refusals() {
-        let mut config: Config = toml::from_str(
+        #[test]
+        fn recording_backend_override_and_refusals() {
+            let mut config: Config = toml::from_str(
             "[general]\nbackend = \"openai-realtime\"\n[recording]\nbackend = \"deepgram-streaming\"\n",
         )
         .unwrap();
-        // `[recording] backend` wins over a live-only dictation backend.
-        assert_eq!(recording_backend_name(&config).unwrap(), "deepgram");
+            // `[recording] backend` wins over a live-only dictation backend.
+            assert_eq!(recording_backend_name(&config).unwrap(), "deepgram");
 
-        config.recording.as_mut().unwrap().backend = Some("  ".into());
-        assert!(
-            recording_backend_name(&config).is_err(),
-            "blank falls back to general"
-        );
-
-        config.recording.as_mut().unwrap().backend = Some("bogus".into());
-        let err = recording_backend_name(&config).unwrap_err().to_string();
-        assert!(
-            err.contains("unknown recording backend"),
-            "no silent groq fallback: {err}"
-        );
-    }
-
-    /// A realtime-only `[openai] model` (what an openai-realtime dictation
-    /// setup holds) still lets recordings run on `openai`: the recording request
-    /// carries gpt-transcribe, while dictation keeps the configured model.
-    #[test]
-    fn recording_on_openai_maps_realtime_only_models_to_gpt_transcribe() {
-        for (configured, sent) in [
-            ("gpt-live-transcribe", "gpt-transcribe"),
-            ("GPT-Live-Transcribe", "gpt-transcribe"),
-            ("gpt-realtime-whisper", "gpt-transcribe"),
-            ("gpt-transcribe", "gpt-transcribe"),
-            ("gpt-4o-transcribe", "gpt-4o-transcribe"),
-            ("whisper-1", "whisper-1"),
-        ] {
-            let config: Config = toml::from_str(&format!(
-                "[general]\nbackend = \"openai-realtime\"\n[recording]\nbackend = \"openai\"\n\
-                 [openai]\napi_key = \"k\"\nmodel = \"{configured}\"\n\
-                 languages = [\"ru\", \"en\"]\n"
-            ))
-            .unwrap();
-            let name = recording_backend_name(&config).unwrap();
-            assert_eq!(name, "openai");
-            assert_eq!(
-                recording_transcription_config(&name, &config, "en").model,
-                sent,
-                "[openai] model = {configured}"
+            config.recording.as_mut().unwrap().backend = Some("  ".into());
+            assert!(
+                recording_backend_name(&config).is_err(),
+                "blank falls back to general"
             );
-            assert_eq!(
-                model_for_backend(&config.general.backend, &config),
-                configured,
-                "dictation keeps [openai] model as written"
+
+            config.recording.as_mut().unwrap().backend = Some("bogus".into());
+            let err = recording_backend_name(&config).unwrap_err().to_string();
+            assert!(
+                err.contains("unknown recording backend"),
+                "no silent groq fallback: {err}"
             );
         }
-    }
 
-    #[test]
-    fn the_recording_log_names_the_local_model_file() {
-        let config: Config = toml::from_str(
-            "[general]\nbackend = \"local-whisper\"\n\
-             [local-whisper]\nmodel_path = \"/m/ggml-large-v3-turbo-q5_0.bin\"\n",
-        )
-        .unwrap();
-        let request = recording_transcription_config("local-whisper", &config, "en");
-        assert_eq!(
-            recording_model_label("local-whisper", &config, &request),
-            "ggml-large-v3-turbo-q5_0.bin"
-        );
-        // Its recording windows take no prompt, so none is sent.
-        let with_vocabulary: Config =
-            toml::from_str("[general]\nbackend = \"local-whisper\"\nvocabulary = [\"whisrs\"]\n")
+        /// A realtime-only `[openai] model` (what an openai-realtime dictation
+        /// setup holds) still lets recordings run on `openai`: the recording request
+        /// carries gpt-transcribe, while dictation keeps the configured model.
+        #[test]
+        fn recording_on_openai_maps_realtime_only_models_to_gpt_transcribe() {
+            for (configured, sent) in [
+                ("gpt-live-transcribe", "gpt-transcribe"),
+                ("GPT-Live-Transcribe", "gpt-transcribe"),
+                ("gpt-realtime-whisper", "gpt-transcribe"),
+                ("gpt-transcribe", "gpt-transcribe"),
+                ("gpt-4o-transcribe", "gpt-4o-transcribe"),
+                ("whisper-1", "whisper-1"),
+            ] {
+                let config: Config = toml::from_str(&format!(
+                    "[general]\nbackend = \"openai-realtime\"\n[recording]\nbackend = \"openai\"\n\
+                 [openai]\napi_key = \"k\"\nmodel = \"{configured}\"\n\
+                 languages = [\"ru\", \"en\"]\n"
+                ))
                 .unwrap();
-        assert_eq!(
-            recording_transcription_config("local", &with_vocabulary, "en").prompt,
-            None
-        );
-        assert_eq!(
-            recording_model_label("local", &config, &request),
-            "ggml-large-v3-turbo-q5_0.bin"
-        );
-        // What the request carries (and the cache keys on) is unchanged.
-        assert_eq!(request.model, "base.en");
-        let groq: Config = toml::from_str("[general]\nbackend = \"groq\"\n").unwrap();
-        let request = recording_transcription_config("groq", &groq, "en");
-        assert_eq!(
-            recording_model_label("groq", &groq, &request),
-            request.model
-        );
-    }
+                let name = recording_backend_name(&config).unwrap();
+                assert_eq!(name, "openai");
+                assert_eq!(
+                    recording_transcription_config(&name, &config, "en").model,
+                    sent,
+                    "[openai] model = {configured}"
+                );
+                assert_eq!(
+                    model_for_backend(&config.general.backend, &config),
+                    configured,
+                    "dictation keeps [openai] model as written"
+                );
+            }
+        }
 
-    #[test]
-    fn recording_request_uses_the_recording_backends_model() {
-        let config: Config = toml::from_str(
-            "[general]\nbackend = \"groq\"\nlanguage = \"de\"\nvocabulary = [\"whisrs\"]\n\
+        #[test]
+        fn the_recording_log_names_the_local_model_file() {
+            let config: Config = toml::from_str(
+                "[general]\nbackend = \"local-whisper\"\n\
+             [local-whisper]\nmodel_path = \"/m/ggml-large-v3-turbo-q5_0.bin\"\n",
+            )
+            .unwrap();
+            let request = recording_transcription_config("local-whisper", &config, "en");
+            assert_eq!(
+                recording_model_label("local-whisper", &config, &request),
+                "ggml-large-v3-turbo-q5_0.bin"
+            );
+            // Its recording windows take no prompt, so none is sent.
+            let with_vocabulary: Config = toml::from_str(
+                "[general]\nbackend = \"local-whisper\"\nvocabulary = [\"whisrs\"]\n",
+            )
+            .unwrap();
+            assert_eq!(
+                recording_transcription_config("local", &with_vocabulary, "en").prompt,
+                None
+            );
+            assert_eq!(
+                recording_model_label("local", &config, &request),
+                "ggml-large-v3-turbo-q5_0.bin"
+            );
+            // What the request carries (and the cache keys on) is unchanged.
+            assert_eq!(request.model, "base.en");
+            let groq: Config = toml::from_str("[general]\nbackend = \"groq\"\n").unwrap();
+            let request = recording_transcription_config("groq", &groq, "en");
+            assert_eq!(
+                recording_model_label("groq", &groq, &request),
+                request.model
+            );
+        }
+
+        #[test]
+        fn recording_request_uses_the_recording_backends_model() {
+            let config: Config = toml::from_str(
+                "[general]\nbackend = \"groq\"\nlanguage = \"de\"\nvocabulary = [\"whisrs\"]\n\
              prompt = \"Transcribe in the language spoken.\"\n\
              [recording]\nbackend = \"openai\"\n\
              [openai]\napi_key = \"k\"\nmodel = \"whisper-1\"\n",
-        )
-        .unwrap();
-        let name = recording_backend_name(&config).unwrap();
-        let request = recording_transcription_config(&name, &config, "fr");
-        assert_eq!(request.model, "whisper-1");
-        // The track's language, not `[general] language`.
-        assert_eq!(request.language, "fr");
-        // The vocabulary, without the dictation prompt.
-        assert_eq!(request.prompt.as_deref(), Some("whisrs"));
-        assert_eq!(request.keyterms, ["whisrs"]);
+            )
+            .unwrap();
+            let name = recording_backend_name(&config).unwrap();
+            let request = recording_transcription_config(&name, &config, "fr");
+            assert_eq!(request.model, "whisper-1");
+            // The track's language, not `[general] language`.
+            assert_eq!(request.language, "fr");
+            // The vocabulary, without the dictation prompt.
+            assert_eq!(request.prompt.as_deref(), Some("whisrs"));
+            assert_eq!(request.keyterms, ["whisrs"]);
 
-        let no_vocabulary: Config = toml::from_str(
-            "[general]\nbackend = \"groq\"\nprompt = \"Transcribe in the language spoken.\"\n",
-        )
-        .unwrap();
-        let request = recording_transcription_config("groq", &no_vocabulary, "en");
-        assert_eq!(request.prompt, None, "nothing to send");
+            let no_vocabulary: Config = toml::from_str(
+                "[general]\nbackend = \"groq\"\nprompt = \"Transcribe in the language spoken.\"\n",
+            )
+            .unwrap();
+            let request = recording_transcription_config("groq", &no_vocabulary, "en");
+            assert_eq!(request.prompt, None, "nothing to send");
+        }
     }
 }

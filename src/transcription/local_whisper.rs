@@ -985,6 +985,7 @@ mod tests {
 
     /// Two speech regions a second of silence apart, as a recording chunk
     /// joins them, are two phrases however long `phrase_silence_ms` is.
+    #[cfg(feature = "recording")]
     #[test]
     fn recording_phrases_break_at_every_join() {
         let region: Vec<i16> = (0..16 * SAMPLE_RATE / 10)

@@ -42,7 +42,8 @@ whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sar
 whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id> [--with "..."]
 whisrs recording name <id> <S2|"Speaker 2"|current name> <name>   # "" clears; rewrites the .md at once
 whisrs recording summarize <id>   # [llm] summary (+ title if untitled) via the queue; [recording] summary = true does it after each transcript
-whisrs mcp       # read-only MCP server on stdio over the recordings folder (feature `mcp`; no daemon needed)
+                 # (every `whisrs recording` line: feature `recording`, in the default and both release builds)
+whisrs mcp       # read-only MCP server on stdio over the recordings folder (feature `mcp`, needs `recording`; no daemon needed)
 
 # Dev loop: rebuild this checkout and restart the daemon
 ./scripts/dev-install.sh             # build + install to ~/.cargo/bin + restart
@@ -69,9 +70,10 @@ src/
 ├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and recording text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
-├── daemon/recording.rs     # Recording sessions, processing queue/worker, recovery, shutdown
+├── daemon/recording.rs     # Recording sessions, processing queue/worker, recovery, shutdown (feature recording)
 ├── recording/              # Recording feature (mic + system audio, transcribed after the stop)
-│   ├── mod.rs              #   RecordingMeta (recording.json), segments, status types
+│   ├── mod.rs              #   RecordingMeta (recording.json), segments, status types: every build (IPC wire);
+│   │                       #   the submodules below are feature `recording`
 │   ├── store.rs            #   Recordings folder: create, list (or list_headers: no transcript text), resolve ids, retention sweep
 │   ├── recorder.rs         #   Per-track WAV writer with periodic header flushes
 │   ├── wav_repair.rs       #   Fix WAV headers a crash left unfinalized
@@ -185,26 +187,40 @@ docs" in an untracked file changes nothing for users and shows up in no PR. Chec
 
 ## Feature Flags
 
-- `default = ["local-whisper", "tray", "overlay", "hooks", "mcp"]`
+- `default = ["local-whisper", "tray", "overlay", "hooks", "recording", "mcp"]`
 - `local-whisper` — whisper-rs (whisper.cpp) for offline transcription. Requires a C++ toolchain and libclang.
 - `tray` — tray icon via `ksni`
 - `overlay` — recording overlay via `smithay-client-toolkit` + `wayland-client` + `tiny-skia`
 - `hooks` — recording-lifecycle hooks + MPRIS media pause via `zbus` (no new system dep; `overlay` already pulls `zbus`)
+- `recording`: the recording feature (`src/recording/` submodules, `src/daemon/recording.rs`, the tray's
+  recording items and icons, `whisrs recording`, the editor's Recording questions), with `flacenc`, `realfft` and
+  `bytes` as its optional deps. The wire and `Config` stay in every build: `Command::Recording`,
+  `Response::Recording` and the plain types in `src/recording/mod.rs`, so a CLI and daemon from different builds
+  still talk. Without it `whisrs recording ...` still parses and exits 1 ("this whisrs was built without the
+  recording feature"), the daemon answers every recording command with "this whisrsd was built without the
+  recording feature", `[hotkeys] recording` binds nothing, and dictation's "refused while a recording runs" check is
+  compiled out. The transcription layer stays whole (`transcribe_segments` on every backend, verbose_json, retry):
+  without the encoder, `flac::recording_upload` passes the WAV through, and nothing sends one
 - `mcp`: `whisrs mcp`, a read-only MCP server on stdio (`src/mcp.rs`) via `rmcp` (pinned `~3.5.1`: server, macros,
-  transport-io) + `schemars` 1. Without it the `mcp` subcommand still exists and exits 1 with a "built without the mcp
-  feature" error, so it is never silently missing
+  transport-io) + `schemars` 1. Implies `recording` (it reads the recordings folder through `recording::store`).
+  Without it the `mcp` subcommand still exists and exits 1 with a "built without the mcp feature" error, so it is
+  never silently missing
 - `vulkan` / `cuda` / `hipblas` — GPU backends for the bundled whisper.cpp, passed
   through to `whisper-rs`. Each implies `local-whisper`. Off by default and never built
   by CI or the release workflow, so they are source-build-only (`cargo install whisrs
   --features vulkan`). Enabling one turns on whisper-rs's `_gpu`, which is what flips
   `WhisperContextParameters::default().use_gpu` to true — there is no whisrs-side wiring.
 
-The **minimal** release build is `--no-default-features --features tray,overlay,hooks,mcp`:
-it drops only whisper.cpp. Keep `tray`, `overlay`, `hooks` and `mcp` in it (that omission was
-issue #51). The list is in `.github/workflows/ci.yml`, `.github/workflows/release.yml`,
-`CONTRIBUTING.md` and here; `flake.nix` builds the default features. A feature left out of that list is silently ignored at runtime rather than
-diagnosed: `Config` is not feature-gated, so the key still parses as known and the
-unknown-key warning stays quiet.
+The **minimal** release build is `--no-default-features --features tray,overlay,hooks,recording,mcp`:
+it drops only whisper.cpp. Keep `tray`, `overlay`, `hooks`, `recording` and `mcp` in it (that omission was
+issue #51); `mcp` implies `recording`, but both are listed so neither goes missing in a later edit. The list
+is in `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `CONTRIBUTING.md`, two comments in
+`src/config/types.rs` and here; `flake.nix` builds the default features. A feature left out of that list is
+silently ignored at runtime rather than diagnosed: `Config` is not feature-gated, so the key still parses as
+known and the unknown-key warning stays quiet. `recording` is the exception: built without it, a `[recording]`
+section that differs from the defaults or a `[hotkeys] recording` binding gets one config warning
+("this whisrs was built without the recording feature, so [recording] is ignored",
+`Config::validate_recording`), since a whole feature going quiet would otherwise look like a bug.
 
 ## Coding Conventions
 
@@ -302,8 +318,10 @@ Environment variable overrides:
 ```fish
 cargo fmt                                      # fix formatting
 cargo clippy --all-targets -- -D warnings      # lint (must pass clean)
-cargo clippy --all-targets --no-default-features --features tray,overlay,hooks -- -D warnings   # the build without mcp (CI runs it)
+cargo clippy --all-targets --no-default-features --features tray,overlay,hooks -- -D warnings             # without recording (CI runs it)
+cargo clippy --all-targets --no-default-features --features tray,overlay,hooks,recording -- -D warnings   # without mcp (CI runs it)
 cargo test                                     # all tests must pass
+cargo test --no-default-features --features tray,overlay,hooks   # the "built without recording" answers (CI runs it)
 cargo build                                    # must compile
 ```
 

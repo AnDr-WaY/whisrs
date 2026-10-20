@@ -1896,6 +1896,7 @@ mod tests {
             state_tx: tokio::sync::watch::channel(State::Idle).0,
             overlay_level_tx: None,
             overlay_enabled: false,
+            #[cfg(feature = "recording")]
             recording: crate::recording::RecordingRuntime::new().0,
         }
     }

@@ -34,13 +34,24 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      # No release row builds without `mcp` (the minimal build has it), so
-      # this keeps the `whisrs mcp` stub of such a build compiling.
-      - name: Clippy without mcp
+      # No release row builds without `recording` or `mcp` (the minimal build
+      # has both), so these keep a source build without them compiling: the
+      # `whisrs recording` and `whisrs mcp` stubs, the daemon's refusal and
+      # the config warning without `recording`, then `recording` without `mcp`.
+      - name: Clippy without recording
         run: cargo clippy --all-targets --no-default-features --features tray,overlay,hooks -- -D warnings
+
+      - name: Clippy without mcp
+        run: cargo clippy --all-targets --no-default-features --features tray,overlay,hooks,recording -- -D warnings
 
       - name: Test
         run: cargo test
+
+      # The "built without the recording feature" answers (CLI, daemon, config
+      # warning) exist only in a build without it, and dictation must pass
+      # there too. Reuses the dependencies above: about 45 s more.
+      - name: Test without recording
+        run: cargo test --no-default-features --features tray,overlay,hooks
 
       # The GPU features are passthroughs to whisper-rs and are never compiled
       # here: a Vulkan build needs shaderc, and no runner has a CUDA or ROCm
@@ -67,7 +78,7 @@ jobs:
           - name: full (default features)
             features: ""
           - name: minimal (no local-whisper)
-            features: "--no-default-features --features tray,overlay,hooks,mcp"
+            features: "--no-default-features --features tray,overlay,hooks,recording,mcp"
     # Same CPU baseline as the x86_64 rows of release.yml, so a regression
     # fails the PR instead of the tag (#152).
     env:

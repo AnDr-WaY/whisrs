@@ -1616,6 +1616,8 @@ mod tests {
         assert!(!line.contains("diarize"), "{line}");
     }
 
+    // FLAC needs the encoder, which comes with the recording feature.
+    #[cfg(feature = "recording")]
     #[tokio::test]
     async fn recording_chunks_upload_as_flac_and_dictation_as_wav() {
         let config = query_config("nova-3", &[]);

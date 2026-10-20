@@ -392,7 +392,9 @@ pub fn parse_response(body: &str) -> anyhow::Result<GroqTranscriptionResponse> {
 mod tests {
     use super::*;
     use crate::transcription::retry::{retry_transient, RateLimitExhausted, RATE_LIMIT_BUDGET};
-    use crate::transcription::test_server::{serve_once, serve_responses};
+    #[cfg(feature = "recording")]
+    use crate::transcription::test_server::serve_once;
+    use crate::transcription::test_server::serve_responses;
     use crate::transcription::RetryableHttpError;
     use std::time::Duration;
 
@@ -501,6 +503,8 @@ mod tests {
         assert!(err.to_string().contains("too large"));
     }
 
+    // The recording shape is FLAC, which comes with the recording feature.
+    #[cfg(feature = "recording")]
     #[test]
     fn form_builds_for_both_granularity_sets() {
         let config = TranscriptionConfig {
@@ -545,6 +549,8 @@ mod tests {
         }
     }
 
+    // FLAC needs the encoder, which comes with the recording feature.
+    #[cfg(feature = "recording")]
     #[tokio::test]
     async fn recording_chunks_upload_as_flac_and_dictation_as_wav() {
         let config = TranscriptionConfig {

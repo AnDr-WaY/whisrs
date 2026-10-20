@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use super::NotifyFn;
+#[cfg(feature = "recording")]
 use crate::recording::{RecordingAction, RecordingOptions, RecordingPhase, RecordingStatus};
 use crate::service::{RestartOutcome, ServiceManager};
 use crate::{Command, State};
@@ -15,7 +16,8 @@ use icons::IconSet;
 /// recording feature, at several sizes so HiDPI panels get a sharp render instead of an
 /// upscaled 16x16. Dictation states fill the bubble; a recording outlines it in
 /// the matching color (red while capturing, amber while transcribing), so the
-/// two read apart at a glance.
+/// two read apart at a glance. A build without the `recording` feature has
+/// neither recording set.
 ///
 /// The PNGs in `src/tray/icons/` are rendered from the SVGs next to them:
 /// `rsvg-convert -w N -h N <name>.svg -o <name>-N.png` for each size.
@@ -46,20 +48,27 @@ mod icons {
         Synthesizing,
         Speaking,
         /// A recording (mic + system audio) is in progress while dictation is idle.
+        #[cfg(feature = "recording")]
         RecordingActive,
         /// A recording is being transcribed while dictation is idle.
+        #[cfg(feature = "recording")]
         RecordingProcessing,
     }
 
     impl IconSet {
+        /// How many sets this build has.
+        pub const COUNT: usize = if cfg!(feature = "recording") { 7 } else { 5 };
+
         /// Every set, in declaration order (the cache index is `set as usize`).
-        pub const ALL: [IconSet; 7] = [
+        pub const ALL: [IconSet; Self::COUNT] = [
             IconSet::Idle,
             IconSet::Recording,
             IconSet::Transcribing,
             IconSet::Synthesizing,
             IconSet::Speaking,
+            #[cfg(feature = "recording")]
             IconSet::RecordingActive,
+            #[cfg(feature = "recording")]
             IconSet::RecordingProcessing,
         ];
 
@@ -81,7 +90,9 @@ mod icons {
                 IconSet::Transcribing => set_pngs!("transcribing"),
                 IconSet::Synthesizing => set_pngs!("synthesizing"),
                 IconSet::Speaking => set_pngs!("speaking"),
+                #[cfg(feature = "recording")]
                 IconSet::RecordingActive => set_pngs!("recording-active"),
+                #[cfg(feature = "recording")]
                 IconSet::RecordingProcessing => set_pngs!("recording-processing"),
             }
         }
@@ -122,7 +133,7 @@ mod icons {
 
     /// All sizes of `set`, decoded once and cached for the daemon's lifetime.
     pub fn get(set: IconSet) -> Vec<Icon> {
-        static CACHE: OnceLock<[Vec<Icon>; 7]> = OnceLock::new();
+        static CACHE: OnceLock<[Vec<Icon>; IconSet::COUNT]> = OnceLock::new();
         let cache = CACHE
             .get_or_init(|| IconSet::ALL.map(|s| s.pngs().iter().map(|b| decode(b)).collect()));
         cache[set as usize].clone()
@@ -137,10 +148,12 @@ mod icons {
 /// miss icon refreshes and leave the old color visible.
 struct TrayState {
     current: State,
+    #[cfg(feature = "recording")]
     recording: RecordingStatus,
 }
 
 /// One-line description of the recording, or `None` when no recording is active.
+#[cfg(feature = "recording")]
 fn recording_line(recording: &RecordingStatus) -> Option<String> {
     match recording.phase {
         RecordingPhase::Idle => None,
@@ -204,13 +217,17 @@ impl ksni::Tray for WhisrsTray {
         // A recording only takes over the title while dictation is idle: a
         // dictation started before the recording, or while it is transcribed,
         // matters more in the moment.
+        #[cfg(feature = "recording")]
         match (self.state.current, self.state.recording.phase) {
             (State::Idle, RecordingPhase::Recording) => {
-                "whisrs: recording mic and system audio".to_string()
+                return "whisrs: recording mic and system audio".to_string();
             }
-            (State::Idle, RecordingPhase::Processing) => "whisrs: processing recording".to_string(),
-            (state, _) => format!("whisrs: {}", state_word(state)),
+            (State::Idle, RecordingPhase::Processing) => {
+                return "whisrs: processing recording".to_string();
+            }
+            _ => {}
         }
+        format!("whisrs: {}", state_word(self.state.current))
     }
 
     /// Left-click on the icon: toggle recording, same as `whisrs toggle`.
@@ -223,11 +240,14 @@ impl ksni::Tray for WhisrsTray {
         // A recording only takes over the icon while dictation is idle: a
         // dictation started before the recording, or while it is transcribed,
         // matters more in the moment.
+        #[cfg(feature = "recording")]
         let set = match (self.state.current, self.state.recording.phase) {
             (State::Idle, RecordingPhase::Recording) => IconSet::RecordingActive,
             (State::Idle, RecordingPhase::Processing) => IconSet::RecordingProcessing,
             (state, _) => IconSet::for_state(state),
         };
+        #[cfg(not(feature = "recording"))]
+        let set = IconSet::for_state(self.state.current);
         icons::get(set)
     }
 
@@ -241,11 +261,14 @@ impl ksni::Tray for WhisrsTray {
         };
         // The recording line leads while dictation is idle, and is appended
         // otherwise so a running recording is never hidden.
+        #[cfg(feature = "recording")]
         let description = match (self.state.current, recording_line(&self.state.recording)) {
             (_, None) => description.to_string(),
             (State::Idle, Some(recording)) => recording,
             (_, Some(recording)) => format!("{description}\n{recording}"),
         };
+        #[cfg(not(feature = "recording"))]
+        let description = description.to_string();
         ToolTip {
             title: "whisrs".to_string(),
             description,
@@ -277,9 +300,12 @@ impl ksni::Tray for WhisrsTray {
             }),
             MenuItem::Separator,
         ];
-        items.extend(recording_menu_items(&self.state.recording));
+        #[cfg(feature = "recording")]
+        {
+            items.extend(recording_menu_items(&self.state.recording));
+            items.push(MenuItem::Separator);
+        }
         items.extend([
-            MenuItem::Separator,
             MenuItem::Standard(StandardItem {
                 label: "Restart Daemon".to_string(),
                 activate: Box::new(|tray: &mut Self| {
@@ -301,6 +327,7 @@ impl ksni::Tray for WhisrsTray {
 
 /// The recording section of the menu: a status line while a recording is active,
 /// a start/stop toggle, and cancel while capturing.
+#[cfg(feature = "recording")]
 fn recording_menu_items(recording: &RecordingStatus) -> Vec<MenuItem<WhisrsTray>> {
     let mut items = Vec::new();
     if let Some(line) = recording_line(recording) {
@@ -335,6 +362,7 @@ fn recording_menu_items(recording: &RecordingStatus) -> Vec<MenuItem<WhisrsTray>
     items
 }
 
+#[cfg(feature = "recording")]
 fn recording_command(action: RecordingAction) -> Command {
     Command::Recording {
         action,
@@ -414,8 +442,8 @@ const TRAY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1
 /// Retries with exponential backoff if the SNI host isn't available yet (common
 /// on boot when the daemon starts before the desktop environment is fully ready).
 pub async fn spawn_tray(
-    mut state_rx: watch::Receiver<State>,
-    mut recording_rx: watch::Receiver<RecordingStatus>,
+    state_rx: watch::Receiver<State>,
+    #[cfg(feature = "recording")] recording_rx: watch::Receiver<RecordingStatus>,
     cmd_tx: mpsc::Sender<Command>,
     notify: Option<NotifyFn>,
 ) {
@@ -427,6 +455,7 @@ pub async fn spawn_tray(
         let tray = WhisrsTray {
             state: TrayState {
                 current: *state_rx.borrow(),
+                #[cfg(feature = "recording")]
                 recording: recording_rx.borrow().clone(),
             },
             cmd_tx: cmd_tx.clone(),
@@ -457,44 +486,70 @@ pub async fn spawn_tray(
 
     let handle = handle.expect("handle must be set after successful spawn");
 
-    // Watch for dictation and recording changes and update the tray. The
-    // dictation channel ends the loop when it closes (the daemon is going
-    // away); a closed recording channel only stops recording updates.
-    tokio::spawn(async move {
-        let mut recording_open = true;
-        loop {
-            tokio::select! {
-                changed = state_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    let new_state = *state_rx.borrow();
-                    debug!("tray state update: {new_state:?}");
-                    // Mutate the tray object itself so ksni emits the
-                    // corresponding D-Bus property changes for title,
-                    // tooltip, and icon pixmap.
-                    handle
-                        .update(|tray| {
-                            tray.state.current = new_state;
-                        })
-                        .await;
+    tokio::spawn(watch_updates(
+        handle,
+        state_rx,
+        #[cfg(feature = "recording")]
+        recording_rx,
+    ));
+}
+
+/// Show a new dictation state. Mutating the tray object itself makes ksni
+/// emit the corresponding D-Bus property changes for title, tooltip, and
+/// icon pixmap.
+async fn show_state(handle: &ksni::Handle<WhisrsTray>, new_state: State) {
+    debug!("tray state update: {new_state:?}");
+    handle
+        .update(|tray| {
+            tray.state.current = new_state;
+        })
+        .await;
+}
+
+/// Watch for dictation changes and update the tray, until the channel
+/// closes (the daemon is going away).
+#[cfg(not(feature = "recording"))]
+async fn watch_updates(handle: ksni::Handle<WhisrsTray>, mut state_rx: watch::Receiver<State>) {
+    while state_rx.changed().await.is_ok() {
+        let new_state = *state_rx.borrow();
+        show_state(&handle, new_state).await;
+    }
+}
+
+/// Watch for dictation and recording changes and update the tray. The
+/// dictation channel ends the loop when it closes (the daemon is going
+/// away); a closed recording channel only stops recording updates.
+#[cfg(feature = "recording")]
+async fn watch_updates(
+    handle: ksni::Handle<WhisrsTray>,
+    mut state_rx: watch::Receiver<State>,
+    mut recording_rx: watch::Receiver<RecordingStatus>,
+) {
+    let mut recording_open = true;
+    loop {
+        tokio::select! {
+            changed = state_rx.changed() => {
+                if changed.is_err() {
+                    break;
                 }
-                changed = recording_rx.changed(), if recording_open => {
-                    if changed.is_err() {
-                        recording_open = false;
-                        continue;
-                    }
-                    let recording = recording_rx.borrow().clone();
-                    debug!("tray recording update: {:?}", recording.phase);
-                    handle
-                        .update(|tray| {
-                            tray.state.recording = recording;
-                        })
-                        .await;
+                let new_state = *state_rx.borrow();
+                show_state(&handle, new_state).await;
+            }
+            changed = recording_rx.changed(), if recording_open => {
+                if changed.is_err() {
+                    recording_open = false;
+                    continue;
                 }
+                let recording = recording_rx.borrow().clone();
+                debug!("tray recording update: {:?}", recording.phase);
+                handle
+                    .update(|tray| {
+                        tray.state.recording = recording;
+                    })
+                    .await;
             }
         }
-    });
+    }
 }
 
 #[cfg(test)]
@@ -505,172 +560,17 @@ mod tests {
     // it doesn't import the trait.
     use ksni::Tray as _;
 
-    fn tray_with(
-        cmd_tx: mpsc::Sender<Command>,
-        current: State,
-        recording: RecordingStatus,
-    ) -> WhisrsTray {
+    /// A tray in dictation state `current`, with no recording.
+    fn tray_with(cmd_tx: mpsc::Sender<Command>, current: State) -> WhisrsTray {
         WhisrsTray {
-            state: TrayState { current, recording },
+            state: TrayState {
+                current,
+                #[cfg(feature = "recording")]
+                recording: RecordingStatus::default(),
+            },
             cmd_tx,
             notify: None,
         }
-    }
-
-    fn active_recording(title: Option<&str>) -> RecordingStatus {
-        use chrono::TimeZone;
-        RecordingStatus {
-            phase: RecordingPhase::Recording,
-            id: Some("2026-10-02_0930".to_string()),
-            title: title.map(str::to_string),
-            started_at: Some(
-                chrono::Local
-                    .with_ymd_and_hms(2026, 10, 2, 9, 30, 0)
-                    .unwrap(),
-            ),
-            ..Default::default()
-        }
-    }
-
-    fn labels(items: &[MenuItem<WhisrsTray>]) -> Vec<(String, bool)> {
-        items
-            .iter()
-            .filter_map(|i| match i {
-                MenuItem::Standard(s) => Some((s.label.clone(), s.enabled)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Activate the standard menu item with this label.
-    fn click(tray: &mut WhisrsTray, label: &str) {
-        let mut items = recording_menu_items(&tray.state.recording);
-        let item = items
-            .iter_mut()
-            .find_map(|i| match i {
-                MenuItem::Standard(s) if s.label == label => Some(s),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("no menu item `{label}`"));
-        let activate = std::mem::replace(&mut item.activate, Box::new(|_: &mut WhisrsTray| {}));
-        activate(tray);
-    }
-
-    #[test]
-    fn recording_line_describes_each_phase() {
-        assert_eq!(recording_line(&RecordingStatus::default()), None);
-        assert_eq!(
-            recording_line(&active_recording(Some("standup"))).as_deref(),
-            Some("Recording mic and system audio since 09:30 (standup)")
-        );
-        assert_eq!(
-            recording_line(&active_recording(None)).as_deref(),
-            Some("Recording mic and system audio since 09:30")
-        );
-        let processing = RecordingStatus {
-            phase: RecordingPhase::Processing,
-            ..Default::default()
-        };
-        assert_eq!(
-            recording_line(&processing).as_deref(),
-            Some("Processing recording...")
-        );
-    }
-
-    #[test]
-    fn idle_recording_menu_offers_only_start() {
-        assert_eq!(
-            labels(&recording_menu_items(&RecordingStatus::default())),
-            vec![("Start recording (mic + system audio)".to_string(), true)]
-        );
-    }
-
-    #[test]
-    fn active_recording_menu_offers_status_stop_and_cancel() {
-        assert_eq!(
-            labels(&recording_menu_items(&active_recording(None))),
-            vec![
-                (
-                    "Recording mic and system audio since 09:30".to_string(),
-                    false
-                ),
-                ("Stop recording and transcribe".to_string(), true),
-                ("Cancel recording and delete it".to_string(), true),
-            ]
-        );
-    }
-
-    #[test]
-    fn recording_menu_items_send_toggle_and_cancel() {
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
-        let mut tray = tray_with(cmd_tx, State::Idle, active_recording(None));
-
-        click(&mut tray, "Stop recording and transcribe");
-        click(&mut tray, "Cancel recording and delete it");
-
-        for expected in [RecordingAction::Toggle, RecordingAction::Cancel] {
-            let cmd = cmd_rx.try_recv().expect("a recording command is queued");
-            assert!(
-                matches!(
-                    &cmd,
-                    Command::Recording { action, title: None, id: None, options }
-                        if *action == expected && *options == RecordingOptions::default()
-                ),
-                "expected recording {expected:?}, got {cmd:?}"
-            );
-        }
-    }
-
-    /// Every size's pixmap, for comparing whole icon sets.
-    fn pixmaps(icons: &[Icon]) -> Vec<&[u8]> {
-        icons.iter().map(|i| i.data.as_slice()).collect()
-    }
-
-    /// The recording shows in the icon and tooltip only while dictation is
-    /// idle; a dictation in progress keeps its own icon, and the recording is
-    /// still named in the tooltip.
-    #[test]
-    fn dictation_state_wins_the_icon_during_a_recording() {
-        let (cmd_tx, _rx) = mpsc::channel(1);
-        let idle = tray_with(cmd_tx.clone(), State::Idle, active_recording(Some("x")));
-        assert_eq!(
-            pixmaps(&idle.icon_pixmap()),
-            pixmaps(&icons::get(IconSet::RecordingActive))
-        );
-        assert_eq!(
-            idle.tool_tip().description,
-            "Recording mic and system audio since 09:30 (x)"
-        );
-
-        let processing = RecordingStatus {
-            phase: RecordingPhase::Processing,
-            ..Default::default()
-        };
-        let idle_processing = tray_with(cmd_tx.clone(), State::Idle, processing.clone());
-        assert_eq!(
-            pixmaps(&idle_processing.icon_pixmap()),
-            pixmaps(&icons::get(IconSet::RecordingProcessing))
-        );
-
-        let dictating = tray_with(
-            cmd_tx.clone(),
-            State::Recording,
-            active_recording(Some("x")),
-        );
-        assert_eq!(
-            pixmaps(&dictating.icon_pixmap()),
-            pixmaps(&icons::get(IconSet::Recording))
-        );
-        assert!(dictating
-            .tool_tip()
-            .description
-            .ends_with("Recording mic and system audio since 09:30 (x)"));
-
-        let transcribing = tray_with(cmd_tx, State::Transcribing, processing);
-        assert_eq!(
-            pixmaps(&transcribing.icon_pixmap()),
-            pixmaps(&icons::get(IconSet::Transcribing))
-        );
     }
 
     /// Dictation's words in the title, the menu's status line and the
@@ -686,7 +586,7 @@ mod tests {
             State::Synthesizing,
             State::Speaking,
         ] {
-            let tray = tray_with(cmd_tx.clone(), state, RecordingStatus::default());
+            let tray = tray_with(cmd_tx.clone(), state);
             for text in [
                 tray.title(),
                 tray.tool_tip().description,
@@ -696,7 +596,7 @@ mod tests {
                 assert!(!text.contains('\u{2014}'), "{state:?}: {text}");
             }
         }
-        let dictating = tray_with(cmd_tx, State::Recording, RecordingStatus::default());
+        let dictating = tray_with(cmd_tx, State::Recording);
         assert_eq!(dictating.tool_tip().description, "Dictating...");
         assert_eq!(dictating.title(), "whisrs: dictating");
     }
@@ -731,7 +631,7 @@ mod tests {
     #[test]
     fn activate_queues_toggle_command() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
-        let mut tray = tray_with(cmd_tx, State::Idle, RecordingStatus::default());
+        let mut tray = tray_with(cmd_tx, State::Idle);
 
         tray.activate(0, 0);
 
@@ -777,6 +677,205 @@ mod tests {
                     icon.width
                 );
             }
+        }
+    }
+
+    /// Without the recording feature the tray is dictation's alone: no
+    /// recording item in the menu and only the five dictation icon sets.
+    #[cfg(not(feature = "recording"))]
+    #[test]
+    fn no_recording_items_or_icons_without_the_feature() {
+        let (cmd_tx, _rx) = mpsc::channel(1);
+        let tray = tray_with(cmd_tx, State::Idle);
+        let labels: Vec<String> = tray
+            .menu()
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Standard(s) => Some(s.label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 3, "{labels:?}");
+        assert!(labels[0].starts_with("whisrs v"), "{labels:?}");
+        assert_eq!(labels[1..], ["Restart Daemon", "Quit"]);
+        assert_eq!(IconSet::ALL.len(), 5);
+        assert!(!tray
+            .tool_tip()
+            .description
+            .to_lowercase()
+            .contains("record"));
+    }
+
+    /// The recording items, icons and lines, in a build with the feature.
+    #[cfg(feature = "recording")]
+    mod recording {
+        use super::*;
+
+        /// A tray in dictation state `current` while `recording` runs.
+        fn tray_with(
+            cmd_tx: mpsc::Sender<Command>,
+            current: State,
+            recording: RecordingStatus,
+        ) -> WhisrsTray {
+            let mut tray = super::tray_with(cmd_tx, current);
+            tray.state.recording = recording;
+            tray
+        }
+
+        fn active_recording(title: Option<&str>) -> RecordingStatus {
+            use chrono::TimeZone;
+            RecordingStatus {
+                phase: RecordingPhase::Recording,
+                id: Some("2026-10-02_0930".to_string()),
+                title: title.map(str::to_string),
+                started_at: Some(
+                    chrono::Local
+                        .with_ymd_and_hms(2026, 10, 2, 9, 30, 0)
+                        .unwrap(),
+                ),
+                ..Default::default()
+            }
+        }
+
+        fn labels(items: &[MenuItem<WhisrsTray>]) -> Vec<(String, bool)> {
+            items
+                .iter()
+                .filter_map(|i| match i {
+                    MenuItem::Standard(s) => Some((s.label.clone(), s.enabled)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Activate the standard menu item with this label.
+        fn click(tray: &mut WhisrsTray, label: &str) {
+            let mut items = recording_menu_items(&tray.state.recording);
+            let item = items
+                .iter_mut()
+                .find_map(|i| match i {
+                    MenuItem::Standard(s) if s.label == label => Some(s),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no menu item `{label}`"));
+            let activate = std::mem::replace(&mut item.activate, Box::new(|_: &mut WhisrsTray| {}));
+            activate(tray);
+        }
+
+        #[test]
+        fn recording_line_describes_each_phase() {
+            assert_eq!(recording_line(&RecordingStatus::default()), None);
+            assert_eq!(
+                recording_line(&active_recording(Some("standup"))).as_deref(),
+                Some("Recording mic and system audio since 09:30 (standup)")
+            );
+            assert_eq!(
+                recording_line(&active_recording(None)).as_deref(),
+                Some("Recording mic and system audio since 09:30")
+            );
+            let processing = RecordingStatus {
+                phase: RecordingPhase::Processing,
+                ..Default::default()
+            };
+            assert_eq!(
+                recording_line(&processing).as_deref(),
+                Some("Processing recording...")
+            );
+        }
+
+        #[test]
+        fn idle_recording_menu_offers_only_start() {
+            assert_eq!(
+                labels(&recording_menu_items(&RecordingStatus::default())),
+                vec![("Start recording (mic + system audio)".to_string(), true)]
+            );
+        }
+
+        #[test]
+        fn active_recording_menu_offers_status_stop_and_cancel() {
+            assert_eq!(
+                labels(&recording_menu_items(&active_recording(None))),
+                vec![
+                    (
+                        "Recording mic and system audio since 09:30".to_string(),
+                        false
+                    ),
+                    ("Stop recording and transcribe".to_string(), true),
+                    ("Cancel recording and delete it".to_string(), true),
+                ]
+            );
+        }
+
+        #[test]
+        fn recording_menu_items_send_toggle_and_cancel() {
+            let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+            let mut tray = tray_with(cmd_tx, State::Idle, active_recording(None));
+
+            click(&mut tray, "Stop recording and transcribe");
+            click(&mut tray, "Cancel recording and delete it");
+
+            for expected in [RecordingAction::Toggle, RecordingAction::Cancel] {
+                let cmd = cmd_rx.try_recv().expect("a recording command is queued");
+                assert!(
+                    matches!(
+                        &cmd,
+                        Command::Recording { action, title: None, id: None, options }
+                            if *action == expected && *options == RecordingOptions::default()
+                    ),
+                    "expected recording {expected:?}, got {cmd:?}"
+                );
+            }
+        }
+
+        /// Every size's pixmap, for comparing whole icon sets.
+        fn pixmaps(icons: &[Icon]) -> Vec<&[u8]> {
+            icons.iter().map(|i| i.data.as_slice()).collect()
+        }
+
+        /// The recording shows in the icon and tooltip only while dictation is
+        /// idle; a dictation in progress keeps its own icon, and the recording is
+        /// still named in the tooltip.
+        #[test]
+        fn dictation_state_wins_the_icon_during_a_recording() {
+            let (cmd_tx, _rx) = mpsc::channel(1);
+            let idle = tray_with(cmd_tx.clone(), State::Idle, active_recording(Some("x")));
+            assert_eq!(
+                pixmaps(&idle.icon_pixmap()),
+                pixmaps(&icons::get(IconSet::RecordingActive))
+            );
+            assert_eq!(
+                idle.tool_tip().description,
+                "Recording mic and system audio since 09:30 (x)"
+            );
+
+            let processing = RecordingStatus {
+                phase: RecordingPhase::Processing,
+                ..Default::default()
+            };
+            let idle_processing = tray_with(cmd_tx.clone(), State::Idle, processing.clone());
+            assert_eq!(
+                pixmaps(&idle_processing.icon_pixmap()),
+                pixmaps(&icons::get(IconSet::RecordingProcessing))
+            );
+
+            let dictating = tray_with(
+                cmd_tx.clone(),
+                State::Recording,
+                active_recording(Some("x")),
+            );
+            assert_eq!(
+                pixmaps(&dictating.icon_pixmap()),
+                pixmaps(&icons::get(IconSet::Recording))
+            );
+            assert!(dictating
+                .tool_tip()
+                .description
+                .ends_with("Recording mic and system audio since 09:30 (x)"));
+
+            let transcribing = tray_with(cmd_tx, State::Transcribing, processing);
+            assert_eq!(
+                pixmaps(&transcribing.icon_pixmap()),
+                pixmaps(&icons::get(IconSet::Transcribing))
+            );
         }
     }
 }

@@ -21,6 +21,7 @@ use crate::pipeline::{
     format_api_error, format_no_microphone_error, save_history_entry, transcribe_batch_audio,
     BatchOptions,
 };
+#[cfg(feature = "recording")]
 use crate::recording::{refuse_while_recording, DictationStart};
 use crate::selection::{acquire_selected_text, capture_selection};
 
@@ -169,6 +170,7 @@ pub(crate) async fn handle_command_mode(
         State::Idle => {
             // First press: copy selection and start recording. A recording
             // in progress refuses it before the selection is copied.
+            #[cfg(feature = "recording")]
             if let Some(refused) = refuse_while_recording(&context, DictationStart::CommandMode) {
                 return refused;
             }
@@ -594,6 +596,7 @@ pub(crate) async fn handle_llm_command(
                 // After the lookup, so a misspelled name still gets the
                 // config error rather than the recording's.
                 Some(entry) => {
+                    #[cfg(feature = "recording")]
                     if let Some(refused) =
                         refuse_while_recording(&context, DictationStart::LlmCommand(&name))
                     {

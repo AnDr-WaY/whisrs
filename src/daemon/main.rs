@@ -21,6 +21,7 @@ mod hooks;
 mod injection;
 mod notify;
 mod pipeline;
+#[cfg(feature = "recording")]
 mod recording;
 mod selection;
 mod speak;
@@ -32,6 +33,7 @@ use crate::dictation::{handle_cancel, handle_toggle};
 use crate::factory::create_backend;
 use crate::injection::{prime_modifier_probe, warm_keyboard};
 use crate::notify::send_notification;
+#[cfg(feature = "recording")]
 use crate::recording::{error_already_notified, handle_recording, RecordingRuntime};
 use crate::speak::handle_speak;
 #[cfg(feature = "hooks")]
@@ -124,6 +126,7 @@ async fn main() -> Result<()> {
     let (overlay_level_tx, overlay_level_rx) = tokio::sync::watch::channel(0.0_f32);
     // Recording status has its own channel, read by the tray only: a recording
     // must not animate the overlay or fire the dictation hooks.
+    #[cfg(feature = "recording")]
     let (recording_runtime, recording_rx, recording_queue_rx) = RecordingRuntime::new();
 
     let tray_enabled = config.general.tray;
@@ -137,6 +140,7 @@ async fn main() -> Result<()> {
         state_tx,
         overlay_level_tx: overlay_enabled.then_some(overlay_level_tx),
         overlay_enabled,
+        #[cfg(feature = "recording")]
         recording: recording_runtime,
     });
 
@@ -155,7 +159,9 @@ async fn main() -> Result<()> {
                 // A recording start can spend seconds opening devices; run it
                 // aside so a dictation hotkey pressed meanwhile is not held
                 // behind it. Recordings never touch the dictation state, so
-                // there is nothing to broadcast after it.
+                // there is nothing to broadcast after it. Without the feature
+                // nothing internal sends one (no hotkey, no tray item).
+                #[cfg(feature = "recording")]
                 if let Command::Recording {
                     action,
                     title,
@@ -199,6 +205,7 @@ async fn main() -> Result<()> {
             .then_some(send_notification as whisrs::tray::NotifyFn);
         tokio::spawn(whisrs::tray::spawn_tray(
             state_rx.clone(),
+            #[cfg(feature = "recording")]
             recording_rx,
             cmd_tx.clone(),
             tray_notify,
@@ -245,24 +252,29 @@ async fn main() -> Result<()> {
     // recordings a crash or shutdown interrupted is spawned too, so the socket
     // serves without waiting for WAV repair. Commands that queued a recording
     // before this wait in the channel.
-    let worker = tokio::spawn(crate::recording::run_worker(
-        Arc::clone(&context),
-        recording_queue_rx,
-    ));
-    // Shutdown aborts it, so a SIGTERM mid-transcription is not counted as
-    // a crashed attempt.
-    context.recording.set_worker(worker);
-    tokio::spawn(crate::recording::recover_on_startup(Arc::clone(&context)));
-    // Recordings that could not reach the backend are tried again every
-    // few minutes while the daemon runs.
-    tokio::spawn(crate::recording::run_network_retries(Arc::clone(&context)));
+    #[cfg(feature = "recording")]
+    {
+        let worker = tokio::spawn(crate::recording::run_worker(
+            Arc::clone(&context),
+            recording_queue_rx,
+        ));
+        // Shutdown aborts it, so a SIGTERM mid-transcription is not counted as
+        // a crashed attempt.
+        context.recording.set_worker(worker);
+        tokio::spawn(crate::recording::recover_on_startup(Arc::clone(&context)));
+        // Recordings that could not reach the backend are tried again every
+        // few minutes while the daemon runs.
+        tokio::spawn(crate::recording::run_network_retries(Arc::clone(&context)));
+    }
 
-    // SIGTERM (systemd stop/restart, tray Quit) and SIGINT both finalize a
-    // recording in progress before exiting, so it is transcribed on the next start.
+    // SIGTERM (systemd stop/restart, tray Quit) and SIGINT both remove the
+    // socket before exiting, and finalize a recording in progress, so it is
+    // transcribed on the next start.
     let mut sigterm =
         signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
     let sock_path_clone = sock_path.clone();
+    #[cfg(feature = "recording")]
     let shutdown_ctx = Arc::clone(&context);
     tokio::spawn(async move {
         let name = tokio::select! {
@@ -270,6 +282,7 @@ async fn main() -> Result<()> {
             _ = sigint.recv() => "SIGINT",
         };
         info!("received {name}, shutting down");
+        #[cfg(feature = "recording")]
         crate::recording::shutdown(&shutdown_ctx).await;
         let _ = std::fs::remove_file(&sock_path_clone);
         std::process::exit(0);
@@ -359,14 +372,31 @@ async fn handle_command(
             handle_set_llm_instruction(daemon_state, context, name).await
         }
         Command::Speak => handle_speak(daemon_state, context).await,
+        #[cfg(feature = "recording")]
         Command::Recording {
             action,
             title,
             id,
             options,
         } => handle_recording(context, action, title, id, options).await,
+        // The wire keeps the command, so a CLI built with the feature gets
+        // a plain answer from a daemon built without it.
+        #[cfg(not(feature = "recording"))]
+        Command::Recording { action, .. } => {
+            info!("recording {action:?} refused: built without the recording feature");
+            Response::Error {
+                message: RECORDING_MISSING.to_string(),
+            }
+        }
     }
 }
+
+/// What a daemon built without the `recording` feature answers to every
+/// `recording` command.
+#[cfg(not(feature = "recording"))]
+const RECORDING_MISSING: &str = "this whisrsd was built without the recording feature, so it \
+     cannot record. Use a release build, or rebuild with `cargo install whisrs --features \
+     recording`.";
 
 #[cfg(test)]
 mod tests {
@@ -420,5 +450,60 @@ mod tests {
     #[test]
     fn daemon_parses_with_no_arguments() {
         assert!(Args::try_parse_from(["whisrsd"]).is_ok());
+    }
+
+    /// Built without the recording feature, every `recording` command,
+    /// straight off the wire, gets the same plain error, and dictation's
+    /// state is left alone.
+    #[cfg(not(feature = "recording"))]
+    #[tokio::test]
+    async fn recording_commands_are_refused_without_the_feature() {
+        use whisrs::recording::RecordingAction;
+
+        let context = Arc::new(DaemonContext {
+            config: toml::from_str("").expect("empty config uses defaults"),
+            window_tracker: Arc::new(whisrs::window::NoopTracker),
+            // Never called: nothing is transcribed.
+            transcription_backend: Arc::new(whisrs::transcription::groq::GroqBackend::new(
+                String::new(),
+            )),
+            notify: false,
+            state_tx: tokio::sync::watch::channel(State::Idle).0,
+            overlay_level_tx: None,
+            overlay_enabled: false,
+        });
+        let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
+        for action in [
+            RecordingAction::Start,
+            RecordingAction::Stop,
+            RecordingAction::Cancel,
+            RecordingAction::Status,
+            RecordingAction::Toggle,
+            RecordingAction::Retry,
+            RecordingAction::Copy,
+            RecordingAction::Name,
+            RecordingAction::Summarize,
+        ] {
+            let json = serde_json::to_string(&serde_json::json!({
+                "cmd": "recording",
+                "action": action,
+                "title": "Weekly sync",
+            }))
+            .unwrap();
+            let cmd: Command = serde_json::from_str(&json).expect("the wire still has it");
+            let response =
+                handle_command(cmd, Arc::clone(&daemon_state), Arc::clone(&context)).await;
+            match response {
+                Response::Error { message } => assert_eq!(
+                    message,
+                    "this whisrsd was built without the recording feature, so it cannot \
+                     record. Use a release build, or rebuild with `cargo install whisrs \
+                     --features recording`.",
+                    "{action:?}"
+                ),
+                other => panic!("{action:?}: expected an error, got {other:?}"),
+            }
+        }
+        assert_eq!(daemon_state.lock().await.state_machine.state(), State::Idle);
     }
 }

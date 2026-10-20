@@ -331,6 +331,8 @@ mod tests {
         }
     }
 
+    // FLAC needs the encoder, which comes with the recording feature.
+    #[cfg(feature = "recording")]
     #[tokio::test]
     async fn whisper_recording_chunks_upload_as_flac_and_dictation_as_wav() {
         let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();

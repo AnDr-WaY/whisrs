@@ -10,6 +10,7 @@ use whisrs::transcription::TranscriptionBackend;
 use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
 
+#[cfg(feature = "recording")]
 use crate::recording::RecordingRuntime;
 
 /// Context saved when command mode starts recording.
@@ -145,6 +146,7 @@ pub(crate) struct DaemonContext {
     /// The recording feature: its session, its status broadcast (tray only)
     /// and the processing queue. Kept out of [`DaemonState`] so a recording
     /// never waits on, or blocks, the dictation lock.
+    #[cfg(feature = "recording")]
     pub(crate) recording: RecordingRuntime,
 }
 

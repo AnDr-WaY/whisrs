@@ -1,14 +1,15 @@
 use std::process;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+#[cfg(feature = "recording")]
+use clap::ValueEnum;
+use clap::{Args, Parser, Subcommand};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use whisrs::history::HistoryEntry;
-use whisrs::recording::{
-    store, RecordingAction, RecordingMeta, RecordingOptions, RecordingPhase, RecordingState,
-    RecordingStatus,
-};
+#[cfg(feature = "recording")]
+use whisrs::recording::{store, RecordingAction, RecordingMeta, RecordingOptions, RecordingState};
+use whisrs::recording::{RecordingPhase, RecordingStatus};
 use whisrs::{
     encode_message, read_message, service::ServiceManager, socket_path, Command, Response,
     RestartOutcome, State,
@@ -97,8 +98,13 @@ enum SubCmd {
     /// Restart the whisrs daemon (uses the systemd or OpenRC user service when present)
     Restart,
     /// Record your mic and the system audio, then turn them into a transcript
+    #[cfg(feature = "recording")]
     #[command(subcommand)]
     Recording(RecordingCmd),
+    /// Record your mic and the system audio (not in this build: it was built
+    /// without the recording feature)
+    #[cfg(not(feature = "recording"))]
+    Recording(RecordingStub),
     /// Serve your recordings to an AI agent: a read-only MCP server on stdin
     /// and stdout (add it to an MCP client, e.g. `claude mcp add whisrs --
     /// whisrs mcp`)
@@ -106,6 +112,7 @@ enum SubCmd {
 }
 
 /// The transcription languages of a recording (`start`, `toggle`, `retry`).
+#[cfg(feature = "recording")]
 #[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
 struct LanguageArgs {
     /// Language of both tracks: an ISO 639-1 code (e.g. `de`), optionally
@@ -120,6 +127,7 @@ struct LanguageArgs {
     system_language: Option<String>,
 }
 
+#[cfg(feature = "recording")]
 impl LanguageArgs {
     fn into_options(self, others: Option<String>, speakers: SpeakerArgs) -> RecordingOptions {
         RecordingOptions {
@@ -137,6 +145,7 @@ impl LanguageArgs {
 
 /// What `whisrs recording name` sends: the speaker, and the name's words
 /// joined with spaces (an empty one clears it, which the daemon decides).
+#[cfg(feature = "recording")]
 fn name_options(speaker: String, name: &[String]) -> RecordingOptions {
     RecordingOptions {
         speaker: Some(speaker),
@@ -148,15 +157,18 @@ fn name_options(speaker: String, name: &[String]) -> RecordingOptions {
 /// The names `--with` lists, parsed by
 /// [`whisrs::recording::naming::parse_participants`]. A newtype so clap
 /// takes the option once, as one value.
+#[cfg(feature = "recording")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Participants(Vec<String>);
 
+#[cfg(feature = "recording")]
 fn parse_with(list: &str) -> Result<Participants, String> {
     whisrs::recording::naming::parse_participants(list).map(Participants)
 }
 
 /// How the voices of a recording are told apart (`start`, `toggle`,
 /// `retry`).
+#[cfg(feature = "recording")]
 #[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
 struct SpeakerArgs {
     /// Several people share your mic (an in-person meeting): tell its voices
@@ -185,6 +197,7 @@ struct SpeakerArgs {
     with: Option<Participants>,
 }
 
+#[cfg(feature = "recording")]
 #[derive(Subcommand)]
 enum RecordingCmd {
     /// Start a recording (mic + system audio)
@@ -278,7 +291,18 @@ enum RecordingCmd {
     },
 }
 
+/// `whisrs recording ...` in a build without the recording feature: it takes
+/// any arguments, so every recording command still parses and then says why
+/// it cannot run, instead of clap calling it unknown.
+#[cfg(not(feature = "recording"))]
+#[derive(Args)]
+struct RecordingStub {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    _args: Vec<String>,
+}
+
 /// Output format of `whisrs recording show`.
+#[cfg(feature = "recording")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ShowFormat {
     /// The rendered Markdown transcript (`<id>.md`)
@@ -380,6 +404,19 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(feature = "mcp")]
 async fn cmd_mcp() -> anyhow::Result<()> {
     whisrs::mcp::serve_stdio(recordings_root()).await
+}
+
+/// What `whisrs recording` says in a build without the `recording` feature.
+#[cfg(not(feature = "recording"))]
+const RECORDING_MISSING: &str = "this whisrs was built without the recording feature, so \
+     `whisrs recording` is not available. Use a release build, or rebuild with `cargo install \
+     whisrs --features recording`.";
+
+/// `whisrs recording ...` without the feature: the error, exit 1. Nothing
+/// is sent to the daemon.
+#[cfg(not(feature = "recording"))]
+async fn cmd_recording(_cmd: RecordingStub) -> anyhow::Result<()> {
+    exit_with_error(RECORDING_MISSING)
 }
 
 /// What `whisrs mcp` says in a build without the `mcp` feature.
@@ -543,6 +580,7 @@ async fn request(cmd: Command) -> anyhow::Result<Response> {
 /// `whisrs recording <action>`. Recording control goes through the daemon;
 /// `list`, `show` and `path` only read the recordings folder, so they work
 /// with the daemon stopped.
+#[cfg(feature = "recording")]
 async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
     let use_color = is_tty();
     let none = RecordingOptions::default;
@@ -628,11 +666,13 @@ async fn cmd_recording(cmd: RecordingCmd) -> anyhow::Result<()> {
 
 /// The recordings root: `[recording] dir` from config.toml, else the default
 /// ([`store::configured_recordings_dir`], which reads only that key).
+#[cfg(feature = "recording")]
 fn recordings_root() -> std::path::PathBuf {
     store::configured_recordings_dir()
 }
 
 /// Resolve `<id|last>` to a recording folder, or print the error and exit 1.
+#[cfg(feature = "recording")]
 fn resolve_or_exit(query: &str) -> std::path::PathBuf {
     match store::resolve(&recordings_root(), query) {
         Ok(dir) => dir,
@@ -641,6 +681,7 @@ fn resolve_or_exit(query: &str) -> std::path::PathBuf {
 }
 
 /// `whisrs recording list`.
+#[cfg(feature = "recording")]
 fn recording_list(json: bool) -> anyhow::Result<()> {
     let root = recordings_root();
     let recordings = match store::list(&root) {
@@ -678,6 +719,7 @@ fn recording_list(json: bool) -> anyhow::Result<()> {
 }
 
 /// One row of the `recording list` table.
+#[cfg(feature = "recording")]
 fn format_recording_row(meta: &RecordingMeta, id_width: usize) -> String {
     let duration = recording_duration_secs(meta)
         .map(format_duration)
@@ -693,6 +735,7 @@ fn format_recording_row(meta: &RecordingMeta, id_width: usize) -> String {
 }
 
 /// One element of `recording list --json`: the metadata without segments.
+#[cfg(feature = "recording")]
 fn recording_list_json(dir: &std::path::Path, meta: &RecordingMeta) -> serde_json::Value {
     serde_json::json!({
         "id": meta.id,
@@ -707,12 +750,14 @@ fn recording_list_json(dir: &std::path::Path, meta: &RecordingMeta) -> serde_jso
 }
 
 /// Recorded length in whole seconds, or `None` while still recording.
+#[cfg(feature = "recording")]
 fn recording_duration_secs(meta: &RecordingMeta) -> Option<i64> {
     let ended = meta.ended_at?;
     Some((ended - meta.started_at).num_seconds().max(0))
 }
 
 /// `3725` -> `1:02:05`, `125` -> `2:05`.
+#[cfg(feature = "recording")]
 fn format_duration(secs: i64) -> String {
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     if h > 0 {
@@ -722,6 +767,7 @@ fn format_duration(secs: i64) -> String {
     }
 }
 
+#[cfg(feature = "recording")]
 fn recording_state_name(state: RecordingState) -> &'static str {
     match state {
         RecordingState::Recording => "recording",
@@ -734,6 +780,7 @@ fn recording_state_name(state: RecordingState) -> &'static str {
 
 /// After `whisrs recording name`: the recording's speakers as the daemon
 /// just wrote them, one per line with its id and how it got its name.
+#[cfg(feature = "recording")]
 fn print_speakers(query: &str) {
     let dir = resolve_or_exit(query);
     let meta = match store::read_meta(&dir) {
@@ -744,6 +791,7 @@ fn print_speakers(query: &str) {
 }
 
 /// `Speakers of <id>:` and a line per speaker: `  S2  Sarah  (user)`.
+#[cfg(feature = "recording")]
 fn format_speakers(meta: &RecordingMeta) -> String {
     let width = meta.speakers.iter().map(|s| s.id.len()).max().unwrap_or(0);
     let mut out = format!("Speakers of {}:", meta.id);
@@ -757,6 +805,7 @@ fn format_speakers(meta: &RecordingMeta) -> String {
 }
 
 /// `whisrs recording show`.
+#[cfg(feature = "recording")]
 fn recording_show(query: &str, format: ShowFormat) -> anyhow::Result<()> {
     let dir = resolve_or_exit(query);
     match format {
@@ -796,6 +845,7 @@ fn recording_show(query: &str, format: ShowFormat) -> anyhow::Result<()> {
 }
 
 /// Why `show` has no transcript to print for a recording that is not done.
+#[cfg(feature = "recording")]
 fn not_ready_message(meta: &RecordingMeta) -> String {
     match meta.status {
         RecordingState::Failed => format!(
@@ -900,293 +950,6 @@ mod tests {
 
     use super::*;
 
-    fn parse_recording(args: &[&str]) -> RecordingCmd {
-        let mut argv = vec!["whisrs", "recording"];
-        argv.extend_from_slice(args);
-        match Cli::try_parse_from(argv).expect("parse").command {
-            SubCmd::Recording(cmd) => cmd,
-            _ => panic!("not a recording command"),
-        }
-    }
-
-    #[test]
-    fn recording_start_parses_title() {
-        assert!(matches!(
-            parse_recording(&["start"]),
-            RecordingCmd::Start { title: None, languages, others: None, speakers }
-                if languages == LanguageArgs::default() && speakers == SpeakerArgs::default()
-        ));
-        for flag in ["-t", "--title"] {
-            match parse_recording(&["start", flag, "Weekly sync"]) {
-                RecordingCmd::Start { title, .. } => {
-                    assert_eq!(title.as_deref(), Some("Weekly sync"))
-                }
-                _ => panic!("expected start"),
-            }
-        }
-    }
-
-    #[test]
-    fn recording_toggle_parses_title() {
-        assert!(matches!(
-            parse_recording(&["toggle"]),
-            RecordingCmd::Toggle { title: None, languages, others: None, speakers }
-                if languages == LanguageArgs::default() && speakers == SpeakerArgs::default()
-        ));
-        match parse_recording(&["toggle", "-t", "Weekly sync"]) {
-            RecordingCmd::Toggle { title, .. } => {
-                assert_eq!(title.as_deref(), Some("Weekly sync"))
-            }
-            _ => panic!("expected toggle"),
-        }
-    }
-
-    /// The language practice example from the docs, on `start` and `toggle`.
-    #[test]
-    fn recording_start_and_toggle_parse_languages_and_others() {
-        let want = RecordingOptions {
-            language: None,
-            mic_language: Some("de".into()),
-            system_language: Some("auto".into()),
-            others: Some("Video".into()),
-            shared_mic: None,
-            num_speakers: None,
-            participants: None,
-            ..Default::default()
-        };
-        for action in ["start", "toggle"] {
-            let cmd = parse_recording(&[
-                action,
-                "-t",
-                "Lesson 50",
-                "--mic-language",
-                "DE",
-                "--system-language",
-                "auto",
-                "--others",
-                " Video ",
-            ]);
-            let options = match cmd {
-                RecordingCmd::Start {
-                    languages,
-                    others,
-                    speakers,
-                    ..
-                }
-                | RecordingCmd::Toggle {
-                    languages,
-                    others,
-                    speakers,
-                    ..
-                } => languages.into_options(others, speakers),
-                _ => panic!("expected {action}"),
-            };
-            assert_eq!(options, want, "{action}: normalized as the daemon would");
-        }
-        for flag in ["-l", "--language"] {
-            match parse_recording(&["start", flag, "de"]) {
-                RecordingCmd::Start { languages, .. } => {
-                    assert_eq!(languages.language.as_deref(), Some("de"))
-                }
-                _ => panic!("expected start"),
-            }
-        }
-        for bad in [
-            &["start", "-l", "english"][..],
-            &["toggle", "--mic-language", "1"],
-            &["start", "--system-language", ""],
-            &["start", "--others", "  "],
-        ] {
-            let mut argv = vec!["whisrs", "recording"];
-            argv.extend_from_slice(bad);
-            assert!(
-                Cli::try_parse_from(argv).is_err(),
-                "{bad:?} must be refused"
-            );
-        }
-    }
-
-    /// `retry` takes the three languages, and no title or others label.
-    #[test]
-    fn recording_retry_parses_languages() {
-        match parse_recording(&["retry", "last", "-l", "de", "--system-language", "auto"]) {
-            RecordingCmd::Retry {
-                id,
-                languages,
-                speakers,
-            } => {
-                assert_eq!(id, "last");
-                assert_eq!(
-                    languages.into_options(None, speakers),
-                    RecordingOptions {
-                        language: Some("de".into()),
-                        system_language: Some("auto".into()),
-                        ..Default::default()
-                    }
-                );
-            }
-            _ => panic!("expected retry"),
-        }
-        for extra in ["--others", "--title"] {
-            let argv = ["whisrs", "recording", "retry", "last", extra, "x"];
-            assert!(Cli::try_parse_from(argv).is_err(), "retry takes no {extra}");
-        }
-    }
-
-    /// `--shared-mic` sets it, `--shared-mic=false` clears it for one
-    /// recording, and leaving it out keeps the default (or what a retried
-    /// recording stored), on `start`, `toggle` and `retry` alike.
-    #[test]
-    fn recording_shared_mic_parses() {
-        let shared = |args: &[&str]| match parse_recording(args) {
-            RecordingCmd::Start { speakers, .. }
-            | RecordingCmd::Toggle { speakers, .. }
-            | RecordingCmd::Retry { speakers, .. } => speakers.shared_mic,
-            _ => panic!("expected start, toggle or retry"),
-        };
-        for head in [&["start"][..], &["toggle"], &["retry", "last"]] {
-            let with = |extra: &[&str]| {
-                let mut args = head.to_vec();
-                args.extend_from_slice(extra);
-                shared(&args)
-            };
-            assert_eq!(with(&[]), None, "{head:?}");
-            assert_eq!(with(&["--shared-mic"]), Some(true), "{head:?}");
-            assert_eq!(with(&["--shared-mic=true"]), Some(true), "{head:?}");
-            assert_eq!(with(&["--shared-mic=false"]), Some(false), "{head:?}");
-        }
-        let argv = ["whisrs", "recording", "start", "--shared-mic=maybe"];
-        assert!(Cli::try_parse_from(argv).is_err());
-        // The option does not take the next argument as its value.
-        match parse_recording(&["retry", "--shared-mic", "last"]) {
-            RecordingCmd::Retry { id, speakers, .. } => {
-                assert_eq!(id, "last");
-                assert_eq!(speakers.shared_mic, Some(true));
-            }
-            _ => panic!("expected retry"),
-        }
-    }
-
-    /// `--num-speakers` takes 0 (let the sidecar decide) to 20 on `start`,
-    /// `toggle` and `retry`, and reaches the options sent to the daemon.
-    #[test]
-    fn recording_num_speakers_parses() {
-        for head in [&["start"][..], &["toggle"], &["retry", "last"]] {
-            for (value, want) in [("0", 0), ("3", 3), ("20", 20)] {
-                let mut args = head.to_vec();
-                args.extend_from_slice(&["--num-speakers", value]);
-                let speakers = match parse_recording(&args) {
-                    RecordingCmd::Start { speakers, .. }
-                    | RecordingCmd::Toggle { speakers, .. }
-                    | RecordingCmd::Retry { speakers, .. } => speakers,
-                    _ => panic!("expected start, toggle or retry"),
-                };
-                let options = LanguageArgs::default().into_options(None, speakers);
-                assert_eq!(options.num_speakers, Some(want), "{args:?}");
-            }
-            for bad in ["21", "-1", "two"] {
-                let mut argv = vec!["whisrs", "recording"];
-                argv.extend_from_slice(head);
-                argv.extend_from_slice(&["--num-speakers", bad]);
-                assert!(Cli::try_parse_from(argv).is_err(), "{head:?} {bad}");
-            }
-        }
-    }
-
-    /// `--with` takes names separated by commas on `start`, `toggle` and
-    /// `retry`, trimmed; a blank list is nobody; bad lists are refused
-    /// before anything reaches the daemon.
-    #[test]
-    fn recording_with_parses() {
-        for head in [&["start"][..], &["toggle"], &["retry", "last"]] {
-            let options = |extra: &[&str]| {
-                let mut args = head.to_vec();
-                args.extend_from_slice(extra);
-                match parse_recording(&args) {
-                    RecordingCmd::Start { speakers, .. }
-                    | RecordingCmd::Toggle { speakers, .. }
-                    | RecordingCmd::Retry { speakers, .. } => {
-                        LanguageArgs::default().into_options(None, speakers)
-                    }
-                    _ => panic!("expected start, toggle or retry"),
-                }
-            };
-            assert_eq!(options(&[]).participants, None, "{head:?}");
-            assert_eq!(
-                options(&["--with", " Sarah, Omar Haddad "]).participants,
-                Some(vec!["Sarah".to_string(), "Omar Haddad".to_string()]),
-                "{head:?}"
-            );
-            assert_eq!(
-                options(&["--with", ""]).participants,
-                Some(Vec::new()),
-                "{head:?}"
-            );
-            let too_many = (0..21).map(|i| format!("p{i}")).collect::<Vec<_>>();
-            for bad in [
-                "Sarah,,Omar",
-                "Sarah, sarah",
-                "Sarah\u{7}",
-                &too_many.join(","),
-            ] {
-                let mut argv = vec!["whisrs", "recording"];
-                argv.extend_from_slice(head);
-                argv.extend_from_slice(&["--with", bad]);
-                assert!(Cli::try_parse_from(argv).is_err(), "{head:?} {bad}");
-            }
-        }
-    }
-
-    /// `name` takes the recording, the speaker and the name, which may be
-    /// several words; an empty name clears it, and none at all is refused.
-    #[test]
-    fn recording_name_parses() {
-        let options = |args: &[&str]| match parse_recording(args) {
-            RecordingCmd::Name { id, speaker, name } => {
-                let options = name_options(speaker, &name);
-                (id, options.speaker.unwrap(), options.name.unwrap())
-            }
-            _ => panic!("expected name"),
-        };
-        assert_eq!(
-            options(&["name", "last", "S2", "Sarah"]),
-            ("last".into(), "S2".into(), "Sarah".into())
-        );
-        assert_eq!(
-            options(&["name", "2026-10", "Speaker 2", "Omar", "Haddad"]),
-            ("2026-10".into(), "Speaker 2".into(), "Omar Haddad".into())
-        );
-        assert_eq!(options(&["name", "last", "S2", ""]).2, "");
-        for bad in [&["name", "last", "S2"][..], &["name", "last"]] {
-            let mut argv = vec!["whisrs", "recording"];
-            argv.extend_from_slice(bad);
-            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn speakers_print_with_their_ids_and_sources() {
-        let mut meta = RecordingMeta::new("m1".into(), None, chrono::Local::now());
-        let speaker = |id: &str, name: &str, source: &str| whisrs::recording::Speaker {
-            id: id.into(),
-            name: name.into(),
-            source: source.into(),
-            evidence: None,
-            talk_ms: 0,
-            channel: None,
-            minor: false,
-        };
-        meta.speakers = vec![
-            speaker("me", "Yosif", "self"),
-            speaker("S1", "Sarah", "user"),
-            speaker("S12", "Speaker 1", "none"),
-        ];
-        assert_eq!(
-            format_speakers(&meta),
-            "Speakers of m1:\n  me   Yosif  (self)\n  S1   Sarah  (user)\n  S12  Speaker 1  (none)"
-        );
-    }
-
     /// `whisrs mcp` exists in every build, so a build without the feature
     /// says so instead of an unknown subcommand.
     #[test]
@@ -1201,87 +964,6 @@ mod tests {
     fn mcp_without_the_feature_says_how_to_get_it() {
         assert!(MCP_MISSING.contains("built without the mcp feature"));
         assert!(MCP_MISSING.contains("--features mcp"));
-    }
-
-    #[test]
-    fn recording_plain_actions_parse() {
-        assert!(matches!(parse_recording(&["stop"]), RecordingCmd::Stop));
-        assert!(matches!(parse_recording(&["cancel"]), RecordingCmd::Cancel));
-        assert!(matches!(parse_recording(&["status"]), RecordingCmd::Status));
-        assert!(matches!(
-            parse_recording(&["list"]),
-            RecordingCmd::List { json: false }
-        ));
-        assert!(matches!(
-            parse_recording(&["list", "--json"]),
-            RecordingCmd::List { json: true }
-        ));
-    }
-
-    #[test]
-    fn recording_id_actions_parse() {
-        match parse_recording(&["path", "last"]) {
-            RecordingCmd::Path { id } => assert_eq!(id, "last"),
-            _ => panic!("expected path"),
-        }
-        match parse_recording(&["copy", "2026-10-02"]) {
-            RecordingCmd::Copy { id } => assert_eq!(id, "2026-10-02"),
-            _ => panic!("expected copy"),
-        }
-        match parse_recording(&["retry", "last"]) {
-            RecordingCmd::Retry {
-                id,
-                languages,
-                speakers,
-            } => {
-                assert_eq!(id, "last");
-                assert_eq!(languages, LanguageArgs::default());
-                assert_eq!(speakers, SpeakerArgs::default());
-            }
-            _ => panic!("expected retry"),
-        }
-        match parse_recording(&["summarize", "last"]) {
-            RecordingCmd::Summarize { id } => assert_eq!(id, "last"),
-            _ => panic!("expected summarize"),
-        }
-        for action in ["show", "path", "copy", "retry", "summarize"] {
-            let argv = ["whisrs", "recording", action];
-            assert!(Cli::try_parse_from(argv).is_err(), "{action} needs an id");
-        }
-    }
-
-    #[test]
-    fn recording_show_format_defaults_to_md() {
-        match parse_recording(&["show", "last"]) {
-            RecordingCmd::Show { id, format } => {
-                assert_eq!(id, "last");
-                assert_eq!(format, ShowFormat::Md);
-            }
-            _ => panic!("expected show"),
-        }
-        for (arg, want) in [
-            ("md", ShowFormat::Md),
-            ("json", ShowFormat::Json),
-            ("txt", ShowFormat::Txt),
-        ] {
-            match parse_recording(&["show", "last", "--format", arg]) {
-                RecordingCmd::Show { format, .. } => assert_eq!(format, want),
-                _ => panic!("expected show"),
-            }
-        }
-        match parse_recording(&["show", "x", "-f", "json"]) {
-            RecordingCmd::Show { format, .. } => assert_eq!(format, ShowFormat::Json),
-            _ => panic!("expected show"),
-        }
-        assert!(
-            Cli::try_parse_from(["whisrs", "recording", "show", "x", "--format", "pdf"]).is_err()
-        );
-    }
-
-    #[test]
-    fn recording_requires_an_action() {
-        assert!(Cli::try_parse_from(["whisrs", "recording"]).is_err());
-        assert!(Cli::try_parse_from(["whisrs", "recording", "bogus"]).is_err());
     }
 
     fn at(h: u32, m: u32) -> chrono::DateTime<chrono::Local> {
@@ -1360,72 +1042,6 @@ mod tests {
             format_recording_status(&status, true),
             format!("{BOLD}{GREEN}Recording{RESET} since 08:30")
         );
-    }
-
-    #[test]
-    fn duration_formatting() {
-        assert_eq!(format_duration(0), "0:00");
-        assert_eq!(format_duration(125), "2:05");
-        assert_eq!(format_duration(3725), "1:02:05");
-    }
-
-    #[test]
-    fn recording_row_and_json() {
-        let mut meta = RecordingMeta::new(
-            "2026-10-02_1405_sync".into(),
-            Some("Sync".into()),
-            at(14, 5),
-        );
-        assert_eq!(recording_duration_secs(&meta), None);
-        assert!(format_recording_row(&meta, 20).contains("       -  recording   Sync"));
-
-        meta.ended_at = Some(at(15, 7));
-        meta.status = RecordingState::Done;
-        assert_eq!(recording_duration_secs(&meta), Some(62 * 60));
-        assert_eq!(
-            format_recording_row(&meta, 20),
-            "2026-10-02_1405_sync  2026-10-02 14:05   1:02:00  done        Sync"
-        );
-
-        let json = recording_list_json(std::path::Path::new("/m/x"), &meta);
-        assert_eq!(json["id"], "2026-10-02_1405_sync");
-        assert_eq!(json["status"], "done");
-        assert_eq!(json["duration_secs"], 3720);
-        assert_eq!(json["dir"], "/m/x");
-        assert!(json.get("segments").is_none());
-    }
-
-    #[test]
-    fn not_ready_message_names_status_and_retry() {
-        let mut meta = RecordingMeta::new("m1".into(), None, at(10, 0));
-        assert_eq!(
-            not_ready_message(&meta),
-            "recording m1 has no transcript yet (status: recording)."
-        );
-        meta.status = RecordingState::Failed;
-        meta.error = Some("backend down".into());
-        assert!(not_ready_message(&meta).contains("backend down"));
-        assert!(not_ready_message(&meta).contains("whisrs recording retry m1"));
-
-        meta.status = RecordingState::Waiting;
-        meta.ended_at = Some(at(11, 0));
-        meta.error = Some("could not reach the transcription service".into());
-        // The window runs from the first failed try (11:01), not the stop.
-        meta.network_wait = Some(whisrs::recording::NetworkWait {
-            since: at(11, 1),
-            attempts: 0,
-            last_attempt_at: at(11, 1),
-        });
-        assert_eq!(
-            not_ready_message(&meta),
-            "recording m1 is waiting for the network: could not reach the transcription \
-             service. whisrs tries again every 10 minutes until 2026-10-03 11:01; \
-             `whisrs recording retry m1` tries now."
-        );
-        assert!(format_recording_row(&meta, 2).contains("  waiting     "));
-        let json = recording_list_json(std::path::Path::new("/m/m1"), &meta);
-        assert_eq!(json["status"], "waiting");
-        assert_eq!(json["error"], "could not reach the transcription service");
     }
 
     #[test]
@@ -1521,5 +1137,486 @@ mod tests {
             }
         }
         headers
+    }
+
+    /// Built without the recording feature, every recording command still
+    /// parses, so it reaches the error below instead of clap's "unrecognized
+    /// subcommand", and nothing in it is checked.
+    #[cfg(not(feature = "recording"))]
+    #[test]
+    fn recording_parses_in_a_build_without_the_feature() {
+        for args in [
+            &["recording"][..],
+            &[
+                "recording",
+                "start",
+                "-t",
+                "Weekly sync",
+                "--with",
+                "Sarah, Omar",
+            ],
+            &["recording", "toggle", "--num-speakers", "99"],
+            &["recording", "show", "last", "-f", "txt"],
+            &["recording", "bogus", "--flag"],
+        ] {
+            let argv: Vec<&str> = std::iter::once("whisrs")
+                .chain(args.iter().copied())
+                .collect();
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert!(matches!(cli.command, SubCmd::Recording(_)), "{args:?}");
+        }
+    }
+
+    #[cfg(not(feature = "recording"))]
+    #[test]
+    fn recording_without_the_feature_says_how_to_get_it() {
+        assert_eq!(
+            RECORDING_MISSING,
+            "this whisrs was built without the recording feature, so `whisrs recording` is \
+             not available. Use a release build, or rebuild with `cargo install whisrs \
+             --features recording`."
+        );
+        assert!(!RECORDING_MISSING.contains('\u{2014}'), "no em dash");
+    }
+
+    /// The recording commands, in a build with the feature.
+    #[cfg(feature = "recording")]
+    mod recording {
+        use super::*;
+
+        fn parse_recording(args: &[&str]) -> RecordingCmd {
+            let mut argv = vec!["whisrs", "recording"];
+            argv.extend_from_slice(args);
+            match Cli::try_parse_from(argv).expect("parse").command {
+                SubCmd::Recording(cmd) => cmd,
+                _ => panic!("not a recording command"),
+            }
+        }
+
+        #[test]
+        fn recording_start_parses_title() {
+            assert!(matches!(
+                parse_recording(&["start"]),
+                RecordingCmd::Start { title: None, languages, others: None, speakers }
+                    if languages == LanguageArgs::default() && speakers == SpeakerArgs::default()
+            ));
+            for flag in ["-t", "--title"] {
+                match parse_recording(&["start", flag, "Weekly sync"]) {
+                    RecordingCmd::Start { title, .. } => {
+                        assert_eq!(title.as_deref(), Some("Weekly sync"))
+                    }
+                    _ => panic!("expected start"),
+                }
+            }
+        }
+
+        #[test]
+        fn recording_toggle_parses_title() {
+            assert!(matches!(
+                parse_recording(&["toggle"]),
+                RecordingCmd::Toggle { title: None, languages, others: None, speakers }
+                    if languages == LanguageArgs::default() && speakers == SpeakerArgs::default()
+            ));
+            match parse_recording(&["toggle", "-t", "Weekly sync"]) {
+                RecordingCmd::Toggle { title, .. } => {
+                    assert_eq!(title.as_deref(), Some("Weekly sync"))
+                }
+                _ => panic!("expected toggle"),
+            }
+        }
+
+        /// The language practice example from the docs, on `start` and `toggle`.
+        #[test]
+        fn recording_start_and_toggle_parse_languages_and_others() {
+            let want = RecordingOptions {
+                language: None,
+                mic_language: Some("de".into()),
+                system_language: Some("auto".into()),
+                others: Some("Video".into()),
+                shared_mic: None,
+                num_speakers: None,
+                participants: None,
+                ..Default::default()
+            };
+            for action in ["start", "toggle"] {
+                let cmd = parse_recording(&[
+                    action,
+                    "-t",
+                    "Lesson 50",
+                    "--mic-language",
+                    "DE",
+                    "--system-language",
+                    "auto",
+                    "--others",
+                    " Video ",
+                ]);
+                let options = match cmd {
+                    RecordingCmd::Start {
+                        languages,
+                        others,
+                        speakers,
+                        ..
+                    }
+                    | RecordingCmd::Toggle {
+                        languages,
+                        others,
+                        speakers,
+                        ..
+                    } => languages.into_options(others, speakers),
+                    _ => panic!("expected {action}"),
+                };
+                assert_eq!(options, want, "{action}: normalized as the daemon would");
+            }
+            for flag in ["-l", "--language"] {
+                match parse_recording(&["start", flag, "de"]) {
+                    RecordingCmd::Start { languages, .. } => {
+                        assert_eq!(languages.language.as_deref(), Some("de"))
+                    }
+                    _ => panic!("expected start"),
+                }
+            }
+            for bad in [
+                &["start", "-l", "english"][..],
+                &["toggle", "--mic-language", "1"],
+                &["start", "--system-language", ""],
+                &["start", "--others", "  "],
+            ] {
+                let mut argv = vec!["whisrs", "recording"];
+                argv.extend_from_slice(bad);
+                assert!(
+                    Cli::try_parse_from(argv).is_err(),
+                    "{bad:?} must be refused"
+                );
+            }
+        }
+
+        /// `retry` takes the three languages, and no title or others label.
+        #[test]
+        fn recording_retry_parses_languages() {
+            match parse_recording(&["retry", "last", "-l", "de", "--system-language", "auto"]) {
+                RecordingCmd::Retry {
+                    id,
+                    languages,
+                    speakers,
+                } => {
+                    assert_eq!(id, "last");
+                    assert_eq!(
+                        languages.into_options(None, speakers),
+                        RecordingOptions {
+                            language: Some("de".into()),
+                            system_language: Some("auto".into()),
+                            ..Default::default()
+                        }
+                    );
+                }
+                _ => panic!("expected retry"),
+            }
+            for extra in ["--others", "--title"] {
+                let argv = ["whisrs", "recording", "retry", "last", extra, "x"];
+                assert!(Cli::try_parse_from(argv).is_err(), "retry takes no {extra}");
+            }
+        }
+
+        /// `--shared-mic` sets it, `--shared-mic=false` clears it for one
+        /// recording, and leaving it out keeps the default (or what a retried
+        /// recording stored), on `start`, `toggle` and `retry` alike.
+        #[test]
+        fn recording_shared_mic_parses() {
+            let shared = |args: &[&str]| match parse_recording(args) {
+                RecordingCmd::Start { speakers, .. }
+                | RecordingCmd::Toggle { speakers, .. }
+                | RecordingCmd::Retry { speakers, .. } => speakers.shared_mic,
+                _ => panic!("expected start, toggle or retry"),
+            };
+            for head in [&["start"][..], &["toggle"], &["retry", "last"]] {
+                let with = |extra: &[&str]| {
+                    let mut args = head.to_vec();
+                    args.extend_from_slice(extra);
+                    shared(&args)
+                };
+                assert_eq!(with(&[]), None, "{head:?}");
+                assert_eq!(with(&["--shared-mic"]), Some(true), "{head:?}");
+                assert_eq!(with(&["--shared-mic=true"]), Some(true), "{head:?}");
+                assert_eq!(with(&["--shared-mic=false"]), Some(false), "{head:?}");
+            }
+            let argv = ["whisrs", "recording", "start", "--shared-mic=maybe"];
+            assert!(Cli::try_parse_from(argv).is_err());
+            // The option does not take the next argument as its value.
+            match parse_recording(&["retry", "--shared-mic", "last"]) {
+                RecordingCmd::Retry { id, speakers, .. } => {
+                    assert_eq!(id, "last");
+                    assert_eq!(speakers.shared_mic, Some(true));
+                }
+                _ => panic!("expected retry"),
+            }
+        }
+
+        /// `--num-speakers` takes 0 (let the sidecar decide) to 20 on `start`,
+        /// `toggle` and `retry`, and reaches the options sent to the daemon.
+        #[test]
+        fn recording_num_speakers_parses() {
+            for head in [&["start"][..], &["toggle"], &["retry", "last"]] {
+                for (value, want) in [("0", 0), ("3", 3), ("20", 20)] {
+                    let mut args = head.to_vec();
+                    args.extend_from_slice(&["--num-speakers", value]);
+                    let speakers = match parse_recording(&args) {
+                        RecordingCmd::Start { speakers, .. }
+                        | RecordingCmd::Toggle { speakers, .. }
+                        | RecordingCmd::Retry { speakers, .. } => speakers,
+                        _ => panic!("expected start, toggle or retry"),
+                    };
+                    let options = LanguageArgs::default().into_options(None, speakers);
+                    assert_eq!(options.num_speakers, Some(want), "{args:?}");
+                }
+                for bad in ["21", "-1", "two"] {
+                    let mut argv = vec!["whisrs", "recording"];
+                    argv.extend_from_slice(head);
+                    argv.extend_from_slice(&["--num-speakers", bad]);
+                    assert!(Cli::try_parse_from(argv).is_err(), "{head:?} {bad}");
+                }
+            }
+        }
+
+        /// `--with` takes names separated by commas on `start`, `toggle` and
+        /// `retry`, trimmed; a blank list is nobody; bad lists are refused
+        /// before anything reaches the daemon.
+        #[test]
+        fn recording_with_parses() {
+            for head in [&["start"][..], &["toggle"], &["retry", "last"]] {
+                let options = |extra: &[&str]| {
+                    let mut args = head.to_vec();
+                    args.extend_from_slice(extra);
+                    match parse_recording(&args) {
+                        RecordingCmd::Start { speakers, .. }
+                        | RecordingCmd::Toggle { speakers, .. }
+                        | RecordingCmd::Retry { speakers, .. } => {
+                            LanguageArgs::default().into_options(None, speakers)
+                        }
+                        _ => panic!("expected start, toggle or retry"),
+                    }
+                };
+                assert_eq!(options(&[]).participants, None, "{head:?}");
+                assert_eq!(
+                    options(&["--with", " Sarah, Omar Haddad "]).participants,
+                    Some(vec!["Sarah".to_string(), "Omar Haddad".to_string()]),
+                    "{head:?}"
+                );
+                assert_eq!(
+                    options(&["--with", ""]).participants,
+                    Some(Vec::new()),
+                    "{head:?}"
+                );
+                let too_many = (0..21).map(|i| format!("p{i}")).collect::<Vec<_>>();
+                for bad in [
+                    "Sarah,,Omar",
+                    "Sarah, sarah",
+                    "Sarah\u{7}",
+                    &too_many.join(","),
+                ] {
+                    let mut argv = vec!["whisrs", "recording"];
+                    argv.extend_from_slice(head);
+                    argv.extend_from_slice(&["--with", bad]);
+                    assert!(Cli::try_parse_from(argv).is_err(), "{head:?} {bad}");
+                }
+            }
+        }
+
+        /// `name` takes the recording, the speaker and the name, which may be
+        /// several words; an empty name clears it, and none at all is refused.
+        #[test]
+        fn recording_name_parses() {
+            let options = |args: &[&str]| match parse_recording(args) {
+                RecordingCmd::Name { id, speaker, name } => {
+                    let options = name_options(speaker, &name);
+                    (id, options.speaker.unwrap(), options.name.unwrap())
+                }
+                _ => panic!("expected name"),
+            };
+            assert_eq!(
+                options(&["name", "last", "S2", "Sarah"]),
+                ("last".into(), "S2".into(), "Sarah".into())
+            );
+            assert_eq!(
+                options(&["name", "2026-10", "Speaker 2", "Omar", "Haddad"]),
+                ("2026-10".into(), "Speaker 2".into(), "Omar Haddad".into())
+            );
+            assert_eq!(options(&["name", "last", "S2", ""]).2, "");
+            for bad in [&["name", "last", "S2"][..], &["name", "last"]] {
+                let mut argv = vec!["whisrs", "recording"];
+                argv.extend_from_slice(bad);
+                assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
+            }
+        }
+
+        #[test]
+        fn speakers_print_with_their_ids_and_sources() {
+            let mut meta = RecordingMeta::new("m1".into(), None, chrono::Local::now());
+            let speaker = |id: &str, name: &str, source: &str| whisrs::recording::Speaker {
+                id: id.into(),
+                name: name.into(),
+                source: source.into(),
+                evidence: None,
+                talk_ms: 0,
+                channel: None,
+                minor: false,
+            };
+            meta.speakers = vec![
+                speaker("me", "Yosif", "self"),
+                speaker("S1", "Sarah", "user"),
+                speaker("S12", "Speaker 1", "none"),
+            ];
+            assert_eq!(
+                format_speakers(&meta),
+                "Speakers of m1:\n  me   Yosif  (self)\n  S1   Sarah  (user)\n  S12  Speaker 1  (none)"
+            );
+        }
+
+        #[test]
+        fn recording_plain_actions_parse() {
+            assert!(matches!(parse_recording(&["stop"]), RecordingCmd::Stop));
+            assert!(matches!(parse_recording(&["cancel"]), RecordingCmd::Cancel));
+            assert!(matches!(parse_recording(&["status"]), RecordingCmd::Status));
+            assert!(matches!(
+                parse_recording(&["list"]),
+                RecordingCmd::List { json: false }
+            ));
+            assert!(matches!(
+                parse_recording(&["list", "--json"]),
+                RecordingCmd::List { json: true }
+            ));
+        }
+
+        #[test]
+        fn recording_id_actions_parse() {
+            match parse_recording(&["path", "last"]) {
+                RecordingCmd::Path { id } => assert_eq!(id, "last"),
+                _ => panic!("expected path"),
+            }
+            match parse_recording(&["copy", "2026-10-02"]) {
+                RecordingCmd::Copy { id } => assert_eq!(id, "2026-10-02"),
+                _ => panic!("expected copy"),
+            }
+            match parse_recording(&["retry", "last"]) {
+                RecordingCmd::Retry {
+                    id,
+                    languages,
+                    speakers,
+                } => {
+                    assert_eq!(id, "last");
+                    assert_eq!(languages, LanguageArgs::default());
+                    assert_eq!(speakers, SpeakerArgs::default());
+                }
+                _ => panic!("expected retry"),
+            }
+            match parse_recording(&["summarize", "last"]) {
+                RecordingCmd::Summarize { id } => assert_eq!(id, "last"),
+                _ => panic!("expected summarize"),
+            }
+            for action in ["show", "path", "copy", "retry", "summarize"] {
+                let argv = ["whisrs", "recording", action];
+                assert!(Cli::try_parse_from(argv).is_err(), "{action} needs an id");
+            }
+        }
+
+        #[test]
+        fn recording_show_format_defaults_to_md() {
+            match parse_recording(&["show", "last"]) {
+                RecordingCmd::Show { id, format } => {
+                    assert_eq!(id, "last");
+                    assert_eq!(format, ShowFormat::Md);
+                }
+                _ => panic!("expected show"),
+            }
+            for (arg, want) in [
+                ("md", ShowFormat::Md),
+                ("json", ShowFormat::Json),
+                ("txt", ShowFormat::Txt),
+            ] {
+                match parse_recording(&["show", "last", "--format", arg]) {
+                    RecordingCmd::Show { format, .. } => assert_eq!(format, want),
+                    _ => panic!("expected show"),
+                }
+            }
+            match parse_recording(&["show", "x", "-f", "json"]) {
+                RecordingCmd::Show { format, .. } => assert_eq!(format, ShowFormat::Json),
+                _ => panic!("expected show"),
+            }
+            assert!(
+                Cli::try_parse_from(["whisrs", "recording", "show", "x", "--format", "pdf"])
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn recording_requires_an_action() {
+            assert!(Cli::try_parse_from(["whisrs", "recording"]).is_err());
+            assert!(Cli::try_parse_from(["whisrs", "recording", "bogus"]).is_err());
+        }
+
+        #[test]
+        fn duration_formatting() {
+            assert_eq!(format_duration(0), "0:00");
+            assert_eq!(format_duration(125), "2:05");
+            assert_eq!(format_duration(3725), "1:02:05");
+        }
+
+        #[test]
+        fn recording_row_and_json() {
+            let mut meta = RecordingMeta::new(
+                "2026-10-02_1405_sync".into(),
+                Some("Sync".into()),
+                at(14, 5),
+            );
+            assert_eq!(recording_duration_secs(&meta), None);
+            assert!(format_recording_row(&meta, 20).contains("       -  recording   Sync"));
+
+            meta.ended_at = Some(at(15, 7));
+            meta.status = RecordingState::Done;
+            assert_eq!(recording_duration_secs(&meta), Some(62 * 60));
+            assert_eq!(
+                format_recording_row(&meta, 20),
+                "2026-10-02_1405_sync  2026-10-02 14:05   1:02:00  done        Sync"
+            );
+
+            let json = recording_list_json(std::path::Path::new("/m/x"), &meta);
+            assert_eq!(json["id"], "2026-10-02_1405_sync");
+            assert_eq!(json["status"], "done");
+            assert_eq!(json["duration_secs"], 3720);
+            assert_eq!(json["dir"], "/m/x");
+            assert!(json.get("segments").is_none());
+        }
+
+        #[test]
+        fn not_ready_message_names_status_and_retry() {
+            let mut meta = RecordingMeta::new("m1".into(), None, at(10, 0));
+            assert_eq!(
+                not_ready_message(&meta),
+                "recording m1 has no transcript yet (status: recording)."
+            );
+            meta.status = RecordingState::Failed;
+            meta.error = Some("backend down".into());
+            assert!(not_ready_message(&meta).contains("backend down"));
+            assert!(not_ready_message(&meta).contains("whisrs recording retry m1"));
+
+            meta.status = RecordingState::Waiting;
+            meta.ended_at = Some(at(11, 0));
+            meta.error = Some("could not reach the transcription service".into());
+            // The window runs from the first failed try (11:01), not the stop.
+            meta.network_wait = Some(whisrs::recording::NetworkWait {
+                since: at(11, 1),
+                attempts: 0,
+                last_attempt_at: at(11, 1),
+            });
+            assert_eq!(
+                not_ready_message(&meta),
+                "recording m1 is waiting for the network: could not reach the transcription \
+                 service. whisrs tries again every 10 minutes until 2026-10-03 11:01; \
+                 `whisrs recording retry m1` tries now."
+            );
+            assert!(format_recording_row(&meta, 2).contains("  waiting     "));
+            let json = recording_list_json(std::path::Path::new("/m/m1"), &meta);
+            assert_eq!(json["status"], "waiting");
+            assert_eq!(json["error"], "could not reach the transcription service");
+        }
     }
 }

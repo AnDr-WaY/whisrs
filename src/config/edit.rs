@@ -16,7 +16,9 @@ use dialoguer::{Confirm, Editor, Input, Select};
 
 use crate::config::{setup, vocabulary};
 use crate::service::ServiceManager;
-use crate::{Config, DiarizationMode, HotkeyConfig, RecordingConfig, RestartOutcome};
+use crate::{Config, HotkeyConfig, RestartOutcome};
+#[cfg(feature = "recording")]
+use crate::{DiarizationMode, RecordingConfig};
 
 use setup::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
@@ -535,9 +537,11 @@ fn select_input_device(
 /// are left out on purpose: they only stream, and a recording is transcribed
 /// from files after it ends. `deepgram-streaming` is left out because a
 /// recording uses Deepgram's REST API either way.
+#[cfg(feature = "recording")]
 const RECORDING_BACKENDS: [&str; 5] =
     ["groq", "openai", "deepgram", "asr-sidecar", "local-whisper"];
 
+#[cfg(feature = "recording")]
 fn edit_recording(config: &mut Config) -> Result<()> {
     use crate::audio::device::list_input_devices;
 
@@ -723,10 +727,26 @@ fn edit_recording(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+/// What the Recording row says in a build without the recording feature.
+#[cfg(not(feature = "recording"))]
+const RECORDING_MISSING: &str = "this whisrs was built without the recording feature, so \
+     there is nothing to set here, and [recording] is kept as it is. Use a release build, or \
+     rebuild with `cargo install whisrs --features recording`.";
+
+/// The Recording row of a build without the recording feature: no question
+/// to ask, only why.
+#[cfg(not(feature = "recording"))]
+fn edit_recording(_config: &mut Config) -> Result<()> {
+    println!("\n  {BOLD}Recording{RESET}");
+    println!("  {YELLOW}{RECORDING_MISSING}{RESET}");
+    Ok(())
+}
+
 /// Decide what to store after the recording editor ran. An existing
 /// `[recording]` section is always kept (even if every value is back at its
 /// default); a config without one only gains it when the user changed
 /// something, so walking through the editor does not add an empty section.
+#[cfg(feature = "recording")]
 fn apply_recording_edit(
     current: Option<RecordingConfig>,
     edited: RecordingConfig,
@@ -828,9 +848,14 @@ fn edit_hotkeys(config: &mut Config) -> Result<()> {
     hotkeys.cancel = prompt_optional_string("Cancel hotkey", &hotkeys.cancel)?;
     hotkeys.command = prompt_optional_string("Command-mode hotkey", &hotkeys.command)?;
     hotkeys.speak = prompt_optional_string("Read-aloud hotkey", &hotkeys.speak)?;
-    // Named apart from dictation, whose hotkey is `toggle`.
-    let recording_prompt = "Recording hotkey (mic + system audio)";
-    hotkeys.recording = prompt_optional_string(recording_prompt, &hotkeys.recording)?;
+    // Named apart from dictation, whose hotkey is `toggle`. A build without
+    // the recording feature ignores the binding, so it is not asked for, and
+    // `hotkeys` keeps it as it was.
+    #[cfg(feature = "recording")]
+    {
+        let recording_prompt = "Recording hotkey (mic + system audio)";
+        hotkeys.recording = prompt_optional_string(recording_prompt, &hotkeys.recording)?;
+    }
 
     // Drop the whole section if every field is empty — keeps the TOML clean.
     config.hotkeys = if any_hotkey_set(&hotkeys) {
@@ -886,6 +911,7 @@ fn prompt_optional_string(label: &str, current: &Option<String>) -> Result<Optio
 /// [`prompt_optional_string`] for an `http(s)://` URL: re-asked until it
 /// parses, and, when `required`, until it is given. An empty line always
 /// reaches the validator (`allow_empty`), which refuses it when required.
+#[cfg(feature = "recording")]
 fn prompt_optional_url(
     label: &str,
     current: &Option<String>,
@@ -910,6 +936,7 @@ fn prompt_optional_url(
 
 /// A URL typed into the editor: blank is unset, anything else must be an
 /// `http://` or `https://` URL, stored trimmed.
+#[cfg(feature = "recording")]
 fn parse_optional_url(input: &str) -> std::result::Result<Option<String>, String> {
     let input = input.trim();
     if input.is_empty() {
@@ -924,6 +951,7 @@ fn parse_optional_url(input: &str) -> std::result::Result<Option<String>, String
 
 /// [`prompt_optional_string`] for a language: re-asked until it passes the
 /// rule `-l` follows, and stored normalized.
+#[cfg(feature = "recording")]
 fn prompt_optional_language(label: &str, current: &Option<String>) -> Result<Option<String>> {
     let input: String = Input::new()
         .with_prompt(format!("{label} (blank to unset)"))
@@ -937,6 +965,7 @@ fn prompt_optional_language(label: &str, current: &Option<String>) -> Result<Opt
 
 /// A language typed into the editor: blank is unset, anything else must
 /// pass [`crate::validate_language_override`] and is stored as it returns it.
+#[cfg(feature = "recording")]
 fn parse_optional_language(input: &str) -> std::result::Result<Option<String>, String> {
     if input.trim().is_empty() {
         return Ok(None);
@@ -1626,6 +1655,7 @@ mod tests {
 
     /// A language typed into the recording editor: blank unsets it, a valid
     /// one is stored normalized, anything else is re-asked.
+    #[cfg(feature = "recording")]
     #[test]
     fn recording_editor_languages_follow_the_l_rule() {
         assert_eq!(parse_optional_language("  "), Ok(None));
@@ -1636,6 +1666,7 @@ mod tests {
 
     /// Walking through the recording editor without changing anything must not
     /// add a `[recording]` section; any change, or an existing section, keeps it.
+    #[cfg(feature = "recording")]
     #[test]
     fn recording_section_is_written_only_when_used() {
         assert_eq!(apply_recording_edit(None, RecordingConfig::default()), None);
