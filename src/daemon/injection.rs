@@ -1032,8 +1032,11 @@ fn new_uinput_keyboard(
 ///
 /// `Auto` prefers the layout-independent Wayland virtual keyboard when a
 /// Wayland session is detected, falling back to uinput when the compositor
-/// lacks `zwp_virtual_keyboard_v1`. `prewarm` only affects the uinput path
-/// (the Wayland backend ships its own keymap, so no settle delay is needed).
+/// lacks `zwp_virtual_keyboard_v1`. XTEST is never picked by `Auto`: it is
+/// opt-in (`backend = "xtest"`) and refuses to start when the X server's
+/// XTEST keyboard has a different layout than the detected one. `prewarm`
+/// only affects the uinput path (the Wayland backend ships its own keymap
+/// and XTEST creates no device, so no settle delay is needed).
 fn new_keyboard(
     key_delay: std::time::Duration,
     prewarm: bool,
@@ -1044,6 +1047,11 @@ fn new_keyboard(
         InjectorBackend::WaylandVk => {
             let kb = xkb_type::wayland_vk::WaylandVkKeyboard::new(key_delay)?;
             info!("using wayland virtual-keyboard injection backend");
+            Ok(Box::new(kb))
+        }
+        InjectorBackend::Xtest => {
+            let kb = xkb_type::Keyboard::new_xtest(key_delay)?;
+            info!("using X11 XTEST injection backend");
             Ok(Box::new(kb))
         }
         InjectorBackend::Auto => {

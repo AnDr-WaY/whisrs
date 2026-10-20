@@ -34,9 +34,9 @@ prompt = "Speech is in English or Spanish. Transcribe in the language spoken; ne
                             # asr-sidecar, which takes it as its `hotwords` field.
                             # Deepgram sends no prompt — use vocabulary there instead.
                             # openai-compatible-realtime sends neither, so neither key
-                            # reaches it. openai-realtime sends a prompt only on
-                            # server-VAD models like gpt-4o-transcribe, not on the
-                            # gpt-realtime-whisper that `whisrs setup` writes for it)
+                            # reaches it. openai-realtime sends a prompt with
+                            # gpt-live-transcribe and gpt-4o-transcribe, but not
+                            # with gpt-realtime-whisper)
                             # `whisrsd` warns at startup if either key targets a backend
                             # that discards it. `whisrs config` warns the same on save.
 tray = true                 # system tray icon (requires SNI host like waybar)
@@ -103,10 +103,23 @@ position = "bottom-center"
 device = "default"         # input device; see "Choosing the microphone" below
 
 [input]
-# Inter-key delay for the virtual keyboard (uinput). Raise this if a TUI
+# Inter-key delay for the virtual keyboard. Raise this if a TUI
 # drops characters while whisrs is typing — e.g. Node/Ink-based apps like
-# Claude Code in raw mode. Default: 2.
+# Claude Code in raw mode. The uinput backend treats 0 as 1 (with no delay
+# the kernel's input queue overflows and the end of the text is lost); the
+# xtest backend honours 0. Default: 2.
 key_delay_ms = 2
+# Keyboard-injection backend: auto | uinput | wayland-vk | xtest.
+# auto uses the Wayland virtual keyboard when the compositor supports it,
+# otherwise uinput. Default: auto.
+# On X11, set "xtest" to type through the X server's XTEST extension instead
+# of uinput: no /dev/uinput access needed, and key_delay_ms = 0 drops no
+# keys. auto never picks it. It refuses to start on Xwayland, and when the X
+# server's XTEST keyboard has a different layout than the one whisrs detected
+# (a layout set only in xorg.conf, e.g. by `localectl set-x11-keymap`, does
+# not reach that keyboard; run setxkbmap with your layout to fix that), or
+# when an XKB option moves Ctrl or Shift (e.g. ctrl:swapcaps; use auto).
+backend = "auto"
 # How long to wait, in milliseconds, for physically held modifier keys (Super,
 # Alt, Ctrl, Shift) to be released before whisrs sends a keystroke with a
 # batch backend (groq, openai, deepgram, local-whisper, asr-sidecar) or in
@@ -243,6 +256,17 @@ model = "nova-3"
 [openai]
 api_key = "sk-..."
 model = "gpt-4o-mini-transcribe"
+
+# For backend = "openai-realtime", select model = "gpt-live-transcribe".
+# languages = ["ru", "en"]  # expected input languages for mixed-language dictation
+
+# gpt-live-transcribe streams text as you speak and commits the final transcript
+# when recording stops. languages are hints, not an output-language guarantee.
+# Precedence for this model: a per-session `whisrs toggle -l <code>`, then
+# languages, then [general] language sent as a one-item list, then no hint when
+# it is "auto". A -l equal to [general] language counts as no override and keeps
+# the list. On any other model or backend, languages is ignored and `whisrsd`
+# warns at startup. OpenAI also accepts some three-letter and regional codes.
 
 # External OpenAI-compatible realtime server (WebSocket).
 # Use this for Lemonade-style services that speak the OpenAI Realtime
