@@ -334,7 +334,7 @@ mod tests {
     // FLAC needs the encoder, which comes with the recording feature.
     #[cfg(feature = "recording")]
     #[tokio::test]
-    async fn whisper_recording_chunks_upload_as_flac_and_dictation_as_wav() {
+    async fn whisper_recording_chunks_upload_as_flac() {
         let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -353,6 +353,11 @@ mod tests {
         assert!(headers.contains("filename=\"audio.flac\""), "{headers}");
         assert!(headers.contains("Content-Type: audio/flac"), "{headers}");
         assert!(data.starts_with(b"fLaC"));
+    }
+
+    #[tokio::test]
+    async fn whisper_dictation_uploads_as_wav() {
+        let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = local_backend(&listener);

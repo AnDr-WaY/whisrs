@@ -1616,15 +1616,21 @@ mod tests {
         assert!(!line.contains("diarize"), "{line}");
     }
 
-    // FLAC needs the encoder, which comes with the recording feature.
-    #[cfg(feature = "recording")]
-    #[tokio::test]
-    async fn recording_chunks_upload_as_flac_and_dictation_as_wav() {
-        let config = query_config("nova-3", &[]);
+    /// 1.25 s of a 16 kHz tone: the samples, and the WAV that holds them.
+    fn tone_wav() -> (Vec<i16>, Vec<u8>) {
         let samples: Vec<i16> = (0..20_000)
             .map(|i| ((i as f64 * 0.17).sin() * 6000.0) as i16)
             .collect();
         let wav = crate::audio::wav::encode_wav(&samples).unwrap();
+        (samples, wav)
+    }
+
+    // FLAC needs the encoder, which comes with the recording feature.
+    #[cfg(feature = "recording")]
+    #[tokio::test]
+    async fn recording_chunks_upload_as_flac() {
+        let config = query_config("nova-3", &[]);
+        let (samples, wav) = tone_wav();
 
         // The streaming backend hands recordings to this REST path in one line.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1645,6 +1651,12 @@ mod tests {
             .map(|s| s.unwrap() as i16)
             .collect();
         assert_eq!(decoded, samples);
+    }
+
+    #[tokio::test]
+    async fn dictation_uploads_as_wav() {
+        let config = query_config("nova-3", &[]);
+        let (_, wav) = tone_wav();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = local_backend(&listener);

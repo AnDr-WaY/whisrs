@@ -316,6 +316,9 @@ time: a running summary delays the next transcription until it ends.
 and
 .B path
 read the recordings directory directly and work without the daemon.
+A build without the
+.B recording
+feature says so and exits 1, whatever the action.
 .TP
 .B mcp
 Serve your recordings to an AI agent: a read\-only MCP (Model Context
@@ -325,9 +328,13 @@ Code
 Its tools list recordings, give one recording's details and summary, page
 through a transcript and search titles, summaries and transcripts. It reads
 the recordings directory directly, works without the daemon, and never
-changes a recording. A build without the
+changes a recording. The
 .B mcp
-feature says so and exits 1.
+feature needs the
+.B recording
+feature, and a build without
+.B mcp
+says so and exits 1.
 .SH LLM OUTPUT
 Applies to
 .B command

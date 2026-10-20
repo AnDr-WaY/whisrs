@@ -49,7 +49,10 @@ jobs:
 
       # The "built without the recording feature" answers (CLI, daemon, config
       # warning) exist only in a build without it, and dictation must pass
-      # there too. Reuses the dependencies above: about 45 s more.
+      # there too. Without a warm cache this builds much of the tree again:
+      # clippy above only type-checks, and without `recording` shared deps
+      # (serde, futures-sink, uuid) get other features, so what sits on them
+      # compiles again.
       - name: Test without recording
         run: cargo test --no-default-features --features tray,overlay,hooks
 

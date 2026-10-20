@@ -11,10 +11,27 @@ const EXPECTED: &str = "error: this whisrs was built without the recording featu
 
 #[test]
 fn recording_exits_1_and_says_how_to_get_it() {
-    // A socket folder with no daemon in it, so a regression that sends the
-    // command fails here ("whisrsd is not running") instead of reaching a
-    // daemon on this machine.
-    let runtime = tempfile::tempdir().expect("temp dir");
+    // A clean environment where every folder whisrs could use is its own empty
+    // temp folder: a regression that sends the command fails here ("whisrsd is
+    // not running") instead of reaching a daemon on this machine, and one that
+    // reads or writes config, history or recordings never touches the real
+    // user's files.
+    let root = tempfile::tempdir().expect("temp dir");
+    let dirs: Vec<(&str, std::path::PathBuf)> = [
+        ("HOME", "home"),
+        ("XDG_RUNTIME_DIR", "runtime"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_CACHE_HOME", "cache"),
+    ]
+    .into_iter()
+    .map(|(var, name)| {
+        let dir = root.path().join(name);
+        std::fs::create_dir(&dir).expect("create temp folder");
+        (var, dir)
+    })
+    .collect();
     for args in [
         &["recording"][..],
         &[
@@ -32,7 +49,8 @@ fn recording_exits_1_and_says_how_to_get_it() {
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_whisrs"))
             .args(args)
-            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_clear()
+            .envs(dirs.iter().map(|(var, dir)| (*var, dir.as_os_str())))
             .output()
             .expect("run whisrs");
         let stderr = String::from_utf8_lossy(&out.stderr);

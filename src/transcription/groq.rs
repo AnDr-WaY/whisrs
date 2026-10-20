@@ -392,9 +392,7 @@ pub fn parse_response(body: &str) -> anyhow::Result<GroqTranscriptionResponse> {
 mod tests {
     use super::*;
     use crate::transcription::retry::{retry_transient, RateLimitExhausted, RATE_LIMIT_BUDGET};
-    #[cfg(feature = "recording")]
-    use crate::transcription::test_server::serve_once;
-    use crate::transcription::test_server::serve_responses;
+    use crate::transcription::test_server::{serve_once, serve_responses};
     use crate::transcription::RetryableHttpError;
     use std::time::Duration;
 
@@ -503,20 +501,29 @@ mod tests {
         assert!(err.to_string().contains("too large"));
     }
 
-    // The recording shape is FLAC, which comes with the recording feature.
-    #[cfg(feature = "recording")]
-    #[test]
-    fn form_builds_for_both_granularity_sets() {
-        let config = TranscriptionConfig {
+    /// reqwest's Form is opaque; building must at least succeed for both the
+    /// dictation and recording shapes, with this config.
+    fn form_config() -> TranscriptionConfig {
+        TranscriptionConfig {
             language: "auto".to_string(),
             model: "whisper-large-v3-turbo".to_string(),
             prompt: Some("whisrs".to_string()),
             keyterms: Vec::new(),
             diarize: false,
-        };
-        // reqwest's Form is opaque; building must at least succeed for both
-        // the dictation and recording shapes.
+        }
+    }
+
+    #[test]
+    fn dictation_form_builds_with_word_timestamps() {
+        let config = form_config();
         assert!(build_form(&[1, 2, 3], UploadFormat::WAV, &config, &["word"]).is_ok());
+    }
+
+    // The recording shape is FLAC, which comes with the recording feature.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn recording_form_builds_with_segment_and_word_timestamps() {
+        let config = form_config();
         let recording = build_form(
             &[1, 2, 3],
             UploadFormat::FLAC,
@@ -552,7 +559,7 @@ mod tests {
     // FLAC needs the encoder, which comes with the recording feature.
     #[cfg(feature = "recording")]
     #[tokio::test]
-    async fn recording_chunks_upload_as_flac_and_dictation_as_wav() {
+    async fn recording_chunks_upload_as_flac() {
         let config = TranscriptionConfig {
             language: "en".to_string(),
             model: "whisper-large-v3-turbo".to_string(),
@@ -575,6 +582,18 @@ mod tests {
         assert!(headers.contains("filename=\"audio.flac\""), "{headers}");
         assert!(headers.contains("Content-Type: audio/flac"), "{headers}");
         assert!(data.starts_with(b"fLaC"));
+    }
+
+    #[tokio::test]
+    async fn dictation_uploads_as_wav() {
+        let config = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+            diarize: false,
+        };
+        let wav = encode_wav(&[300i16; 16_000]).unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = local_backend(&listener);

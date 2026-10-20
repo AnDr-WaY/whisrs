@@ -394,9 +394,9 @@ async fn handle_command(
 /// What a daemon built without the `recording` feature answers to every
 /// `recording` command.
 #[cfg(not(feature = "recording"))]
-const RECORDING_MISSING: &str = "this whisrsd was built without the recording feature, so it \
-     cannot record. Use a release build, or rebuild with `cargo install whisrs --features \
-     recording`.";
+const RECORDING_MISSING: &str = "this whisrsd was built without the recording feature, so it has \
+     no recordings to work with. Use a release build, or rebuild with `cargo install whisrs \
+     --features recording`.";
 
 #[cfg(test)]
 mod tests {
@@ -496,9 +496,9 @@ mod tests {
             match response {
                 Response::Error { message } => assert_eq!(
                     message,
-                    "this whisrsd was built without the recording feature, so it cannot \
-                     record. Use a release build, or rebuild with `cargo install whisrs \
-                     --features recording`.",
+                    "this whisrsd was built without the recording feature, so it has no \
+                     recordings to work with. Use a release build, or rebuild with `cargo \
+                     install whisrs --features recording`.",
                     "{action:?}"
                 ),
                 other => panic!("{action:?}: expected an error, got {other:?}"),
