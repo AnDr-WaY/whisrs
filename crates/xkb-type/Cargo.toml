@@ -13,7 +13,7 @@ categories = ["os::linux-apis", "hardware-support"]
 [features]
 default = []
 logging = ["dep:log"]
-arboard = ["dep:arboard"]
+arboard = ["dep:arboard", "dep:x11rb"]
 wayland-vk = ["dep:wayland-client", "dep:wayland-protocols-misc", "dep:rustix"]
 xtest = ["dep:x11rb"]
 
