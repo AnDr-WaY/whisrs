@@ -152,6 +152,7 @@ const COMPOSITOR_ENV_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const COMPOSITOR_ENV_VARS: &[&str] = &[
     "WAYLAND_DISPLAY",
     "DISPLAY",
+    "XAUTHORITY",
     "HYPRLAND_INSTANCE_SIGNATURE",
     "SWAYSOCK",
     "XDG_CURRENT_DESKTOP",

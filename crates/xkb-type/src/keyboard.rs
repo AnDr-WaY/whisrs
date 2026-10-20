@@ -1,8 +1,9 @@
-//! Virtual keyboard via evdev/uinput.
+//! Virtual keyboard via evdev/uinput, or via XTEST on X11.
 //!
-//! Creates a virtual keyboard device via `/dev/uinput` and injects key events
-//! using the reverse XKB keymap to produce the correct characters regardless
-//! of the user's keyboard layout.
+//! Creates a virtual keyboard device via `/dev/uinput` (or, with the `xtest`
+//! feature, an X server connection) and injects key events using the reverse
+//! XKB keymap to produce the correct characters regardless of the user's
+//! keyboard layout.
 
 use std::thread;
 use std::time::Duration;
@@ -37,9 +38,66 @@ const DEVICE_SETTLE_DELAY: Duration = Duration::from_millis(200);
 /// (notably `<LVL3>` characters like `é` on `us:qwerty-fr`).
 const INITIAL_WARMUP_DELAY: Duration = Duration::from_secs(1);
 
-/// Virtual keyboard that injects keystrokes via uinput.
+/// See [`Sink::min_delay`].
+const UINPUT_MIN_DELAY: Duration = Duration::from_millis(1);
+
+/// Where a [`Keyboard`]'s key events go.
+enum Sink {
+    /// A uinput device: each event is written to the kernel immediately.
+    Uinput(VirtualDevice),
+    /// The X server via XTEST: events are queued on the X connection.
+    #[cfg(feature = "xtest")]
+    Xtest(Box<crate::xtest::XtestSink>),
+}
+
+impl Sink {
+    /// Press (`pressed`) or release the key with evdev code `code`.
+    fn key(&mut self, code: u16, pressed: bool) -> anyhow::Result<()> {
+        match self {
+            Sink::Uinput(device) => {
+                device.emit(&[InputEvent::new(EventType::KEY, code, i32::from(pressed))])?;
+            }
+            #[cfg(feature = "xtest")]
+            Sink::Xtest(xtest) => xtest.key(code, pressed)?,
+        }
+        Ok(())
+    }
+
+    /// Hand queued events to the X server. uinput writes are immediate.
+    fn flush(&mut self) -> anyhow::Result<()> {
+        match self {
+            Sink::Uinput(_) => Ok(()),
+            #[cfg(feature = "xtest")]
+            Sink::Xtest(xtest) => xtest.flush(),
+        }
+    }
+
+    /// The shortest wait between events. uinput events pass through the
+    /// kernel's evdev queue (about 64 events) to the X server or compositor;
+    /// with no wait a burst overflows it and the reader drops the rest of the
+    /// text, so a zero `key_delay` is raised to 1 ms there.
+    fn min_delay(&self) -> Duration {
+        match self {
+            Sink::Uinput(_) => UINPUT_MIN_DELAY,
+            #[cfg(feature = "xtest")]
+            Sink::Xtest(_) => Duration::ZERO,
+        }
+    }
+
+    /// Return once every event sent so far has been processed (XTEST only).
+    fn sync(&mut self) -> anyhow::Result<()> {
+        match self {
+            Sink::Uinput(_) => Ok(()),
+            #[cfg(feature = "xtest")]
+            Sink::Xtest(xtest) => xtest.sync(),
+        }
+    }
+}
+
+/// Virtual keyboard that injects keystrokes via uinput, or via XTEST on X11
+/// (see [`Keyboard::new_xtest`]).
 pub struct Keyboard {
-    device: VirtualDevice,
+    sink: Sink,
     keymap: XkbKeymap,
     clipboard: Box<dyn ClipboardBackend>,
     key_delay: Duration,
@@ -154,9 +212,32 @@ impl Keyboard {
         debug!("uinput virtual keyboard created");
 
         Ok(Self {
-            device,
+            sink: Sink::Uinput(device),
             keymap,
             clipboard,
+            key_delay,
+        })
+    }
+
+    /// Create a keyboard that injects through the X server's XTEST extension
+    /// instead of uinput, with auto-detected layout and clipboard.
+    ///
+    /// XTEST events go straight to the X server, which processes them in
+    /// order, so nothing is dropped however fast they are sent: `key_delay`
+    /// can be zero. Needs no `/dev/uinput` access and no settle delay.
+    ///
+    /// Fails on Xwayland (keys would only reach X11 clients) and when the
+    /// server's XTEST keyboard has a different layout than the detected one.
+    #[cfg(feature = "xtest")]
+    pub fn new_xtest(key_delay: Duration) -> anyhow::Result<Self> {
+        let layout = KeyboardLayout::detect();
+        let mut keymap = XkbKeymap::from_layout(&layout)?;
+        let sink = Sink::Xtest(Box::new(crate::xtest::XtestSink::connect(&mut keymap)?));
+        debug!("XTEST keyboard connected");
+        Ok(Self {
+            sink,
+            keymap,
+            clipboard: default_clipboard(),
             key_delay,
         })
     }
@@ -206,7 +287,7 @@ impl Keyboard {
             self.paste_text(&paste_buf)?;
         }
 
-        Ok(())
+        self.sink.sync()
     }
 
     /// Emit Backspace `count` times.
@@ -221,41 +302,46 @@ impl Keyboard {
             })?;
         }
 
-        Ok(())
+        self.sink.sync()
     }
 
     /// Press all keys in `keys`, then release them in reverse order.
     ///
     /// Each press and release is separated by `self.key_delay`.
     pub fn send_combo(&mut self, keys: &[Key]) -> anyhow::Result<()> {
+        self.release_all_modifiers()?;
+
         // Press all keys in order.
         for key in keys {
-            self.device
-                .emit(&[InputEvent::new(EventType::KEY, key.code(), 1)])?;
-            thread::sleep(self.key_delay);
+            self.sink.key(key.code(), true)?;
+            self.pause()?;
         }
 
         // Release in reverse order.
         for key in keys.iter().rev() {
-            self.device
-                .emit(&[InputEvent::new(EventType::KEY, key.code(), 0)])?;
-            thread::sleep(self.key_delay);
+            self.sink.key(key.code(), false)?;
+            self.pause()?;
         }
 
-        Ok(())
+        self.sink.sync()
     }
 
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    /// Send queued events, then wait `key_delay` (at least
+    /// [`Sink::min_delay`]).
+    fn pause(&mut self) -> anyhow::Result<()> {
+        self.sink.flush()?;
+        thread::sleep(self.key_delay.max(self.sink.min_delay()));
+        Ok(())
+    }
+
     /// Press or release a modifier key.
     fn set_modifier(&mut self, modifier: Key, pressed: bool) -> anyhow::Result<()> {
-        let value = if pressed { 1 } else { 0 };
-        self.device
-            .emit(&[InputEvent::new(EventType::KEY, modifier.code(), value)])?;
-        thread::sleep(self.key_delay);
-        Ok(())
+        self.sink.key(modifier.code(), pressed)?;
+        self.pause()
     }
 
     /// Press and release a single key, with Shift and/or AltGr held as needed.
@@ -274,12 +360,10 @@ impl Keyboard {
             self.set_modifier(level3_key, true)?;
         }
 
-        self.device
-            .emit(&[InputEvent::new(EventType::KEY, tap.keycode, 1)])?;
-        thread::sleep(self.key_delay);
-        self.device
-            .emit(&[InputEvent::new(EventType::KEY, tap.keycode, 0)])?;
-        thread::sleep(self.key_delay);
+        self.sink.key(tap.keycode, true)?;
+        self.pause()?;
+        self.sink.key(tap.keycode, false)?;
+        self.pause()?;
 
         if tap.altgr {
             self.set_modifier(level3_key, false)?;
@@ -307,25 +391,21 @@ impl Keyboard {
         ];
 
         for modifier in &modifiers {
-            self.device
-                .emit(&[InputEvent::new(EventType::KEY, modifier.code(), 0)])?;
+            self.sink.key(modifier.code(), false)?;
         }
-        thread::sleep(self.key_delay);
-
-        Ok(())
+        self.pause()
     }
 
     /// Inject Ctrl+V to paste from clipboard.
     fn inject_ctrl_v(&mut self) -> anyhow::Result<()> {
         self.set_modifier(Key::KEY_LEFTCTRL, true)?;
-        self.device
-            .emit(&[InputEvent::new(EventType::KEY, Key::KEY_V.code(), 1)])?;
-        thread::sleep(self.key_delay);
-        self.device
-            .emit(&[InputEvent::new(EventType::KEY, Key::KEY_V.code(), 0)])?;
-        thread::sleep(self.key_delay);
+        self.sink.key(Key::KEY_V.code(), true)?;
+        self.pause()?;
+        self.sink.key(Key::KEY_V.code(), false)?;
+        self.pause()?;
         self.set_modifier(Key::KEY_LEFTCTRL, false)?;
-        Ok(())
+        // The paste must reach the server before the clipboard is restored.
+        self.sink.sync()
     }
 
     /// Set clipboard to `text`, inject Ctrl+V, then restore previous content.

@@ -67,7 +67,7 @@ asr-dedup = { path = "crates/asr-dedup", version = "0.1" }
 audio-silence-gate = { path = "crates/audio-silence-gate", version = "0.1" }
 filler-remove = { path = "crates/filler-remove", version = "0.1" }
 prompt-echo = { path = "crates/prompt-echo", version = "0.1" }
-xkb-type = { path = "crates/xkb-type", version = "0.1.4", features = ["arboard", "wayland-vk"] }
+xkb-type = { path = "crates/xkb-type", version = "0.1.5", features = ["arboard", "wayland-vk", "xtest"] }
 async-trait = "0.1"
 base64 = "0.22"
 # Shares one upload buffer between the retries of a diarization sidecar
