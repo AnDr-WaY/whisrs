@@ -5402,6 +5402,7 @@ mod tests {
 
         // Another recording is being transcribed (slowly).
         backend.set(HANG);
+        let sent_before = backend.calls.load(Ordering::Relaxed);
         let busy = crashed_recording(tmp.path());
         let meta = recover_dir(&busy, None).unwrap();
         let busy_id = meta.id.clone();
@@ -5412,9 +5413,12 @@ mod tests {
         context
             .recording
             .set_worker(tokio::spawn(run_worker(Arc::clone(&context), queue)));
+        // The worker shows the busy recording as soon as it takes it, before
+        // its request goes out, so wait for that request too.
         let deadline = Instant::now() + Duration::from_secs(5);
         while context.recording.status().id.as_deref() != Some(busy_id.as_str())
             || !context.recording.status().queued.is_empty()
+            || backend.calls.load(Ordering::Relaxed) == sent_before
         {
             assert!(Instant::now() < deadline, "the worker never took it");
             tokio::time::sleep(Duration::from_millis(10)).await;
