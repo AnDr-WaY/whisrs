@@ -579,7 +579,7 @@ Uses that work today:
 - interviews
 
 `whisrs recording start [--title ...]` (or the `[hotkeys] recording` binding,
-or "Record mic and system audio" in the tray menu) starts a
+or "Start recording (mic + system audio)" in the tray menu) starts a
 recording; `whisrs recording stop` ends it and queues the transcript.
 `whisrs recording cancel` stops and deletes it. The `recording` hotkey and
 `whisrs recording toggle` (for a compositor binding) start a recording when

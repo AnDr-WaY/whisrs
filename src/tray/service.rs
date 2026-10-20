@@ -315,7 +315,7 @@ fn recording_menu_items(recording: &RecordingStatus) -> Vec<MenuItem<WhisrsTray>
         label: if capturing {
             "Stop recording and transcribe"
         } else {
-            "Record mic and system audio"
+            "Start recording (mic + system audio)"
         }
         .to_string(),
         activate: Box::new(|tray: &mut WhisrsTray| {
@@ -581,7 +581,7 @@ mod tests {
     fn idle_recording_menu_offers_only_start() {
         assert_eq!(
             labels(&recording_menu_items(&RecordingStatus::default())),
-            vec![("Record mic and system audio".to_string(), true)]
+            vec![("Start recording (mic + system audio)".to_string(), true)]
         );
     }
 
