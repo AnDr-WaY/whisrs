@@ -4,12 +4,16 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::history;
+use crate::recording::{RecordingAction, RecordingOptions, RecordingStatus};
 
 // ---------------------------------------------------------------------------
 // IPC protocol
 // ---------------------------------------------------------------------------
 
-/// Commands sent from the CLI to the daemon over the Unix socket.
+/// Commands sent from the CLI to the daemon over the Unix socket. One is
+/// built per request and dropped once handled, so the size of the
+/// `Recording` variant does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 pub enum Command {
@@ -51,6 +55,24 @@ pub enum Command {
     /// stops any in-progress playback.
     #[serde(alias = "read")]
     Speak,
+    /// The recording feature: record mic + system audio, then transcribe.
+    /// `title` names a new recording (`start`/`toggle`); `id` selects an
+    /// existing one (`retry`/`copy`/`name`). `options` (flat on the wire:
+    /// `language`, `mic_language`, `system_language`, `others`,
+    /// `shared_mic`, `num_speakers`, `participants`) set the languages and
+    /// speaker settings of a new recording or a retry and the label of the
+    /// system track; a request without them gets the config defaults.
+    /// `name` takes `speaker` and `name` (blank clears it); `summarize`
+    /// takes only `id`.
+    Recording {
+        action: RecordingAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(flatten)]
+        options: RecordingOptions,
+    },
 }
 
 fn default_log_limit() -> usize {
@@ -61,9 +83,19 @@ fn default_log_limit() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum Response {
-    Ok { state: State },
-    Error { message: String },
-    History { entries: Vec<history::HistoryEntry> },
+    Ok {
+        state: State,
+    },
+    Error {
+        message: String,
+    },
+    History {
+        entries: Vec<history::HistoryEntry>,
+    },
+    /// Recording status after a `recording` command.
+    Recording {
+        recording: RecordingStatus,
+    },
 }
 
 /// Daemon state.
@@ -468,5 +500,169 @@ mod tests {
         );
         let parsed: Command = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Command::SetLlmInstruction { name } if name == "translate-de"));
+    }
+    #[test]
+    fn recording_command_wire_format() {
+        let cmd = Command::Recording {
+            action: RecordingAction::Start,
+            title: Some("x".to_string()),
+            id: None,
+            options: RecordingOptions::default(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"cmd":"recording","action":"start","title":"x"}"#);
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Command::Recording { action: RecordingAction::Start, title: Some(t), id: None, options }
+                if t == "x" && options == RecordingOptions::default()
+        ));
+    }
+
+    #[test]
+    fn recording_command_without_options() {
+        let parsed: Command =
+            serde_json::from_str(r#"{"cmd":"recording","action":"toggle"}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            Command::Recording {
+                action: RecordingAction::Toggle,
+                title: None,
+                id: None,
+                options,
+            } if options == RecordingOptions::default()
+        ));
+        let cmd = Command::Recording {
+            action: RecordingAction::Retry,
+            title: None,
+            id: Some("last".to_string()),
+            options: RecordingOptions::default(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"cmd":"recording","action":"retry","id":"last"}"#);
+    }
+
+    /// The options travel flat beside `action`, and each one is optional.
+    #[test]
+    fn recording_command_with_options_roundtrip() {
+        let options = RecordingOptions {
+            language: Some("de".to_string()),
+            mic_language: None,
+            system_language: Some("auto".to_string()),
+            others: Some("Video".to_string()),
+            shared_mic: Some(true),
+            num_speakers: Some(3),
+            participants: Some(vec!["Sarah".to_string(), "Omar".to_string()]),
+            ..Default::default()
+        };
+        let cmd = Command::Recording {
+            action: RecordingAction::Start,
+            title: Some("Lesson 50".to_string()),
+            id: None,
+            options: options.clone(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"recording","action":"start","title":"Lesson 50","language":"de","system_language":"auto","others":"Video","shared_mic":true,"num_speakers":3,"participants":["Sarah","Omar"]}"#
+        );
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(&parsed, Command::Recording { options: o, .. } if *o == options),
+            "{parsed:?}"
+        );
+
+        let retry: Command = serde_json::from_str(
+            r#"{"cmd":"recording","action":"retry","id":"last","mic_language":"en","shared_mic":false,"num_speakers":0,"participants":[]}"#,
+        )
+        .unwrap();
+        let Command::Recording {
+            action,
+            id,
+            options,
+            ..
+        } = retry
+        else {
+            panic!("not a recording command");
+        };
+        assert_eq!(action, RecordingAction::Retry);
+        assert_eq!(id.as_deref(), Some("last"));
+        assert_eq!(
+            options,
+            RecordingOptions {
+                mic_language: Some("en".to_string()),
+                shared_mic: Some(false),
+                num_speakers: Some(0),
+                participants: Some(Vec::new()),
+                ..Default::default()
+            }
+        );
+    }
+
+    /// `name` carries the speaker and its new name beside the id.
+    #[test]
+    fn recording_name_roundtrip() {
+        let json = r#"{"cmd":"recording","action":"name","id":"last","speaker":"Speaker 2","name":"Sarah"}"#;
+        let Command::Recording {
+            action,
+            id,
+            options,
+            ..
+        } = serde_json::from_str(json).unwrap()
+        else {
+            panic!("not a recording command");
+        };
+        assert_eq!(action, RecordingAction::Name);
+        assert_eq!(id.as_deref(), Some("last"));
+        assert_eq!(options.speaker.as_deref(), Some("Speaker 2"));
+        assert_eq!(options.name.as_deref(), Some("Sarah"));
+        let back = serde_json::to_string(&Command::Recording {
+            action,
+            title: None,
+            id,
+            options,
+        })
+        .unwrap();
+        assert_eq!(back, json);
+    }
+
+    /// `summarize` is an action of its own and takes an id.
+    #[test]
+    fn recording_summarize_roundtrip() {
+        let json = r#"{"cmd":"recording","action":"summarize","id":"last"}"#;
+        let Command::Recording { action, id, .. } = serde_json::from_str(json).unwrap() else {
+            panic!("not a recording command");
+        };
+        assert_eq!(action, RecordingAction::Summarize);
+        assert_eq!(id.as_deref(), Some("last"));
+    }
+
+    #[test]
+    fn recording_response_roundtrip() {
+        let status = RecordingStatus {
+            phase: crate::recording::RecordingPhase::Recording,
+            id: Some("2026-10-02_1400_standup".to_string()),
+            title: Some("standup".to_string()),
+            started_at: Some(chrono::Local::now()),
+            dir: Some(PathBuf::from("/tmp/m")),
+            queued: vec!["2026-10-01_0900".to_string()],
+            waiting: vec!["2026-09-30_1500".to_string()],
+            summarizing: true,
+        };
+        let resp = Response::Recording {
+            recording: status.clone(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.starts_with(r#"{"status":"recording","recording":{"phase":"recording""#));
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::Recording { recording } => assert_eq!(recording, status),
+            other => panic!("expected recording response, got {other:?}"),
+        }
+        let idle: Response =
+            serde_json::from_str(r#"{"status":"recording","recording":{"phase":"idle"}}"#).unwrap();
+        assert!(
+            matches!(idle, Response::Recording { recording } if recording == RecordingStatus::default())
+        );
     }
 }

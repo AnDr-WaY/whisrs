@@ -153,6 +153,20 @@ impl TranscriptionBackend for OpenAiCompatibleRealtimeBackend {
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
     }
+
+    // Live-only: a recording needs a batch backend.
+    async fn transcribe_segments(
+        &self,
+        _audio: &[u8],
+        _config: &TranscriptionConfig,
+    ) -> anyhow::Result<super::Transcript> {
+        Err(super::live_only_error("openai-compatible-realtime"))
+    }
+
+    // Never chunked: `transcribe_segments` always errors.
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +285,7 @@ mod tests {
             model: "   ".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         });
 
         assert_eq!(request.model, "Whisper-Tiny");
@@ -328,6 +343,7 @@ mod tests {
             model: "Whisper-Tiny".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         }
     }
 

@@ -15,7 +15,7 @@
 
 **Voice for the Linux desktop, written in Rust: dictation, read-aloud, and voice-driven LLM commands.**
 
-Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source.
+Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. Record your mic and the system audio too: both become one timestamped Markdown transcript, kept in its own folder.
 
 ![whisrs demo: dictation, read aloud, and command mode](assets/demo.gif)
 
@@ -61,7 +61,7 @@ Each tagged release publishes tarballs on [GitHub Releases](https://github.com/y
 ARCH=x86_64   # or aarch64
 curl -sSL -o whisrs.tar.gz https://github.com/y0sif/whisrs/releases/latest/download/whisrs-linux-${ARCH}.tar.gz
 
-# Or the minimal build (cloud backends only, no whisper.cpp; keeps tray + overlay):
+# Or the minimal build (cloud backends only, no whisper.cpp; keeps tray, overlay, recordings and MCP):
 # curl -sSL -o whisrs.tar.gz https://github.com/y0sif/whisrs/releases/latest/download/whisrs-linux-${ARCH}-minimal.tar.gz
 
 tar xzf whisrs.tar.gz
@@ -228,15 +228,19 @@ For the full reference (overlay, `[input]`, `[tts]`, `[llm]`, `[hotkeys]`, `[hoo
 ```
 whisrs setup     # Interactive onboarding
 whisrs config    # Interactive editor for ~/.config/whisrs/config.toml
-whisrs toggle    # Start/stop recording (uses general.language)
-whisrs toggle -l en  # Start/stop recording, overriding the language for this session
-whisrs cancel    # Cancel recording, discard audio
+whisrs toggle    # Start/stop dictation (uses general.language)
+whisrs toggle -l en  # Start/stop dictation, overriding the language for this session
+whisrs cancel    # Cancel dictation, discard audio
 whisrs status    # Query daemon state
 whisrs restart   # Restart the daemon (uses the systemd or OpenRC user service when present)
 whisrs command   # Command mode: select text + speak instruction → LLM rewrite
 whisrs llm-command <name>      # Toggle a named [[llm_commands]] entry (see config.toml)
 whisrs llm-command-set <name>  # Reprogram a named LLM command from the current selection
 whisrs speak     # Read the selected text aloud (alias: whisrs read; press again to stop)
+whisrs recording start -t "Standup"   # Record mic + system audio; stop | toggle | cancel | status
+whisrs recording show last            # Print the latest recording's transcript (list | path | copy | retry)
+whisrs recording summarize last       # Summarize a transcript with the [llm] (or [recording] summary = true for each)
+whisrs mcp                            # Read-only MCP server (stdio) for agents: claude mcp add whisrs -- whisrs mcp
 whisrs log       # Show recent transcription history
 whisrs log -n 5  # Show last 5 entries
 whisrs log --clear  # Clear all history

@@ -29,6 +29,12 @@
 //!   (`continuation`), so a decoder can treat it as mid-sentence text.
 //! - [`PhraseSplitter::flush`] emits the trailing in-progress phrase at end of
 //!   stream (if it carries enough speech) exactly once.
+//!
+//! Local whisper recordings then group consecutive phrases into decode
+//! windows ([`decode_windows`]): one `full()` call per window instead of per
+//! phrase.
+
+use std::ops::Range;
 
 use audio_silence_gate::rms_energy;
 
@@ -47,6 +53,19 @@ const MAX_PHRASE_SECS: usize = 20;
 const HARD_MAX_PHRASE_SECS: usize = 28;
 /// How far back to look for the quietest frame when force-splitting.
 const QUIET_SEARCH_MS: usize = 2000;
+/// Longest decode window: the hard phrase ceiling, so a window fits in one
+/// 30 s mel window. That bounds the audio, not the decoder passes: whisper
+/// can still take a second pass over the rest of a window, which is why
+/// recording windows decode without carried text (`n_max_text_ctx` 0).
+pub const MAX_DECODE_WINDOW_SECS: usize = HARD_MAX_PHRASE_SECS;
+/// A run of at least this much exact-zero audio is a join: the second of
+/// digital silence a condensed recording chunk puts between two speech regions
+/// (`crate::recording::speech::JOIN_GAP`). The runs are found in the raw
+/// samples, so a join always shows its full second; the threshold sits a
+/// little under it. A microphone never records that many exact zeros (its
+/// noise floor keeps flipping the low bits); a system track can, when
+/// nothing plays, and then grouping merely stops there as at a join.
+const JOIN_ZERO_MS: usize = 900;
 
 /// A completed phrase of contiguous audio.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +75,89 @@ pub struct Phrase {
     /// True when this phrase starts at a forced cut boundary (mid-speech),
     /// i.e. it continues the previous phrase rather than starting fresh.
     pub continuation: bool,
+    /// Index of the phrase's first sample in the whole stream fed so far,
+    /// so a caller can place the phrase on the input's timeline.
+    pub start_sample: u64,
+}
+
+/// Consecutive phrases decoded together, with the pauses between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeWindow {
+    /// The window's samples in the input: from its first phrase's start to
+    /// its last phrase's end.
+    pub range: Range<usize>,
+    /// Whether the first phrase starts at a forced cut
+    /// ([`Phrase::continuation`]), so the window's text continues a sentence.
+    pub continuation: bool,
+    /// How many phrases the window holds.
+    pub phrases: usize,
+}
+
+/// Group the `phrases` a splitter emitted for `samples` (fed from sample 0)
+/// into decode windows: the next phrase joins the current window while the
+/// window would still end within [`MAX_DECODE_WINDOW_SECS`] of its start
+/// and no join ([`JOIN_ZERO_MS`] of exact zeros) lies between them.
+///
+/// Every phrase lands in exactly one window, in order. Whisper pads each
+/// call to a 30 s window, so decoding phrases one by one costs a whole
+/// encoder pass for a two-second "yeah"; a shared window costs one, and
+/// keeps the pauses between its phrases as natural context. A join marks
+/// two speech regions that may be minutes apart, so it always ends a window.
+pub fn decode_windows(
+    samples: &[i16],
+    phrases: &[Phrase],
+    sample_rate: usize,
+) -> Vec<DecodeWindow> {
+    let max_len = MAX_DECODE_WINDOW_SECS * sample_rate;
+    let joins = zero_runs(samples, JOIN_ZERO_MS * sample_rate / 1000);
+    let mut windows: Vec<DecodeWindow> = Vec::new();
+    for phrase in phrases {
+        let start = phrase.start_sample as usize;
+        let end = start + phrase.samples.len();
+        if let Some(window) = windows.last_mut() {
+            // A join between them reaches past the window's end into this
+            // phrase. Measured from the window's end, not its last phrase's
+            // start: a phrase's leading pad may lie in the join before it.
+            let joined = joins
+                .iter()
+                .any(|j| j.start < end && j.end > window.range.end);
+            if !joined && end.saturating_sub(window.range.start) <= max_len {
+                window.range.end = window.range.end.max(end);
+                window.phrases += 1;
+                continue;
+            }
+        }
+        windows.push(DecodeWindow {
+            range: start..end,
+            continuation: phrase.continuation,
+            phrases: 1,
+        });
+    }
+    windows
+}
+
+/// Runs of at least `min` exact-zero samples.
+fn zero_runs(samples: &[i16], min: usize) -> Vec<Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (i, &s) in samples.iter().enumerate() {
+        match (s == 0, start) {
+            (true, None) => start = Some(i),
+            (false, Some(from)) => {
+                if i - from >= min {
+                    runs.push(from..i);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = start {
+        if samples.len() - from >= min {
+            runs.push(from..samples.len());
+        }
+    }
+    runs
 }
 
 /// Incremental silence-delimited phrase splitter over i16 PCM samples.
@@ -85,6 +187,9 @@ pub struct PhraseSplitter {
     trailing_silence: usize,
     /// True while the open phrase started at a forced cut boundary.
     continuation: bool,
+    /// Samples dropped from the front of `buffer` since the stream began, so
+    /// `consumed + k` is the stream index of `buffer[k]`.
+    consumed: u64,
 }
 
 impl PhraseSplitter {
@@ -140,6 +245,7 @@ impl PhraseSplitter {
             speech_frames: 0,
             trailing_silence: 0,
             continuation: false,
+            consumed: 0,
         }
     }
 
@@ -180,6 +286,7 @@ impl PhraseSplitter {
         let phrase = Phrase {
             samples: self.buffer[self.emit_start_frame * self.frame_len..end_sample].to_vec(),
             continuation: self.continuation,
+            start_sample: self.stream_index(self.emit_start_frame),
         };
         self.clear();
         Some(phrase)
@@ -253,6 +360,7 @@ impl PhraseSplitter {
                     [self.emit_start_frame * self.frame_len..end_frame * self.frame_len]
                     .to_vec(),
                 continuation: self.continuation,
+                start_sample: self.stream_index(self.emit_start_frame),
             });
         }
 
@@ -323,6 +431,7 @@ impl PhraseSplitter {
                 [self.emit_start_frame * self.frame_len..split_frame * self.frame_len]
                 .to_vec(),
             continuation: self.continuation,
+            start_sample: self.stream_index(self.emit_start_frame),
         });
 
         self.drop_frames(split_frame);
@@ -342,16 +451,23 @@ impl PhraseSplitter {
             .count();
     }
 
+    /// Stream index of the first sample of buffered frame `frame`.
+    fn stream_index(&self, frame: usize) -> u64 {
+        self.consumed + (frame * self.frame_len) as u64
+    }
+
     /// Drop the first `n` analyzed frames (and their samples) from the front.
     fn drop_frames(&mut self, n: usize) {
         if n == 0 {
             return;
         }
+        self.consumed += (n * self.frame_len) as u64;
         self.buffer.drain(..n * self.frame_len);
         self.energies.drain(..n);
     }
 
     fn clear(&mut self) {
+        self.consumed += self.buffer.len() as u64;
         self.buffer.clear();
         self.energies.clear();
         self.in_phrase = false;
@@ -678,5 +794,175 @@ mod tests {
         s.feed(&frames(&[(0, 1000)]));
         // Only the pad frame (plus at most a partial tail) may remain.
         assert!(s.buffer.len() <= 2 * FRAME);
+    }
+
+    /// Every emitted phrase is the exact input slice at `start_sample`.
+    fn assert_phrases_at_their_offsets(audio: &[i16], phrases: &[Phrase]) {
+        for p in phrases {
+            let start = p.start_sample as usize;
+            assert_eq!(
+                &audio[start..start + p.samples.len()],
+                p.samples.as_slice(),
+                "phrase at {start} is not the input slice at that offset"
+            );
+        }
+    }
+
+    #[test]
+    fn start_sample_places_natural_phrases_on_the_input_timeline() {
+        let mut s = splitter();
+        let audio = frames(&[(0, 20), (SPEECH, 4), (0, 10), (SPEECH, 4), (0, 2)]);
+        let mut phrases = s.feed(&audio);
+        phrases.extend(s.flush());
+        assert_eq!(phrases.len(), 2);
+        // Speech onset minus one pad frame.
+        assert_eq!(phrases[0].start_sample, (19 * FRAME) as u64);
+        assert_eq!(phrases[1].start_sample, (33 * FRAME) as u64);
+        assert_phrases_at_their_offsets(&audio, &phrases);
+    }
+
+    #[test]
+    fn start_sample_survives_forced_cuts_and_chunked_feeding() {
+        let mut s = splitter();
+        let audio = frames(&[(0, 7), (SPEECH, 300), (0, 5)]);
+        let mut phrases = Vec::new();
+        // Odd-sized chunks so frame boundaries never line up with feeds.
+        for chunk in audio.chunks(37) {
+            phrases.extend(s.feed(chunk));
+        }
+        phrases.extend(s.flush());
+        assert!(phrases.len() >= 3, "300 voiced frames must force-cut");
+        assert!(phrases[1].continuation);
+        assert_phrases_at_their_offsets(&audio, &phrases);
+        // Contiguous across forced cuts: each continuation starts where the
+        // previous phrase ended.
+        for pair in phrases.windows(2) {
+            if pair[1].continuation {
+                assert_eq!(
+                    pair[1].start_sample,
+                    pair[0].start_sample + pair[0].samples.len() as u64
+                );
+            }
+        }
+    }
+
+    const RATE: usize = 16_000;
+
+    /// `secs` of a 2 kHz square wave, loud enough to be speech.
+    fn voice(secs: f64) -> Vec<i16> {
+        let n = (secs * RATE as f64) as usize;
+        (0..n)
+            .map(|i| if i % 8 < 4 { 3000 } else { -3000 })
+            .collect()
+    }
+
+    /// `secs` of a recorded pause: room noise, quiet but never exact zeros.
+    fn pause(secs: f64) -> Vec<i16> {
+        let n = (secs * RATE as f64) as usize;
+        (0..n).map(|i| [3, -2, 1, -3][i % 4]).collect()
+    }
+
+    fn phrases_of(audio: &[i16]) -> Vec<Phrase> {
+        let mut splitter = PhraseSplitter::new(RATE, 0.003, 400);
+        let mut phrases = splitter.feed(audio);
+        phrases.extend(splitter.flush());
+        phrases
+    }
+
+    /// Windows hold whole phrases, each exactly once and in order, never
+    /// more than the cap, never across a join, and a sentence split by a
+    /// short pause decodes in one window.
+    #[test]
+    fn decode_windows_group_phrases_up_to_the_cap_and_never_across_a_join() {
+        let mut audio = Vec::new();
+        // A sentence with a 0.6 s pause in it: two phrases at 400 ms.
+        audio.extend(voice(2.0));
+        audio.extend(pause(0.6));
+        audio.extend(voice(3.0));
+        audio.extend(pause(0.5));
+        // A join, then 40 s of short turns: more than one window's worth.
+        let join_at = audio.len() + RATE / 2;
+        audio.extend(std::iter::repeat_n(0i16, RATE));
+        for _ in 0..16 {
+            audio.extend(voice(1.5));
+            audio.extend(pause(1.0));
+        }
+        let phrases = phrases_of(&audio);
+        assert!(phrases.len() >= 18, "{} phrases", phrases.len());
+        let windows = decode_windows(&audio, &phrases, RATE);
+
+        assert_eq!(
+            windows.iter().map(|w| w.phrases).sum::<usize>(),
+            phrases.len()
+        );
+        let mut next = 0;
+        for window in &windows {
+            assert!(
+                window.range.len() <= MAX_DECODE_WINDOW_SECS * RATE,
+                "{window:?}"
+            );
+            assert!(
+                !window.range.contains(&join_at),
+                "{window:?} crosses the join"
+            );
+            for phrase in &phrases[next..next + window.phrases] {
+                let start = phrase.start_sample as usize;
+                assert!(window.range.start <= start);
+                assert!(start + phrase.samples.len() <= window.range.end);
+            }
+            next += window.phrases;
+        }
+        // The sentence and its pause, in one window that ends at the join;
+        // the 40 s of turns after it, in two.
+        assert_eq!(windows[0].phrases, 2);
+        assert!(windows[0].range.end <= join_at);
+        assert_eq!(windows.len(), 3, "{windows:?}");
+    }
+
+    #[test]
+    fn a_pause_of_room_noise_is_not_a_join() {
+        let mut audio = voice(1.0);
+        audio.extend(pause(2.0));
+        audio.extend(voice(1.0));
+        let phrases = phrases_of(&audio);
+        assert_eq!(phrases.len(), 2);
+        assert_eq!(decode_windows(&audio, &phrases, RATE).len(), 1);
+        // The same gap as digital silence is.
+        let mut audio = voice(1.0);
+        audio.extend(std::iter::repeat_n(0i16, 2 * RATE));
+        audio.extend(voice(1.0));
+        let phrases = phrases_of(&audio);
+        assert_eq!(decode_windows(&audio, &phrases, RATE).len(), 2);
+        assert!(decode_windows(&[], &[], RATE).is_empty());
+    }
+
+    /// The first phrase after a join has its leading pad in the join's
+    /// zeros; that join lies before it, not between it and the next phrase.
+    #[test]
+    fn a_join_before_a_window_does_not_split_it() {
+        let mut audio = voice(1.0);
+        audio.extend(std::iter::repeat_n(0i16, RATE));
+        audio.extend(voice(1.0));
+        audio.extend(pause(2.0));
+        audio.extend(voice(1.0));
+        let phrases = phrases_of(&audio);
+        assert_eq!(phrases.len(), 3);
+        let windows = decode_windows(&audio, &phrases, RATE);
+        let counts: Vec<usize> = windows.iter().map(|w| w.phrases).collect();
+        assert_eq!(counts, [1, 2], "{windows:?}");
+    }
+
+    #[test]
+    fn a_window_starting_at_a_forced_cut_is_a_continuation() {
+        // 35 s without a pause: cut at the hard ceiling, the rest continues.
+        let audio = voice(35.0);
+        let phrases = phrases_of(&audio);
+        let windows = decode_windows(&audio, &phrases, RATE);
+        assert!(windows.len() >= 2);
+        assert!(!windows[0].continuation);
+        assert!(windows[1].continuation);
+        assert!(windows
+            .iter()
+            .all(|w| w.range.len() <= MAX_DECODE_WINDOW_SECS * RATE));
     }
 }

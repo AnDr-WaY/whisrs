@@ -30,7 +30,7 @@ whisrsd &
 systemctl --user enable --now whisrs.service
 
 # Use the CLI (bind to a hotkey)
-whisrs toggle    # start/stop recording
+whisrs toggle    # start/stop dictation
 whisrs cancel    # cancel and discard audio
 whisrs speak     # read the selected text aloud via TTS (alias: read; press again to stop)
 whisrs status    # query daemon state
@@ -38,6 +38,12 @@ whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
 whisrs log       # dictation history
 whisrs config    # interactive config editor
+whisrs recording start [-t TITLE] [--shared-mic] [--num-speakers N] [--with "Sarah, Omar"] | stop | toggle | cancel | status   # record mic + system audio, transcribe after the stop
+whisrs recording list | show <id|last> [-f md|json|txt] | path <id> | copy <id> | retry <id> [--with "..."]
+whisrs recording name <id> <S2|"Speaker 2"|current name> <name>   # "" clears; rewrites the .md at once
+whisrs recording summarize <id>   # [llm] summary (+ title if untitled) via the queue; [recording] summary = true does it after each transcript
+                 # (every `whisrs recording` line: feature `recording`, in the default and both release builds)
+whisrs mcp       # read-only MCP server on stdio over the recordings folder (feature `mcp`, needs `recording`; no daemon needed)
 
 # Dev loop: rebuild this checkout and restart the daemon
 ./scripts/dev-install.sh             # build + install to ~/.cargo/bin + restart
@@ -60,9 +66,27 @@ src/
 │                           #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ├── history.rs              # Dictation history (whisrs log)
 ├── llm.rs                  # LLM calls for command mode
-├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated text
+├── mcp.rs                  # whisrs mcp (feature mcp): read-only rmcp server, 4 tools over the recordings folder
+├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and recording text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
+├── daemon/recording.rs     # Recording sessions, processing queue/worker, recovery, shutdown (feature recording)
+├── recording/              # Recording feature (mic + system audio, transcribed after the stop)
+│   ├── mod.rs              #   RecordingMeta (recording.json), segments, status types: every build (IPC wire);
+│   │                       #   the submodules below are feature `recording`
+│   ├── store.rs            #   Recordings folder: create, list (or list_headers: no transcript text), resolve ids, retention sweep
+│   ├── recorder.rs         #   Per-track WAV writer with periodic header flushes
+│   ├── wav_repair.rs       #   Fix WAV headers a crash left unfinalized
+│   ├── echo.rs             #   Remove speaker echo from the mic track (system track as reference)
+│   ├── speech.rs           #   Speech regions, condensed chunks + time maps, segments mapped back
+│   ├── process.rs          #   Echo-cancel, send the speech, transcribe (cached, rate-limit retry), merge, write
+│   ├── speakers.rs         #   Speaker separation: plan, align words to voices, ids by first appearance
+│   ├── diarize.rs          #   Diarization sidecar client (contract, timeout, retries)
+│   ├── naming.rs           #   Speaker names: user > self > --with > LLM > last voice > Speaker N
+│   ├── llm_names.rs        #   Opt-in LLM naming (name_speakers): bounded excerpt, quoted evidence
+│   ├── summary.rs          #   Opt-in summary + title through [llm]: rules, map-reduce over parts, JSON reply
+│   ├── split.rs            #   Cut long tracks into backend-sized chunks at silence
+│   └── render.rs           #   Markdown transcript rendering (front matter, ## Summary, turns)
 ├── audio/
 │   ├── capture.rs          # cpal audio capture
 │   ├── wav.rs              # PCM-to-WAV encoding
@@ -70,7 +94,11 @@ src/
 │   ├── feedback.rs         # Audio cues
 │   └── recovery.rs         # Save/load audio on transcription failure
 ├── transcription/
-│   ├── mod.rs              # TranscriptionBackend trait
+│   ├── mod.rs              # TranscriptionBackend trait, timed segments, phrase fallback
+│   ├── factory.rs          # Build a backend by name; model, alias and recording backend rules
+│   ├── verbose_json.rs     # Whisper verbose_json parsing (segment timestamps)
+│   ├── retry.rs            # 429/503 backoff for long jobs (one retry layer per request)
+│   ├── flac.rs             # Recording chunks as FLAC for Deepgram, Groq, OpenAI whisper-1 (WAV fallback)
 │   ├── deepgram.rs         # Deepgram Nova API (REST + WebSocket streaming)
 │   ├── groq.rs             # Groq Whisper API (chunked HTTP, timestamp dedup)
 │   ├── openai_realtime.rs  # OpenAI Realtime API (WebSocket, true streaming)
@@ -138,6 +166,7 @@ contrib/
 ├── whisrs.1                # man page for whisrs CLI (.TH version asserted by test)
 ├── whisrsd.1               # man page for whisrsd daemon (.TH version asserted by test)
 ├── asr-sidecars/           # Local ASR sidecar recipes
+├── agent-skill/            # whisrs-recordings/SKILL.md: lets an agent find and read recordings (read-only)
 └── gnome-shell-extension/  # GNOME overlay extension
 scripts/
 ├── dev-install.sh          # Build + install + restart daemon (the dev loop)
@@ -158,22 +187,40 @@ docs" in an untracked file changes nothing for users and shows up in no PR. Chec
 
 ## Feature Flags
 
-- `default = ["local-whisper", "tray", "overlay", "hooks"]`
+- `default = ["local-whisper", "tray", "overlay", "hooks", "recording", "mcp"]`
 - `local-whisper` — whisper-rs (whisper.cpp) for offline transcription. Requires a C++ toolchain and libclang.
 - `tray` — tray icon via `ksni`
 - `overlay` — recording overlay via `smithay-client-toolkit` + `wayland-client` + `tiny-skia`
 - `hooks` — recording-lifecycle hooks + MPRIS media pause via `zbus` (no new system dep; `overlay` already pulls `zbus`)
+- `recording`: the recording feature (`src/recording/` submodules, `src/daemon/recording.rs`, the tray's
+  recording items and icons, `whisrs recording`, the editor's Recording questions), with `flacenc`, `realfft` and
+  `bytes` as its optional deps. The wire and `Config` stay in every build: `Command::Recording`,
+  `Response::Recording` and the plain types in `src/recording/mod.rs`, so a CLI and daemon from different builds
+  still talk. Without it `whisrs recording ...` still parses and exits 1 ("this whisrs was built without the
+  recording feature"), the daemon answers every recording command with "this whisrsd was built without the
+  recording feature", `[hotkeys] recording` binds nothing, and dictation's "refused while a recording runs" check is
+  compiled out. The transcription layer stays whole (`transcribe_segments` on every backend, verbose_json, retry):
+  without the encoder, `flac::recording_upload` passes the WAV through, and nothing sends one
+- `mcp`: `whisrs mcp`, a read-only MCP server on stdio (`src/mcp.rs`) via `rmcp` (pinned `~3.5.1`: server, macros,
+  transport-io) + `schemars` 1. Implies `recording` (it reads the recordings folder through `recording::store`).
+  Without it the `mcp` subcommand still exists and exits 1 with a "built without the mcp feature" error, so it is
+  never silently missing
 - `vulkan` / `cuda` / `hipblas` — GPU backends for the bundled whisper.cpp, passed
   through to `whisper-rs`. Each implies `local-whisper`. Off by default and never built
   by CI or the release workflow, so they are source-build-only (`cargo install whisrs
   --features vulkan`). Enabling one turns on whisper-rs's `_gpu`, which is what flips
   `WhisperContextParameters::default().use_gpu` to true — there is no whisrs-side wiring.
 
-The **minimal** release build is `--no-default-features --features tray,overlay,hooks`:
-it drops only whisper.cpp. Keep `tray`, `overlay` and `hooks` in it (that omission was
-issue #51). A feature left out of that list is silently ignored at runtime rather than
-diagnosed: `Config` is not feature-gated, so the key still parses as known and the
-unknown-key warning stays quiet.
+The **minimal** release build is `--no-default-features --features tray,overlay,hooks,recording,mcp`:
+it drops only whisper.cpp. Keep `tray`, `overlay`, `hooks`, `recording` and `mcp` in it (that omission was
+issue #51); `mcp` implies `recording`, but both are listed so neither goes missing in a later edit. The list
+is in `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `CONTRIBUTING.md`, two comments in
+`src/config/types.rs` and here; `flake.nix` builds the default features. A feature left out of that list is
+silently ignored at runtime rather than diagnosed: `Config` is not feature-gated, so the key still parses as
+known and the unknown-key warning stays quiet. `recording` is the exception: built without it, a `[recording]`
+section that differs from the defaults or a `[hotkeys] recording` binding gets one config warning
+("this whisrs was built without the recording feature, so [recording] is ignored",
+`Config::validate_recording`), since a whole feature going quiet would otherwise look like a bug.
 
 ## Coding Conventions
 
@@ -201,13 +248,27 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
+{"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name|summarize", "title": "...", "id": "...",
+ "language": "de", "mic_language": "de", "system_language": "auto", "others": "Video",
+ "shared_mic": true, "num_speakers": 3, "participants": ["Sarah", "Omar"],
+ "speaker": "S2", "name": "Sarah"}
+                                     // all but action optional: title (start/toggle), id (retry/copy/name/summarize,
+                                     // default "last"), speaker + name (name; "" clears), the languages, shared_mic, num_speakers and
+                                     // participants (--with) (start/toggle/retry;
+                                     // a track's own language wins over "language"), others = system track
+                                     // label (start/toggle). Validated by the daemon
+                                     // (RecordingOptions::validated)
 ```
 
 Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": "..."}`,
-and a `History` variant carrying log entries.
+a `History` variant carrying log entries, and a `Recording` variant carrying the recording status.
 
 Adding a command means a new `Command` variant plus a daemon handler. Never put logic in
-`src/cli/main.rs` — it is a thin socket client.
+`src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording
+list/show/path` read the recordings folder directly, which keeps transcript bodies off IPC
+(as does the speaker list `whisrs recording name` prints after the daemon renamed one).
+`whisrs mcp` reads it too, but its logic is in the library (`src/mcp.rs`); the CLI only
+starts it with `store::configured_recordings_dir()`.
 
 ## Configuration
 
@@ -217,7 +278,31 @@ Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realti
 
 TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
 
-Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, after filler removal (`src/replacements.rs`).
+Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
+
+Recording (mic + system audio, transcribed after the stop): the `[recording]` section (`backend`,
+`user_name`, `language`, `mic_language`, `system_language`, `mic_device`, `system_device`,
+`max_duration_minutes`, `audio_retention_days`, `dir`, `diarization`, `diarization_url`,
+`num_speakers`, `shared_mic`, `name_speakers`, `summary`, `summary_instruction`)
+plus `[hotkeys] recording`. Recordings live in `~/.local/share/whisrs/recordings/<id>/`
+(`recording.json`, `<id>.md`, `audio/`, and a `.cache/` of finished chunks kept until the
+transcript is written or the audio is deleted; a diarization sidecar's voices stay until the
+audio is deleted). The recording backend
+must be file-capable, a backend that can transcribe a recorded file: groq, openai, deepgram,
+asr-sidecar or local-whisper (`deepgram-streaming` maps to `deepgram`; realtime backends are
+refused). Every processing job goes through one queue in `daemon/recording.rs` (`reserve` +
+`dispatch`; a `Job` is `Transcribe` or `Summarize`, and the worker runs waiting transcriptions
+before waiting summaries, `next_job`; one worker, so a running summary delays the next
+transcription); short rewrites that are no job (`recording name`, the retention sweep)
+`hold`/`release` the recording instead, and a hold waits only for a transcription
+(`blocks_a_hold`). `process_recording` ends at the transcript (and clears `summary_pending`);
+with `[recording] summary` the worker then queues a `Summarize` job (`queue_summary`, which
+sets `summary_pending: "auto" | "asked"` so `resume_summaries` re-queues it at startup, an
+auto one only while `summary` is on). A summary job reads a snapshot, calls the LLM unheld,
+then holds the recording just to merge its fields into `recording.json` as it is then
+(`summary::write_result`, stale if a name changed meanwhile) and re-render `<id>.md`
+(`process::save`); it never re-transcribes. A retry or a rename over a summary marks it
+`summary_stale`.
 
 Environment variable overrides:
 - `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key` (also used by the `deepgram` TTS backend)
@@ -233,7 +318,10 @@ Environment variable overrides:
 ```fish
 cargo fmt                                      # fix formatting
 cargo clippy --all-targets -- -D warnings      # lint (must pass clean)
+cargo clippy --all-targets --no-default-features --features tray,overlay,hooks -- -D warnings             # without recording (CI runs it)
+cargo clippy --all-targets --no-default-features --features tray,overlay,hooks,recording -- -D warnings   # without mcp (CI runs it)
 cargo test                                     # all tests must pass
+cargo test --no-default-features --features tray,overlay,hooks   # the "built without recording" answers (CI runs it)
 cargo build                                    # must compile
 ```
 

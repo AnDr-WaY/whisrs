@@ -149,6 +149,12 @@ IPC socket.
 .TP
 .I ~/.cache/whisrs/recovery/
 Audio recovery files saved on transcription failure.
+.TP
+.I $XDG_DATA_HOME/whisrs/recordings/
+Recordings and their transcripts, one folder per recording. Override with
+.B [recording] dir
+in
+.IR config.toml .
 .SH EXAMPLES
 Run the daemon in the foreground with debug logging:
 .PP

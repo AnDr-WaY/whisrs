@@ -16,7 +16,7 @@ use whisrs::history::{self, HistoryEntry};
 use whisrs::llm;
 use whisrs::replacements::Replacer;
 use whisrs::state::Action;
-use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
+use whisrs::transcription::{transcription_prompt, TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
 use xkb_type::ClipboardBackend;
@@ -611,14 +611,15 @@ pub(crate) enum BatchOrigin<'a> {
 }
 
 impl BatchOrigin<'_> {
-    /// Toast text when the audio gate rejects the recording (`label` is the
-    /// gate's reason, e.g. "too short" or "silent").
+    /// Toast text when the audio gate rejects the audio (`label` is the
+    /// gate's reason, e.g. "too short" or "silent"). It never says
+    /// "recording": that is the recording feature's word.
     fn gate_skip_message(&self, label: &str) -> String {
         match self {
             BatchOrigin::Dictation | BatchOrigin::LlmCommand { .. } => {
-                format!("Skipped: recording was {label}")
+                format!("Skipped: the audio was {label}")
             }
-            BatchOrigin::CommandMode => format!("Command mode: recording was {label}"),
+            BatchOrigin::CommandMode => format!("Command mode: the audio was {label}"),
         }
     }
 
@@ -1244,6 +1245,7 @@ pub(crate) fn build_transcription_config(config: &Config, language: &str) -> Tra
         model: get_model_for_backend(config),
         prompt: transcription_prompt(config.general.prompt.as_deref(), &config.general.vocabulary),
         keyterms: config.general.vocabulary.clone(),
+        diarize: false,
     }
 }
 
@@ -1267,25 +1269,8 @@ fn batch_transcription_config(
             model: get_model_for_backend(config),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         }
-    }
-}
-
-/// Joins `prompt` and `vocabulary` with `". "`, prompt first. Blank prompts
-/// are treated as absent; returns `None` only when both inputs are empty so
-/// backends skip the hint entirely rather than receiving an empty string.
-fn transcription_prompt(prompt: Option<&str>, vocabulary: &[String]) -> Option<String> {
-    let prompt = prompt.map(str::trim).filter(|s| !s.is_empty());
-    let vocab = if vocabulary.is_empty() {
-        None
-    } else {
-        Some(vocabulary.join(", "))
-    };
-    match (prompt, vocab) {
-        (Some(p), Some(v)) => Some(format!("{p}. {v}")),
-        (Some(p), None) => Some(p.to_string()),
-        (None, Some(v)) => Some(v),
-        (None, None) => None,
     }
 }
 
@@ -1692,14 +1677,14 @@ mod tests {
     #[test]
     fn gate_skip_message_per_origin() {
         let cases = [
-            (BatchOrigin::Dictation, "Skipped: recording was silent"),
+            (BatchOrigin::Dictation, "Skipped: the audio was silent"),
             (
                 BatchOrigin::CommandMode,
-                "Command mode: recording was silent",
+                "Command mode: the audio was silent",
             ),
             (
                 BatchOrigin::LlmCommand { name: "proofread" },
-                "Skipped: recording was silent",
+                "Skipped: the audio was silent",
             ),
         ];
         for (origin, expected) in cases {
@@ -1874,6 +1859,20 @@ mod tests {
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             self.sends_prompt
         }
+
+        // The batch path never asks for segments; recordings have their own
+        // fakes in `whisrs::recording::process`.
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> anyhow::Result<whisrs::transcription::Transcript> {
+            unreachable!("the dictation batch path does not request segments")
+        }
+
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
     }
 
     /// Terms a user would put in `[general] vocabulary`. They are what
@@ -1897,6 +1896,8 @@ mod tests {
             state_tx: tokio::sync::watch::channel(State::Idle).0,
             overlay_level_tx: None,
             overlay_enabled: false,
+            #[cfg(feature = "recording")]
+            recording: crate::recording::RecordingRuntime::new().0,
         }
     }
 

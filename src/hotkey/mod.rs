@@ -14,6 +14,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::llm::LlmCommandConfig;
+#[cfg(feature = "recording")]
+use crate::recording::{RecordingAction, RecordingOptions};
 use crate::{Command, HotkeyConfig};
 pub use parse::{parse_hotkey, HotkeyBinding};
 
@@ -134,6 +136,19 @@ fn build_actions(config: &HotkeyConfig, llm_commands: &[LlmCommandConfig]) -> Ve
         ("cancel", &config.cancel, Command::Cancel),
         ("command", &config.command, Command::CommandMode),
         ("speak", &config.speak, Command::Speak),
+        // A build without the recording feature binds nothing for it; the
+        // config warns that `[hotkeys] recording` is ignored.
+        #[cfg(feature = "recording")]
+        (
+            "recording",
+            &config.recording,
+            Command::Recording {
+                action: RecordingAction::Toggle,
+                title: None,
+                id: None,
+                options: RecordingOptions::default(),
+            },
+        ),
     ];
     for (label, spec, command) in fixed {
         let Some(spec) = spec else { continue };
@@ -531,6 +546,7 @@ mod tests {
             cancel: Some("Super+Shift+D".to_string()),
             command: Some("Super+Shift+G".to_string()),
             speak: Some("Super+Shift+R".to_string()),
+            recording: Some("Super+Shift+M".to_string()),
         }
     }
 
@@ -548,12 +564,53 @@ mod tests {
             .len();
 
         let actions = build_actions(&config, &[]);
+        // `[hotkeys] recording` alone binds nothing in a build without the
+        // recording feature, which warns that it is ignored.
+        let ignored = usize::from(!cfg!(feature = "recording"));
         assert_eq!(
             actions.len(),
-            fields,
+            fields - ignored,
             "every set [hotkeys] field must produce a listener action — a new field \
              needs a line in build_actions' `fixed` table"
         );
+    }
+
+    /// Built without the recording feature, `[hotkeys] recording` registers
+    /// no key: pressing it would only reach a daemon that refuses it.
+    #[cfg(not(feature = "recording"))]
+    #[test]
+    fn recording_hotkey_binds_nothing_without_the_feature() {
+        let config = HotkeyConfig {
+            recording: Some("ScrollLock".to_string()),
+            ..Default::default()
+        };
+        assert!(build_actions(&config, &[]).is_empty());
+        let actions = build_actions(&all_hotkeys_set(), &[]);
+        assert!(actions
+            .iter()
+            .all(|a| !matches!(a.command, Command::Recording { .. })));
+    }
+
+    /// `[hotkeys] recording` takes the same forms as the other fields, the
+    /// bare ScrollLock/Pause/F13-F24 bindings included.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn recording_hotkey_accepts_a_bare_binding() {
+        let config = HotkeyConfig {
+            recording: Some("ScrollLock".to_string()),
+            ..Default::default()
+        };
+        let actions = build_actions(&config, &[]);
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].binding.modifiers.is_empty());
+        assert_eq!(actions[0].binding.trigger, Key::KEY_SCROLLLOCK);
+        assert!(matches!(
+            actions[0].command,
+            Command::Recording {
+                action: RecordingAction::Toggle,
+                ..
+            }
+        ));
     }
 
     /// Each field is wired to its own command — a mis-ordered `fixed` table
@@ -566,6 +623,13 @@ mod tests {
             Command::Cancel,
             Command::CommandMode,
             Command::Speak,
+            #[cfg(feature = "recording")]
+            Command::Recording {
+                action: RecordingAction::Toggle,
+                title: None,
+                id: None,
+                options: RecordingOptions::default(),
+            },
         ] {
             assert_eq!(
                 actions

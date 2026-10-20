@@ -17,6 +17,8 @@ use dialoguer::{Confirm, Editor, Input, Select};
 use crate::config::{setup, vocabulary};
 use crate::service::ServiceManager;
 use crate::{Config, HotkeyConfig, RestartOutcome};
+#[cfg(feature = "recording")]
+use crate::{DiarizationMode, RecordingConfig};
 
 use setup::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
@@ -105,9 +107,10 @@ pub fn run_config_menu() -> Result<()> {
             "Clipboard-only mode (no injection)",
             "Hotkeys",
             "Tray & overlay",
-            "Recording hooks",
+            "Dictation hooks",
             "Command mode (LLM)",
             "Custom LLM commands",
+            "Recording",
             "Show full config (masked)",
             "Open in $EDITOR",
             "─────────",
@@ -137,8 +140,9 @@ pub fn run_config_menu() -> Result<()> {
             11 => edit_media_hooks(&mut config)?,
             12 => edit_llm(&mut config)?,
             13 => edit_llm_commands(&mut config)?,
-            14 => show_config(&config),
-            15 => {
+            14 => edit_recording(&mut config)?,
+            15 => show_config(&config),
+            16 => {
                 if open_in_editor(&mut config)? {
                     // External edit already wrote the file; reload and skip the
                     // normal save path so we don't clobber formatting/comments
@@ -146,17 +150,17 @@ pub fn run_config_menu() -> Result<()> {
                     println!("  {GREEN}Applied edits from $EDITOR.{RESET}");
                 }
             }
-            16 => {
+            17 => {
                 // separator — no-op
             }
-            17 => {
+            18 => {
                 if save_and_restart(&config, fresh, &vocabulary_baseline)? {
                     return Ok(());
                 }
                 // Validation failed — fall through to next loop iteration,
                 // preserving the in-memory `config` so the user can fix it.
             }
-            18 => {
+            19 => {
                 println!("\n  {DIM}Discarded changes.{RESET}");
                 return Ok(());
             }
@@ -186,6 +190,7 @@ fn default_config() -> Config {
         overlay: None,
         llm_commands: Vec::new(),
         replacements: Default::default(),
+        recording: None,
     }
 }
 
@@ -454,11 +459,39 @@ fn edit_audio_device(config: &mut Config) -> Result<()> {
     println!("  Current: {}", config.audio.device);
 
     let devices = list_input_devices();
+    // Every spelling of "default" lands on the preset, not on "manual".
+    let current = if is_default_name(&config.audio.device) {
+        "default".to_string()
+    } else {
+        config.audio.device.clone()
+    };
+    let picked = select_input_device(
+        "Input device (restart the daemon to apply)",
+        &[("System default".to_string(), Some("default".to_string()))],
+        &devices,
+        Some(&current),
+        "Audio device name (\"default\" to use system default)",
+    )?;
+    config.audio.device = picked.unwrap_or_else(|| "default".to_string());
+    Ok(())
+}
+
+/// Pick an input device: a few fixed `presets` (label, stored value, where
+/// `None` means "unset the key"), then every detected device, then manual
+/// entry. `current` preselects the matching row; a value that matches neither
+/// a preset nor a device preselects manual entry.
+fn select_input_device(
+    prompt: &str,
+    presets: &[(String, Option<String>)],
+    devices: &[crate::audio::device::InputDeviceInfo],
+    current: Option<&str>,
+    manual_prompt: &str,
+) -> Result<Option<String>> {
     if devices.is_empty() {
-        println!("  {YELLOW}No input devices detected.{RESET}");
+        println!("  {YELLOW}No matching devices detected.{RESET}");
     }
 
-    let mut items = vec!["System default".to_string()];
+    let mut items: Vec<String> = presets.iter().map(|(label, _)| label.clone()).collect();
     items.extend(devices.iter().map(|d| {
         let monitor = if d.is_monitor() {
             " [system audio]"
@@ -468,37 +501,261 @@ fn edit_audio_device(config: &mut Config) -> Result<()> {
         format!("{}  ({}){monitor}", d.description, d.id)
     }));
     items.push("Enter a name manually".to_string());
+    let manual = items.len() - 1;
 
-    let current = config.audio.device.trim();
-    let default = if is_default_name(current) {
-        0
+    let default = if let Some(i) = presets.iter().position(|(_, v)| v.as_deref() == current) {
+        i
     } else {
-        devices
-            .iter()
-            .position(|d| d.id == current)
-            .map(|i| i + 1)
-            .unwrap_or(items.len() - 1)
+        current
+            .and_then(|c| devices.iter().position(|d| d.id == c))
+            .map(|i| i + presets.len())
+            .unwrap_or(manual)
     };
 
     let choice = Select::new()
-        .with_prompt("Input device (restart the daemon to apply)")
+        .with_prompt(prompt)
         .items(&items)
         .default(default)
         .interact()
         .context("failed to read audio device choice")?;
 
-    config.audio.device = if choice == 0 {
-        "default".to_string()
-    } else if let Some(d) = devices.get(choice - 1) {
-        d.id.clone()
+    Ok(if let Some((_, value)) = presets.get(choice) {
+        value.clone()
+    } else if let Some(d) = devices.get(choice - presets.len()) {
+        Some(d.id.clone())
     } else {
-        Input::new()
-            .with_prompt("Audio device name (\"default\" to use system default)")
-            .default(config.audio.device.clone())
+        let name: String = Input::new()
+            .with_prompt(manual_prompt)
+            .default(current.unwrap_or("default").to_string())
             .interact_text()
-            .context("failed to read audio device")?
+            .context("failed to read audio device")?;
+        Some(name.trim().to_string())
+    })
+}
+
+/// Batch backends the recording feature can transcribe with. The realtime backends
+/// are left out on purpose: they only stream, and a recording is transcribed
+/// from files after it ends. `deepgram-streaming` is left out because a
+/// recording uses Deepgram's REST API either way.
+#[cfg(feature = "recording")]
+const RECORDING_BACKENDS: [&str; 5] =
+    ["groq", "openai", "deepgram", "asr-sidecar", "local-whisper"];
+
+#[cfg(feature = "recording")]
+fn edit_recording(config: &mut Config) -> Result<()> {
+    use crate::audio::device::list_input_devices;
+
+    println!("\n  {BOLD}Recording{RESET}");
+    println!(
+        "  {DIM}Records your mic and the system audio as separate tracks, then\n   \
+         transcribes them after you stop. Start and stop it with\n   \
+         `whisrs recording` or the [hotkeys] recording binding.{RESET}"
+    );
+
+    let mut recording = RecordingConfig::effective(config);
+
+    // Backend.
+    let mut backend_items = vec![format!("Same as dictation ({})", config.general.backend)];
+    backend_items.extend(RECORDING_BACKENDS.iter().map(|b| b.to_string()));
+    let backend_default = match recording.backend.as_deref() {
+        None => 0,
+        Some(b) => RECORDING_BACKENDS
+            .iter()
+            .position(|m| *m == b)
+            .map(|i| i + 1)
+            .unwrap_or(0),
     };
+    let choice = Select::new()
+        .with_prompt("Transcription backend for recordings (batch backends only)")
+        .items(&backend_items)
+        .default(backend_default)
+        .interact()
+        .context("failed to read recording backend")?;
+    recording.backend = if choice == 0 {
+        None
+    } else {
+        Some(RECORDING_BACKENDS[choice - 1].to_string())
+    };
+
+    // Speaker name.
+    recording.user_name = prompt_optional_string(
+        "Your name in transcripts, defaults to your login name",
+        &recording.user_name,
+    )?;
+
+    // Languages. `whisrs recording start -l` and friends override these for
+    // one recording.
+    recording.language = prompt_optional_language(
+        &format!(
+            "Language of both tracks (e.g. de, auto), defaults to [general] language ({})",
+            config.general.language
+        ),
+        &recording.language,
+    )?;
+    recording.mic_language = prompt_optional_language(
+        "Language of your microphone, defaults to the one above",
+        &recording.mic_language,
+    )?;
+    recording.system_language = prompt_optional_language(
+        "Language of the system audio, defaults to the one above",
+        &recording.system_language,
+    )?;
+
+    // Speakers.
+    let modes = [
+        (
+            DiarizationMode::Auto,
+            "Auto: the diarization sidecar when its URL is set, else Deepgram",
+        ),
+        (
+            DiarizationMode::Backend,
+            "The transcription backend (Deepgram, or an asr-sidecar that returns speakers)",
+        ),
+        (
+            DiarizationMode::Sidecar,
+            "A diarization sidecar (a local server at diarization_url)",
+        ),
+        (DiarizationMode::Off, "Off: one speaker per track"),
+    ];
+    let mode_labels: Vec<&str> = modes.iter().map(|(_, label)| *label).collect();
+    let mode_default = modes
+        .iter()
+        .position(|(mode, _)| *mode == recording.diarization)
+        .unwrap_or(0);
+    let choice = Select::new()
+        .with_prompt("Tell the voices on the system audio apart")
+        .items(&mode_labels)
+        .default(mode_default)
+        .interact()
+        .context("failed to read speaker separation")?;
+    recording.diarization = modes[choice].0;
+    if matches!(
+        recording.diarization,
+        DiarizationMode::Auto | DiarizationMode::Sidecar
+    ) {
+        let required = recording.diarization == DiarizationMode::Sidecar;
+        recording.diarization_url = prompt_optional_url(
+            "Diarization sidecar URL, e.g. http://127.0.0.1:8770/diarize",
+            &recording.diarization_url,
+            required,
+        )?;
+        if recording.diarization_url.is_some() {
+            recording.num_speakers = Input::new()
+                .with_prompt("How many voices on the system audio (0 = let the sidecar decide)")
+                .default(recording.num_speakers)
+                .validate_with(|n: &u32| crate::recording::validate_num_speakers(*n).map(|_| ()))
+                .interact_text()
+                .context("failed to read the number of voices")?;
+        }
+    }
+    recording.shared_mic = Confirm::new()
+        .with_prompt("Several people share your mic (tell its voices apart too)?")
+        .default(recording.shared_mic)
+        .interact()
+        .context("failed to read shared mic")?;
+    recording.name_speakers = Confirm::new()
+        .with_prompt("Name the speakers with the [llm] (sends excerpts of each transcript to it)?")
+        .default(recording.name_speakers)
+        .interact()
+        .context("failed to read speaker naming")?;
+    recording.summary = Confirm::new()
+        .with_prompt("Summarize each transcript with the [llm] (sends the whole transcript to it)?")
+        .default(recording.summary)
+        .interact()
+        .context("failed to read the summary setting")?;
+
+    // Devices.
+    let devices = list_input_devices();
+    let (monitors, mics): (Vec<_>, Vec<_>) = devices.into_iter().partition(|d| d.is_monitor());
+
+    recording.mic_device = select_input_device(
+        "Microphone",
+        &[
+            (
+                format!("Same as [audio] device ({})", config.audio.device),
+                None,
+            ),
+            ("System default".to_string(), Some("default".to_string())),
+        ],
+        &mics,
+        recording.mic_device.as_deref(),
+        "Microphone device name",
+    )?;
+
+    // `"default"` is stored as unset: both mean the default monitor.
+    let system_current = match recording.system_device.as_deref() {
+        Some("default") => None,
+        other => other,
+    };
+    recording.system_device = select_input_device(
+        "System audio (what your computer plays)",
+        &[
+            ("Default monitor (what you hear)".to_string(), None),
+            ("None (mic only)".to_string(), Some("none".to_string())),
+        ],
+        &monitors,
+        system_current,
+        "System audio source name (usually ends in .monitor)",
+    )?;
+
+    // Limits and storage.
+    recording.max_duration_minutes = Input::new()
+        .with_prompt("Stop recording automatically after (minutes, 1-2160)")
+        .default(recording.max_duration_minutes)
+        .validate_with(|v: &u32| {
+            if (1..=2160).contains(v) {
+                Ok(())
+            } else {
+                Err("must be between 1 and 2160")
+            }
+        })
+        .interact_text()
+        .context("failed to read max duration")?;
+
+    recording.audio_retention_days = Input::new()
+        .with_prompt("Keep recording audio for (days; 0 = delete once transcribed, -1 = forever)")
+        .default(recording.audio_retention_days)
+        .interact_text()
+        .context("failed to read audio retention")?;
+
+    recording.dir = prompt_optional_string(
+        "Recordings folder, defaults to ~/.local/share/whisrs/recordings",
+        &recording.dir,
+    )?;
+
+    config.recording = apply_recording_edit(config.recording.take(), recording);
     Ok(())
+}
+
+/// What the Recording row says in a build without the recording feature.
+#[cfg(not(feature = "recording"))]
+const RECORDING_MISSING: &str = "this whisrs was built without the recording feature, so \
+     there is nothing to set here, and [recording] is kept as it is. Use a release build, or \
+     rebuild with `cargo install whisrs --features recording`.";
+
+/// The Recording row of a build without the recording feature: no question
+/// to ask, only why.
+#[cfg(not(feature = "recording"))]
+fn edit_recording(_config: &mut Config) -> Result<()> {
+    println!("\n  {BOLD}Recording{RESET}");
+    println!("  {YELLOW}{RECORDING_MISSING}{RESET}");
+    Ok(())
+}
+
+/// Decide what to store after the recording editor ran. An existing
+/// `[recording]` section is always kept (even if every value is back at its
+/// default); a config without one only gains it when the user changed
+/// something, so walking through the editor does not add an empty section.
+#[cfg(feature = "recording")]
+fn apply_recording_edit(
+    current: Option<RecordingConfig>,
+    edited: RecordingConfig,
+) -> Option<RecordingConfig> {
+    if current.is_some() || edited != RecordingConfig::default() {
+        Some(edited)
+    } else {
+        None
+    }
 }
 
 fn edit_key_delay(config: &mut Config) -> Result<()> {
@@ -591,6 +848,14 @@ fn edit_hotkeys(config: &mut Config) -> Result<()> {
     hotkeys.cancel = prompt_optional_string("Cancel hotkey", &hotkeys.cancel)?;
     hotkeys.command = prompt_optional_string("Command-mode hotkey", &hotkeys.command)?;
     hotkeys.speak = prompt_optional_string("Read-aloud hotkey", &hotkeys.speak)?;
+    // Named apart from dictation, whose hotkey is `toggle`. A build without
+    // the recording feature ignores the binding, so it is not asked for, and
+    // `hotkeys` keeps it as it was.
+    #[cfg(feature = "recording")]
+    {
+        let recording_prompt = "Recording hotkey (mic + system audio)";
+        hotkeys.recording = prompt_optional_string(recording_prompt, &hotkeys.recording)?;
+    }
 
     // Drop the whole section if every field is empty — keeps the TOML clean.
     config.hotkeys = if any_hotkey_set(&hotkeys) {
@@ -611,8 +876,13 @@ fn any_hotkey_set(hotkeys: &HotkeyConfig) -> bool {
         cancel,
         command,
         speak,
+        recording,
     } = hotkeys;
-    toggle.is_some() || cancel.is_some() || command.is_some() || speak.is_some()
+    toggle.is_some()
+        || cancel.is_some()
+        || command.is_some()
+        || speak.is_some()
+        || recording.is_some()
 }
 
 /// Prompt for a value that may be unset, seeded with the current one.
@@ -638,8 +908,73 @@ fn prompt_optional_string(label: &str, current: &Option<String>) -> Result<Optio
     })
 }
 
+/// [`prompt_optional_string`] for an `http(s)://` URL: re-asked until it
+/// parses, and, when `required`, until it is given. An empty line always
+/// reaches the validator (`allow_empty`), which refuses it when required.
+#[cfg(feature = "recording")]
+fn prompt_optional_url(
+    label: &str,
+    current: &Option<String>,
+    required: bool,
+) -> Result<Option<String>> {
+    let input: String = Input::new()
+        .with_prompt(if required {
+            label.to_string()
+        } else {
+            format!("{label} (blank to unset)")
+        })
+        .with_initial_text(current.clone().unwrap_or_default())
+        .allow_empty(true)
+        .validate_with(move |input: &String| match parse_optional_url(input) {
+            Ok(None) if required => Err("a URL is needed here".to_string()),
+            other => other.map(|_| ()),
+        })
+        .interact_text()
+        .with_context(|| format!("failed to read {label}"))?;
+    Ok(parse_optional_url(&input).unwrap_or(None))
+}
+
+/// A URL typed into the editor: blank is unset, anything else must be an
+/// `http://` or `https://` URL, stored trimmed.
+#[cfg(feature = "recording")]
+fn parse_optional_url(input: &str) -> std::result::Result<Option<String>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let url = reqwest::Url::parse(input).map_err(|e| format!("not a URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("use http:// or https://, not {}://", url.scheme()));
+    }
+    Ok(Some(input.to_string()))
+}
+
+/// [`prompt_optional_string`] for a language: re-asked until it passes the
+/// rule `-l` follows, and stored normalized.
+#[cfg(feature = "recording")]
+fn prompt_optional_language(label: &str, current: &Option<String>) -> Result<Option<String>> {
+    let input: String = Input::new()
+        .with_prompt(format!("{label} (blank to unset)"))
+        .with_initial_text(current.clone().unwrap_or_default())
+        .allow_empty(true)
+        .validate_with(|input: &String| parse_optional_language(input).map(|_| ()))
+        .interact_text()
+        .with_context(|| format!("failed to read {label}"))?;
+    Ok(parse_optional_language(&input).unwrap_or(None))
+}
+
+/// A language typed into the editor: blank is unset, anything else must
+/// pass [`crate::validate_language_override`] and is stored as it returns it.
+#[cfg(feature = "recording")]
+fn parse_optional_language(input: &str) -> std::result::Result<Option<String>, String> {
+    if input.trim().is_empty() {
+        return Ok(None);
+    }
+    crate::validate_language_override(input).map(Some)
+}
+
 fn edit_media_hooks(config: &mut Config) -> Result<()> {
-    println!("\n  {BOLD}Recording hooks{RESET}");
+    println!("\n  {BOLD}Dictation hooks{RESET}");
     println!(
         "  {DIM}Pause MPRIS media that is playing (browsers, Spotify, VLC, MPV,\n   \
          KDE Connect) while dictating, and resume exactly those afterwards.\n   \
@@ -649,15 +984,15 @@ fn edit_media_hooks(config: &mut Config) -> Result<()> {
     let mut hooks = config.hooks.clone().unwrap_or_default();
 
     hooks.media_auto_pause = Confirm::new()
-        .with_prompt("Pause playing MPRIS media while recording?")
+        .with_prompt("Pause playing MPRIS media while dictating?")
         .default(hooks.media_auto_pause)
         .interact()
         .unwrap_or(hooks.media_auto_pause);
 
     hooks.on_record_start =
-        prompt_optional_string("Shell command on record start", &hooks.on_record_start)?;
+        prompt_optional_string("Shell command on dictation start", &hooks.on_record_start)?;
     hooks.on_record_stop =
-        prompt_optional_string("Shell command on record stop", &hooks.on_record_stop)?;
+        prompt_optional_string("Shell command on dictation stop", &hooks.on_record_stop)?;
 
     // Drop the whole section if nothing is configured — keeps the TOML clean.
     let any_set =
@@ -1278,8 +1613,8 @@ mod tests {
             .collect();
         assert_eq!(
             chains.len(),
-            17,
-            "the scan found {} `Input` chains, not 17. Fewer means a \
+            22,
+            "the scan found {} `Input` chains, not 22. Fewer means a \
              constructor spelling the needle misses, which makes this test \
              vacuous; more means a prompt was added — audit its chain against \
              the rules below, then bump this number",
@@ -1308,6 +1643,7 @@ mod tests {
             cancel: Some("b".into()),
             command: Some("c".into()),
             speak: Some("d".into()),
+            recording: Some("e".into()),
         };
         let json = serde_json::to_value(&all_set).expect("HotkeyConfig serializes");
         json.as_object()
@@ -1315,6 +1651,83 @@ mod tests {
             .keys()
             .cloned()
             .collect()
+    }
+
+    /// A language typed into the recording editor: blank unsets it, a valid
+    /// one is stored normalized, anything else is re-asked.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn recording_editor_languages_follow_the_l_rule() {
+        assert_eq!(parse_optional_language("  "), Ok(None));
+        assert_eq!(parse_optional_language("DE"), Ok(Some("de".into())));
+        assert_eq!(parse_optional_language("auto"), Ok(Some("auto".into())));
+        assert!(parse_optional_language("german").is_err());
+    }
+
+    /// Walking through the recording editor without changing anything must not
+    /// add a `[recording]` section; any change, or an existing section, keeps it.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn recording_section_is_written_only_when_used() {
+        assert_eq!(apply_recording_edit(None, RecordingConfig::default()), None);
+        assert_eq!(parse_optional_url("  "), Ok(None));
+        assert_eq!(
+            parse_optional_url(" http://127.0.0.1:8770/diarize "),
+            Ok(Some("http://127.0.0.1:8770/diarize".to_string()))
+        );
+        assert!(parse_optional_url("ws://127.0.0.1:8770").is_err());
+        assert!(parse_optional_url("127.0.0.1:8770").is_err());
+
+        let changed = RecordingConfig {
+            user_name: Some("Ada".into()),
+            ..Default::default()
+        };
+        assert_eq!(apply_recording_edit(None, changed.clone()), Some(changed));
+
+        assert_eq!(
+            apply_recording_edit(Some(RecordingConfig::default()), RecordingConfig::default()),
+            Some(RecordingConfig::default())
+        );
+    }
+
+    /// The menu labels and the `match selection` arms are two hand-kept lists;
+    /// pin that the recording row lands on its own handler.
+    #[test]
+    fn recording_menu_row_dispatches_to_edit_recording() {
+        let source = include_str!("edit.rs");
+        let body = source
+            .split("pub fn run_config_menu(")
+            .nth(1)
+            .expect("edit.rs defines run_config_menu")
+            .split("\n}\n")
+            .next()
+            .expect("run_config_menu has a body");
+        let labels: Vec<&str> = body
+            .split("let choices = &[")
+            .nth(1)
+            .expect("menu choices")
+            .split("];")
+            .next()
+            .expect("menu choices end")
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix('"'))
+            .filter_map(|l| l.strip_suffix("\","))
+            .collect();
+        let index = labels
+            .iter()
+            .position(|l| *l == "Recording")
+            .expect("menu has a Recording row");
+        assert!(
+            body.contains(&format!("{index} => edit_recording(&mut config)?")),
+            "Recording is row {index} but that arm does not call edit_recording"
+        );
+        let last = labels.len() - 1;
+        assert!(
+            body.contains(&format!(
+                "{last} => {{\n                println!(\"\\n  {{DIM}}Discarded"
+            )),
+            "the last row ({last}) must be Discard & exit"
+        );
     }
 
     /// The editor rewrites the whole `[hotkeys]` table from the struct, so a
@@ -1891,6 +2304,7 @@ mod tests {
                 "cancel" => hotkeys.cancel = Some("Super+Shift+Escape".into()),
                 "command" => hotkeys.command = Some("Super+Shift+C".into()),
                 "speak" => hotkeys.speak = Some("Super+Shift+R".into()),
+                "recording" => hotkeys.recording = Some("Super+Shift+M".into()),
                 other => panic!("unhandled hotkey field `{other}` — add it to this test"),
             }
             assert!(

@@ -31,7 +31,7 @@ On save, writes the file and restarts the daemon via systemd. Unlike
 this does not touch udev rules, the systemd unit, or compositor keybindings.
 .TP
 .B toggle
-Start or stop recording. If idle, begins audio capture. If recording,
+Start or stop dictation. If idle, begins audio capture. If recording,
 stops capture and sends audio for transcription. Text is typed at the
 cursor in the previously focused window.
 .RS
@@ -58,7 +58,7 @@ dictate in each without switching settings.
 .RE
 .TP
 .B cancel
-Cancel the current recording and discard captured audio. Returns the
+Cancel the current dictation and discard captured audio. Returns the
 daemon to the idle state. Has no effect if the daemon is not recording.
 .TP
 .B log
@@ -112,7 +112,9 @@ stops playback. Alias:
 .BR read .
 .TP
 .B status
-Query the daemon state. Prints one of:
+Query the dictation state (for a recording, see
+.BR "whisrs recording status" ).
+Prints one of:
 .BR idle ,
 .BR recording ,
 .BR transcribing ,
@@ -127,9 +129,212 @@ on systemd systems and
 .B rc-service --user whisrs restart
 on OpenRC systems, when the corresponding user service is installed;
 otherwise prints guidance for manual restart. Does not require the daemon
-to be running \(em
+to be running:
 .B restart
 will start a stopped service.
+.TP
+.B recording
+Record the microphone and the system audio (the default output's monitor) as
+two separate tracks and turn them into a transcript, for a meeting or call, a
+lecture, a video or language practice. The tracks are transcribed after
+.B stop
+into a Markdown transcript whose speaker labels are your name
+.RB ( [recording]
+.BR user_name )
+and \(lqOthers\(rq, or, when
+.B [recording] diarization
+tells the voices on the system audio apart, \(lqSpeaker 1\(rq,
+\(lqSpeaker 2\(rq and so on (a single voice keeps \(lqOthers\(rq), unless a
+voice is named: by the people given with
+.BR \-\-with ,
+or, with
+.B [recording] name_speakers
+(off by default; it sends transcript excerpts to the
+.B [llm]
+endpoint), by the LLM from a quote of the transcript that shows the name.
+With
+.B [recording] summary
+(off by default; it sends the whole transcript to the
+.B [llm]
+endpoint), each transcript also gets a summary from the LLM, and a recording
+you gave no title gets one.
+Each track is transcribed in its own language:
+.B [recording] mic_language
+and
+.BR system_language ,
+which default to
+.B [recording] language
+and then to
+.BR "[general] language" .
+A recording keeps the languages it started with.
+While a recording is in progress,
+.BR "whisrs toggle" ,
+.B whisrs command
+and
+.B whisrs llm\-command
+refuse to start, since the microphone is shared with the recording.
+Each recording lives in its own folder under the recordings directory (see
+.BR FILES ),
+named by its id
+.RI ( YYYY\-MM\-DD_HHMM ,
+plus a slug of the title). Wherever an
+.I ID
+is taken, it may be a full id, a unique id prefix, or
+.B last
+for the newest recording. Requires an action:
+.RS
+.TP
+\fBstart\fR [\fB\-t\fR, \fB\-\-title\fR \fITITLE\fR] [\fB\-l\fR, \fB\-\-language\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR] [\fB\-\-with\fR \fINAMES\fR]
+Start a recording. The optional title goes into the transcript and the
+folder name.
+.B \-l
+sets the language of both tracks for this recording (an ISO 639 code such as
+.BR de ,
+optionally with a region, or
+.BR auto ),
+and
+.B \-\-mic\-language
+and
+.B \-\-system\-language
+set one track's, over
+.BR \-l .
+.B \-\-others
+names the system track in the transcript instead of \(lqOthers\(rq.
+.B \-\-shared\-mic
+says several people share your mic, so its voices are told apart too
+(\fB\-\-shared\-mic=false\fR turns
+.B [recording] shared_mic
+off for this recording).
+.B \-\-num\-speakers
+tells a diarization sidecar
+.RB ( "[recording] diarization_url" )
+how many voices the system audio holds (your mic, when there is no system
+audio), from 0 (let it decide) to 20.
+.B \-\-with
+says who the recording is with, names separated by commas (at most 20), to
+name the voices on the system audio: one voice and one name, or the last
+voice left once the others have names.
+.TP
+.B stop
+Stop the recording and queue it for transcription.
+.TP
+\fBtoggle\fR [\fB\-t\fR \fITITLE\fR] [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-others\fR \fINAME\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR] [\fB\-\-with\fR \fINAMES\fR]
+Start a recording when none is in progress, otherwise stop the one that is.
+Meant for a compositor hotkey. The options are those of
+.B start
+and apply when this starts a recording.
+.TP
+.B cancel
+Stop the recording and delete it.
+.TP
+.B status
+Print whether a recording is in progress or processing, and which recordings
+are waiting for the network.
+.TP
+\fBlist\fR [\fB\-\-json\fR]
+List recordings, newest first, with id, start time, duration, status and title.
+.B \-\-json
+prints a JSON array instead.
+.TP
+\fBshow\fR \fIID\fR [\fB\-f\fR, \fB\-\-format\fR \fBmd\fR|\fBjson\fR|\fBtxt\fR]
+Print a transcript:
+.B md
+(the default) prints the Markdown file,
+.B json
+prints
+.IR recording.json ,
+and
+.B txt
+prints plain text.
+.TP
+\fBpath\fR \fIID\fR
+Print the recording's folder.
+.TP
+\fBcopy\fR \fIID\fR
+Copy the transcript to the clipboard.
+.TP
+\fBname\fR \fIID\fR \fISPEAKER\fR \fINAME\fR
+Name a speaker of a transcribed recording.
+.I SPEAKER
+is its id (such as
+.BR S2 ),
+\(lqSpeaker 2\(rq, or the name it has now;
+.I NAME
+may be several words, and an empty one (\fB""\fR) clears the name you gave.
+The transcript and
+.I recording.json
+are rewritten at once, nothing is transcribed again, and
+.B retry
+keeps the name, which works while a summary is being made; a summary
+made before the name is marked as such. Refused while the recording is
+queued or being transcribed.
+.TP
+\fBretry\fR \fIID\fR [\fB\-l\fR \fILANG\fR] [\fB\-\-mic\-language\fR \fILANG\fR] [\fB\-\-system\-language\fR \fILANG\fR] [\fB\-\-shared\-mic\fR[=\fIBOOL\fR]] [\fB\-\-num\-speakers\fR \fIN\fR] [\fB\-\-with\fR \fINAMES\fR]
+Transcribe the recording again, for example after a failure or in another
+language. A language given here replaces the one the recording saved (as for
+.BR start ,
+.B \-l
+covers both tracks); a track left out keeps its own.
+.BR \-\-shared\-mic ,
+.B \-\-num\-speakers
+and
+.B \-\-with
+likewise replace the saved settings, and leaving them out keeps them
+.RB ( "\-\-with \(dq\(dq"
+clears the names). A recording whose
+transcription was interrupted three times (by a crash each time) is marked
+failed instead of being resumed at startup; retry resets that count and
+queues it again. After a failure, chunks already transcribed with the same
+backend and settings, language included, are reused; a recording that finished
+keeps none, so its retry sends both tracks again. With
+.B [recording] summary
+on, a retry makes a new summary; with it off, the summary is kept and
+marked as from an earlier transcript.
+.TP
+\fBsummarize\fR \fIID\fR
+Summarize a transcribed recording with the
+.B [llm]
+now, whatever
+.B [recording] summary
+says, without transcribing it again. The summary goes before the transcript
+in the Markdown file and into
+.I recording.json
+.RB ( summary ),
+and a recording you gave no title gets one of 3 to 6 words (a title you gave
+is never changed). The default rules (a TL;DR, sections by topic, decisions
+and next steps only when there are any) can be replaced with
+.BR "[recording] summary_instruction" .
+A transcript of 50 words or fewer is not sent. The job waits behind any
+recording being transcribed, and a notification says when it is done; if it
+fails, the recording keeps the summary it had and notes why. A summary
+interrupted by a shutdown is made at the next start. One job runs at a
+time: a running summary delays the next transcription until it ends.
+.RE
+.IP
+.BR list ,
+.B show
+and
+.B path
+read the recordings directory directly and work without the daemon.
+A build without the
+.B recording
+feature says so and exits 1, whatever the action.
+.TP
+.B mcp
+Serve your recordings to an AI agent: a read\-only MCP (Model Context
+Protocol) server on standard input and output, for a client such as Claude
+Code
+.RB ( "claude mcp add whisrs \-\- whisrs mcp" ).
+Its tools list recordings, give one recording's details and summary, page
+through a transcript and search titles, summaries and transcripts. It reads
+the recordings directory directly, works without the daemon, and never
+changes a recording. The
+.B mcp
+feature needs the
+.B recording
+feature, and a build without
+.B mcp
+says so and exits 1.
 .SH LLM OUTPUT
 Applies to
 .B command
@@ -206,6 +411,14 @@ Unix domain socket for CLI\-daemon IPC.
 .TP
 .I ~/.cache/whisrs/recovery/
 Recovery directory for audio that failed transcription.
+.TP
+.I $XDG_DATA_HOME/whisrs/recordings/
+Recordings and their transcripts, one folder per recording (defaults to
+.IR ~/.local/share/whisrs/recordings/ ;
+override with
+.B [recording] dir
+in
+.IR config.toml ).
 .SH EXIT STATUS
 .TP
 .B 0
@@ -232,7 +445,7 @@ Start dictation in Polish for this session only:
 .B whisrs toggle \-l pl
 .RE
 .PP
-Cancel recording:
+Cancel a dictation:
 .PP
 .RS
 .B whisrs cancel

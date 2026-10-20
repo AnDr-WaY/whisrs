@@ -17,6 +17,8 @@ use crate::pipeline::{
     process_recording_batch, run_streaming_pipeline, save_history_entry, DictationOutcome,
     StreamingPipelineParams,
 };
+#[cfg(feature = "recording")]
+use crate::recording::{refuse_while_recording, DictationStart};
 
 pub(crate) async fn handle_toggle(
     daemon_state: Arc<Mutex<DaemonState>>,
@@ -28,12 +30,20 @@ pub(crate) async fn handle_toggle(
 
     match current_state {
         State::Idle => {
+            // Refused first while a recording is in progress: no capture, no state
+            // change, no start cue. The stop arm below is never refused. A
+            // build without the recording feature has no recordings to wait for.
+            #[cfg(feature = "recording")]
+            if let Some(refused) = refuse_while_recording(&context, DictationStart::Dictation) {
+                return refused;
+            }
+
             // Fail fast on a bad `-l` override before any capture or state
             // transition — otherwise the user records a whole session and
             // only finds out when the backend rejects the language.
             let language = match validate_toggle_language(language) {
                 Ok(lang) => lang,
-                Err(response) => return response,
+                Err(message) => return Response::Error { message },
             };
 
             // Resolve the session language once: per-toggle override, else
@@ -150,7 +160,7 @@ pub(crate) async fn handle_toggle(
                         feedback::play_start(context.config.general.audio_feedback_volume);
                     }
                     if context.notify_state() {
-                        send_notification("whisrs", "Recording...");
+                        send_notification("whisrs", "Dictating...");
                     }
                     Response::Ok { state: new_state }
                 }
@@ -388,7 +398,7 @@ pub(crate) async fn handle_cancel(
             }
             info!("cancelled recording");
             if context.notify_state() {
-                send_notification("whisrs", "Recording cancelled");
+                send_notification("whisrs", "Dictation cancelled");
             }
             Response::Ok { state: new_state }
         }
@@ -483,19 +493,19 @@ fn resolve_language(override_lang: Option<String>, default_lang: &str) -> String
 
 /// Validate a per-toggle language override before recording starts.
 ///
-/// Returns the normalized override on success, or the error `Response` to
+/// Returns the normalized override on success, or the error message to
 /// send back to the CLI. Called on the start-press before any capture or
 /// state transition so a bad `-l` value (e.g. `english`) is rejected up
 /// front instead of failing a whole session at transcription time. The
 /// config default (`general.language`) is deliberately not validated.
-fn validate_toggle_language(language: Option<String>) -> Result<Option<String>, Response> {
+fn validate_toggle_language(language: Option<String>) -> Result<Option<String>, String> {
     match language {
         None => Ok(None),
         Some(lang) => match validate_language_override(&lang) {
             Ok(normalized) => Ok(Some(normalized)),
             Err(message) => {
                 warn!("rejected language override: {message}");
-                Err(Response::Error { message })
+                Err(message)
             }
         },
     }
@@ -523,8 +533,8 @@ mod tests {
     fn start_press_rejects_invalid_language_override_before_recording() {
         let ds = DaemonState::new();
 
-        let response = validate_toggle_language(Some("english".to_string())).unwrap_err();
-        assert!(matches!(response, Response::Error { .. }));
+        let message = validate_toggle_language(Some("english".to_string())).unwrap_err();
+        assert!(message.starts_with("invalid language"), "{message}");
 
         // handle_toggle returns that response without touching the state
         // machine — the daemon stays idle and no capture is started.

@@ -1101,6 +1101,7 @@ mod stream_lifecycle_tests {
             model: "gpt-4o-mini-transcribe".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         }
     }
 

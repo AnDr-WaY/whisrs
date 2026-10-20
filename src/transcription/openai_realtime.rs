@@ -142,6 +142,20 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
     fn sends_prompt(&self, config: &TranscriptionConfig) -> bool {
         openai_model_supports_prompt(&config.model)
     }
+
+    // Live-only: a recording needs a batch backend.
+    async fn transcribe_segments(
+        &self,
+        _audio: &[u8],
+        _config: &TranscriptionConfig,
+    ) -> anyhow::Result<super::Transcript> {
+        Err(super::live_only_error("openai-realtime"))
+    }
+
+    // Never chunked: `transcribe_segments` always errors.
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +168,7 @@ mod tests {
             model: model.to_string(),
             prompt: Some("Hyprland, whisrs".to_string()),
             keyterms: Vec::new(),
+            diarize: false,
         }
     }
 

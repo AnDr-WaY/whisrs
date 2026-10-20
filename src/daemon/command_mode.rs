@@ -21,6 +21,8 @@ use crate::pipeline::{
     format_api_error, format_no_microphone_error, save_history_entry, transcribe_batch_audio,
     BatchOptions,
 };
+#[cfg(feature = "recording")]
+use crate::recording::{refuse_while_recording, DictationStart};
 use crate::selection::{acquire_selected_text, capture_selection};
 
 /// History `backend` tag for a command-mode result, alongside the `llm:<name>`
@@ -150,7 +152,7 @@ pub(crate) async fn handle_command_mode(
             };
             if !is_command_mode {
                 return Response::Error {
-                    message: "recording is active but not in command mode — use toggle or cancel"
+                    message: "a dictation is active but not in command mode: use toggle or cancel"
                         .to_string(),
                 };
             }
@@ -166,7 +168,12 @@ pub(crate) async fn handle_command_mode(
             }
         }
         State::Idle => {
-            // First press: copy selection and start recording.
+            // First press: copy selection and start recording. A recording
+            // in progress refuses it before the selection is copied.
+            #[cfg(feature = "recording")]
+            if let Some(refused) = refuse_while_recording(&context, DictationStart::CommandMode) {
+                return refused;
+            }
             command_mode_start(daemon_state, context).await
         }
         State::Transcribing => Response::Error {
@@ -563,7 +570,7 @@ pub(crate) async fn handle_llm_command(
             };
             if !is_llm_command {
                 return Response::Error {
-                    message: "recording is active but not for an llm-command — use toggle, \
+                    message: "a dictation is active but not for an llm-command: use toggle, \
                               command, or cancel"
                         .to_string(),
                 };
@@ -586,7 +593,17 @@ pub(crate) async fn handle_llm_command(
                 .find(|e| e.name == name)
                 .cloned();
             match entry {
-                Some(entry) => llm_command_start(daemon_state, context, entry).await,
+                // After the lookup, so a misspelled name still gets the
+                // config error rather than the recording's.
+                Some(entry) => {
+                    #[cfg(feature = "recording")]
+                    if let Some(refused) =
+                        refuse_while_recording(&context, DictationStart::LlmCommand(&name))
+                    {
+                        return refused;
+                    }
+                    llm_command_start(daemon_state, context, entry).await
+                }
                 None => Response::Error {
                     message: format!("no llm_commands entry named '{name}' — check config.toml"),
                 },
@@ -760,7 +777,7 @@ async fn llm_command_start(
     if context.notify_state() {
         send_notification(
             "whisrs",
-            &format!("Recording for '{}'... (press again to stop)", entry.name),
+            &format!("Listening for '{}'... (press again to stop)", entry.name),
         );
     }
 

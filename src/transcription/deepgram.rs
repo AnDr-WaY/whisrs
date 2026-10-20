@@ -1,7 +1,8 @@
 //! Deepgram transcription backend (REST + streaming WebSocket).
 //!
 //! Supports two modes:
-//! - **REST**: POST WAV audio to `/v1/listen` (non-streaming, simple).
+//! - **REST**: POST WAV audio (FLAC for recording chunks) to `/v1/listen`
+//!   (non-streaming, simple).
 //! - **Streaming**: WebSocket to `wss://api.deepgram.com/v1/listen` with raw
 //!   PCM binary frames and real-time transcription results.
 
@@ -14,7 +15,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioChunk;
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::flac::{recording_upload, UploadFormat};
+use super::{secs_to_ms, Segment, Transcript, TranscriptionBackend, TranscriptionConfig, Word};
 
 /// Deepgram REST API endpoint for pre-recorded audio.
 const DEEPGRAM_REST_URL: &str = "https://api.deepgram.com/v1/listen";
@@ -216,6 +218,30 @@ pub(crate) fn supports_keyterm(model: &str) -> bool {
     model.starts_with("nova-3") || model.starts_with("flux")
 }
 
+/// Whether `model` can tell speakers apart. Deepgram diarizes with every
+/// Nova batch model (Nova-1, 2 and 3) and with enhanced and base, but not
+/// with the Whisper models it hosts.
+pub fn supports_diarization(model: &str) -> bool {
+    !model.starts_with("whisper")
+}
+
+/// Whether `err` is Deepgram refusing a request for its speakers: a 400
+/// whose message is about diarization (an account or model that cannot
+/// have it). The same audio goes through without them.
+pub fn refused_diarization(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let text = cause.to_string();
+        text.starts_with("Deepgram API error (400") && text.to_lowercase().contains("diariz")
+    })
+}
+
+/// The diarization model a recording asks for (`diarize_model`): the newest
+/// batch diarizer (v2 since 2026-05-13).
+pub const DIARIZE_MODEL: &str = "latest";
+
+/// What `recording.json` records as `diarization` for Deepgram.
+pub const DIARIZATION_LABEL: &str = "deepgram:latest";
+
 /// What to log when the configured model cannot take the vocabulary at all, or
 /// `None` when there is nothing to report.
 ///
@@ -328,10 +354,13 @@ struct StreamingChannel {
 
 /// Deepgram REST transcription backend.
 ///
-/// Sends the full WAV file to `/v1/listen` and returns the complete transcript.
+/// Sends the full WAV file (FLAC for a recording chunk) to `/v1/listen` and
+/// returns the complete transcript.
 pub struct DeepgramRestBackend {
     client: reqwest::Client,
     api_key: String,
+    /// [`DEEPGRAM_REST_URL`]; tests point it at a local server.
+    url: String,
 }
 
 impl DeepgramRestBackend {
@@ -339,8 +368,219 @@ impl DeepgramRestBackend {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            url: rest_url(),
         }
     }
+
+    /// A backend that posts to `url` instead of Deepgram: a local stand-in
+    /// for tests.
+    #[cfg(test)]
+    pub(crate) fn with_url(api_key: String, url: String) -> Self {
+        Self {
+            url,
+            ..Self::new(api_key)
+        }
+    }
+
+    /// POST `audio`, in `format`, to `/v1/listen` with the common params plus
+    /// `extra`, and return the raw success body.
+    async fn post(
+        &self,
+        audio: &[u8],
+        format: UploadFormat,
+        config: &TranscriptionConfig,
+        extra: &[(&str, &str)],
+    ) -> anyhow::Result<String> {
+        let api_key = resolve_api_key(&self.api_key)?;
+        let params = build_query_params(config, extra);
+
+        let response = self
+            .client
+            .post(&self.url)
+            .header("Authorization", format!("Token {api_key}"))
+            .header("Content-Type", format.mime)
+            .query(&params)
+            .body(audio.to_vec())
+            .send()
+            .await?;
+
+        let status = response.status();
+        let retry_after = super::retry_after_header(response.headers());
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            let code = status.as_u16();
+            let message = match serde_json::from_str::<DeepgramErrorResponse>(&body) {
+                Ok(err_resp) => match code {
+                    401 | 403 => format!("Deepgram API: invalid API key: {}", err_resp.err_msg),
+                    429 => format!("Deepgram API: rate limited: {}", err_resp.err_msg),
+                    _ => format!(
+                        "Deepgram API error ({code} {}): {}",
+                        err_resp.err_code, err_resp.err_msg
+                    ),
+                },
+                Err(_) => format!("Deepgram API error ({code}): {body}"),
+            };
+            return Err(super::http_error(code, retry_after, message));
+        }
+        Ok(body)
+    }
+}
+
+/// [`DEEPGRAM_REST_URL`], or in a debug build `WHISRS_DEBUG_DEEPGRAM_URL`
+/// when it is set: a local stand-in for end-to-end tests of a daemon built
+/// from source. A release build never reads it.
+fn rest_url() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(url) = std::env::var("WHISRS_DEBUG_DEEPGRAM_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+    {
+        warn!("posting Deepgram requests to {url} (WHISRS_DEBUG_DEEPGRAM_URL)");
+        return url;
+    }
+    DEEPGRAM_REST_URL.to_string()
+}
+
+/// Extra query params for a recording request: `utterances=true` makes Deepgram
+/// group words into timed utterances at pauses.
+const SEGMENT_QUERY_EXTRA: &[(&str, &str)] = &[("utterances", "true")];
+
+/// [`SEGMENT_QUERY_EXTRA`] for a track whose voices Deepgram tells apart:
+/// `diarize_model` both turns diarization on and picks the model, and every
+/// word and utterance comes back with a `speaker`. Never `diarize=true`
+/// beside it: Deepgram rejects a request with both.
+const SEGMENT_QUERY_DIARIZED: &[(&str, &str)] =
+    &[("utterances", "true"), ("diarize_model", DIARIZE_MODEL)];
+
+/// The extra query params of a recording request: with speakers when the
+/// request asks for them ([`TranscriptionConfig::diarize`]) and the model
+/// can tell them apart.
+fn segment_query_extra(config: &TranscriptionConfig) -> &'static [(&'static str, &'static str)] {
+    if config.diarize && supports_diarization(&config.model) {
+        SEGMENT_QUERY_DIARIZED
+    } else {
+        SEGMENT_QUERY_EXTRA
+    }
+}
+
+/// Longest chunk sent to Deepgram in one request. Pre-recorded audio has no
+/// small upload cap, so an hour (~115 MB of WAV) keeps requests few while
+/// bounding how much one failed request costs.
+const DEEPGRAM_CHUNK_SECS: u32 = 3600;
+
+#[derive(Debug, Deserialize)]
+struct UtteranceResponse {
+    results: UtteranceResults,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceResults {
+    #[serde(default)]
+    utterances: Option<Vec<Utterance>>,
+    #[serde(default)]
+    channels: Vec<UtteranceChannel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceChannel {
+    #[serde(default)]
+    alternatives: Vec<UtteranceAlternative>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceAlternative {
+    #[serde(default)]
+    transcript: String,
+    #[serde(default)]
+    words: Vec<UtteranceWord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Utterance {
+    start: f64,
+    end: f64,
+    #[serde(default)]
+    transcript: String,
+    #[serde(default)]
+    speaker: Option<u32>,
+    #[serde(default)]
+    words: Vec<UtteranceWord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceWord {
+    word: String,
+    #[serde(default)]
+    punctuated_word: Option<String>,
+    start: f64,
+    end: f64,
+    #[serde(default)]
+    speaker: Option<u32>,
+}
+
+impl UtteranceWord {
+    fn to_word(&self) -> Word {
+        Word {
+            start_ms: secs_to_ms(self.start),
+            end_ms: secs_to_ms(self.end),
+            text: self
+                .punctuated_word
+                .clone()
+                .unwrap_or_else(|| self.word.clone()),
+            speaker: self.speaker.map(|s| s.to_string()),
+        }
+    }
+}
+
+/// Parse a `/v1/listen?utterances=true` body into timed segments.
+///
+/// One segment per utterance with its words. Without an `utterances` array
+/// (a request that did not ask for them), the first channel's transcript
+/// becomes one segment spanning its words. With diarization every word and
+/// utterance carries Deepgram's `speaker` number (per request), kept as its
+/// decimal string.
+pub fn parse_utterances(body: &str) -> anyhow::Result<Transcript> {
+    let parsed: UtteranceResponse = serde_json::from_str(body)?;
+    let words_of = |words: &[UtteranceWord]| -> Option<Vec<Word>> {
+        (!words.is_empty()).then(|| words.iter().map(UtteranceWord::to_word).collect())
+    };
+
+    let segments = match parsed.results.utterances {
+        Some(utterances) => utterances
+            .iter()
+            .filter(|u| !u.transcript.trim().is_empty())
+            .map(|u| {
+                let start_ms = secs_to_ms(u.start);
+                Segment {
+                    start_ms,
+                    end_ms: secs_to_ms(u.end).max(start_ms),
+                    text: u.transcript.trim().to_string(),
+                    speaker: u.speaker.map(|s| s.to_string()),
+                    words: words_of(&u.words),
+                }
+            })
+            .collect(),
+        None => parsed
+            .results
+            .channels
+            .first()
+            .and_then(|ch| ch.alternatives.first())
+            .filter(|alt| !alt.transcript.trim().is_empty())
+            .map(|alt| {
+                let start_ms = alt.words.first().map_or(0, |w| secs_to_ms(w.start));
+                let end_ms = alt.words.last().map_or(start_ms, |w| secs_to_ms(w.end));
+                vec![Segment {
+                    start_ms,
+                    end_ms,
+                    text: alt.transcript.trim().to_string(),
+                    speaker: None,
+                    words: words_of(&alt.words),
+                }]
+            })
+            .unwrap_or_default(),
+    };
+    Ok(Transcript { segments })
 }
 
 #[async_trait]
@@ -354,8 +594,6 @@ impl TranscriptionBackend for DeepgramRestBackend {
             anyhow::bail!("cannot transcribe empty audio");
         }
 
-        let api_key = resolve_api_key(&self.api_key)?;
-
         debug!(
             "sending {} bytes to Deepgram REST API (model={}, language={})",
             audio.len(),
@@ -363,40 +601,7 @@ impl TranscriptionBackend for DeepgramRestBackend {
             config.language
         );
 
-        let params = build_query_params(config, &[]);
-
-        let response = self
-            .client
-            .post(DEEPGRAM_REST_URL)
-            .header("Authorization", format!("Token {api_key}"))
-            .header("Content-Type", "audio/wav")
-            .query(&params)
-            .body(audio.to_vec())
-            .send()
-            .await?;
-
-        let status = response.status();
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            if let Ok(err_resp) = serde_json::from_str::<DeepgramErrorResponse>(&body) {
-                match status.as_u16() {
-                    401 | 403 => {
-                        anyhow::bail!("Deepgram API: invalid API key — {}", err_resp.err_msg)
-                    }
-                    429 => {
-                        anyhow::bail!("Deepgram API: rate limited — {}", err_resp.err_msg)
-                    }
-                    _ => anyhow::bail!(
-                        "Deepgram API error ({} {}): {}",
-                        status.as_u16(),
-                        err_resp.err_code,
-                        err_resp.err_msg
-                    ),
-                }
-            }
-            anyhow::bail!("Deepgram API error ({}): {}", status.as_u16(), body);
-        }
+        let body = self.post(audio, UploadFormat::WAV, config, &[]).await?;
 
         let parsed: DeepgramResponse = serde_json::from_str(&body)?;
         let text = parsed
@@ -420,6 +625,38 @@ impl TranscriptionBackend for DeepgramRestBackend {
     // Deepgram has no prompt field; vocabulary rides as `keyterm` params.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
+    }
+
+    // Native timestamps via `utterances=true`, and speakers via
+    // `diarize_model` when the request asks for them. The chunk goes up as
+    // FLAC.
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        if audio.is_empty() {
+            anyhow::bail!("cannot transcribe empty audio");
+        }
+        let upload = recording_upload(audio).await;
+        let extra = segment_query_extra(config);
+        debug!(
+            "sending {} bytes ({}, WAV was {}) to Deepgram REST API for utterances \
+             (model={}, speakers={})",
+            upload.bytes.len(),
+            upload.format.mime,
+            audio.len(),
+            config.model,
+            extra == SEGMENT_QUERY_DIARIZED
+        );
+        let body = self
+            .post(&upload.bytes, upload.format, config, extra)
+            .await?;
+        parse_utterances(&body)
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(DEEPGRAM_CHUNK_SECS)
     }
 }
 
@@ -620,11 +857,29 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
     }
+
+    // A recording has no use for the live socket: same key and model,
+    // sent to the REST endpoint.
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        DeepgramRestBackend::new(self.api_key.clone())
+            .transcribe_segments(audio, config)
+            .await
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(DEEPGRAM_CHUNK_SECS)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcription::retry::{retry_transient, RATE_LIMIT_BUDGET};
+    use crate::transcription::test_server::{serve_once, serve_responses};
 
     #[test]
     fn deepgram_backends_never_send_the_prompt() {
@@ -633,6 +888,7 @@ mod tests {
             model: "nova-3".to_string(),
             prompt: Some("Hyprland, whisrs".to_string()),
             keyterms: Vec::new(),
+            diarize: false,
         };
 
         assert!(!DeepgramRestBackend::new(String::new()).sends_prompt(&request));
@@ -747,6 +1003,7 @@ mod tests {
             model: model.to_string(),
             prompt: None,
             keyterms: keyterms.iter().map(|t| t.to_string()).collect(),
+            diarize: false,
         }
     }
 
@@ -757,6 +1014,7 @@ mod tests {
             model: model.to_string(),
             prompt: None,
             keyterms: keyterms.to_vec(),
+            diarize: false,
         }
     }
 
@@ -1137,5 +1395,305 @@ mod tests {
             query.contains("model=nova-3"),
             "the fixed params must survive encoding: {query}"
         );
+    }
+
+    /// Trimmed from a real nova-3 `/v1/listen?utterances=true&smart_format=true`
+    /// response.
+    const UTTERANCES_BODY: &str = r#"{
+        "metadata": {"request_id": "x", "duration": 9.5, "channels": 1},
+        "results": {
+            "channels": [{"alternatives": [{"transcript": "Hi team. Let's start.", "confidence": 0.99,
+                "words": []}]}],
+            "utterances": [
+                {"start": 0.32, "end": 1.1, "confidence": 0.98, "channel": 0,
+                 "transcript": "Hi team.", "id": "a",
+                 "words": [
+                    {"word": "hi", "start": 0.32, "end": 0.6, "confidence": 0.9, "punctuated_word": "Hi"},
+                    {"word": "team", "start": 0.6, "end": 1.1, "confidence": 0.9, "punctuated_word": "team."}
+                 ]},
+                {"start": 4.0, "end": 5.25, "confidence": 0.97, "channel": 0,
+                 "transcript": "Let's start.", "id": "b", "speaker": 1,
+                 "words": [
+                    {"word": "let's", "start": 4.0, "end": 4.6, "confidence": 0.9, "punctuated_word": "Let's", "speaker": 1},
+                    {"word": "start", "start": 4.6, "end": 5.25, "confidence": 0.9, "punctuated_word": "start.", "speaker": 1}
+                 ]},
+                {"start": 7.0, "end": 7.2, "confidence": 0.1, "channel": 0,
+                 "transcript": "", "id": "c", "words": []}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn parse_utterances_into_segments() {
+        let t = parse_utterances(UTTERANCES_BODY).unwrap();
+        assert_eq!(t.segments.len(), 2, "blank utterances are dropped");
+        assert_eq!((t.segments[0].start_ms, t.segments[0].end_ms), (320, 1100));
+        assert_eq!(t.segments[0].text, "Hi team.");
+        let words = t.segments[0].words.as_ref().unwrap();
+        assert_eq!(words[1].text, "team.", "punctuated_word wins");
+        assert_eq!(t.segments[1].speaker.as_deref(), Some("1"));
+        assert_eq!(t.segments[1].start_ms, 4000);
+    }
+
+    #[test]
+    fn parse_utterances_without_utterances_uses_the_channel() {
+        let body = r#"{"results": {"channels": [{"alternatives": [{"transcript": "hello",
+            "words": [{"word": "hello", "start": 1.5, "end": 2.0}]}]}]}}"#;
+        let t = parse_utterances(body).unwrap();
+        assert_eq!(t.segments.len(), 1);
+        assert_eq!((t.segments[0].start_ms, t.segments[0].end_ms), (1500, 2000));
+
+        let silent = r#"{"results": {"channels": [{"alternatives": [{"transcript": ""}]}]}}"#;
+        assert!(parse_utterances(silent).unwrap().segments.is_empty());
+    }
+
+    #[test]
+    fn segment_query_asks_for_utterances_and_keeps_keyterms() {
+        let config = query_config("nova-3", &["whisrs"]);
+        let params = build_query_params(&config, SEGMENT_QUERY_EXTRA);
+        assert!(params.contains(&("utterances", "true")));
+        assert!(params.contains(&("smart_format", "true")));
+        assert_eq!(keyterm_values(&params), ["whisrs"]);
+        // Dictation's params stay without it.
+        assert!(!build_query_params(&config, &[]).contains(&("utterances", "true")));
+    }
+
+    /// A backend that posts to the local server on `listener`.
+    fn local_backend(listener: &tokio::net::TcpListener) -> DeepgramRestBackend {
+        DeepgramRestBackend::with_url(
+            "test-key".to_string(),
+            format!("http://{}/v1/listen", listener.local_addr().unwrap()),
+        )
+    }
+
+    fn diarized(model: &str) -> TranscriptionConfig {
+        TranscriptionConfig {
+            diarize: true,
+            ..query_config(model, &[])
+        }
+    }
+
+    /// A recording request that asks for speakers carries
+    /// `diarize_model=latest` and never `diarize=true` (Deepgram rejects
+    /// both together). One that does not ask, a Whisper model (Deepgram
+    /// cannot diarize with it), and the params dictation and the live
+    /// socket build (`build_query_params` without the recording extras)
+    /// carry neither.
+    #[test]
+    fn only_a_recording_request_for_speakers_asks_for_them() {
+        let diarize_params = |params: &[(&str, &str)]| -> Vec<(String, String)> {
+            params
+                .iter()
+                .filter(|(k, _)| k.starts_with("diarize"))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let config = diarized("nova-3");
+        let params = build_query_params(&config, segment_query_extra(&config));
+        assert_eq!(
+            diarize_params(&params),
+            [("diarize_model".to_string(), "latest".to_string())]
+        );
+        assert!(params.contains(&("utterances", "true")));
+
+        let plain = query_config("nova-3", &[]);
+        let params = build_query_params(&plain, segment_query_extra(&plain));
+        assert!(diarize_params(&params).is_empty());
+        let whisper = diarized("whisper-large");
+        assert!(
+            diarize_params(&build_query_params(&whisper, segment_query_extra(&whisper))).is_empty()
+        );
+        // Dictation REST and the WebSocket add their own extras to these.
+        assert!(diarize_params(&build_query_params(&config, &[])).is_empty());
+        assert!(supports_diarization("nova-2-meeting"));
+        assert!(supports_diarization("base"));
+        assert!(!supports_diarization("whisper-medium"));
+    }
+
+    /// A pre-recorded response with diarization, in the shape of
+    /// Deepgram's documentation: `speaker` and `speaker_confidence` on
+    /// every word, `speaker` on every utterance.
+    const DIARIZED_BODY: &str = r#"{
+        "metadata": {"request_id": "test", "duration": 2.6, "channels": 1},
+        "results": {
+            "channels": [{"alternatives": [{
+                "transcript": "hello there how are you fine thanks",
+                "confidence": 0.98,
+                "words": [
+                    {"word": "hello", "start": 0.3, "end": 0.6, "confidence": 0.99,
+                     "speaker": 0, "speaker_confidence": 0.91, "punctuated_word": "Hello"},
+                    {"word": "there", "start": 0.6, "end": 1.0, "confidence": 0.99,
+                     "speaker": 0, "speaker_confidence": 0.9, "punctuated_word": "there."}
+                ]
+            }]}],
+            "utterances": [
+                {"start": 0.3, "end": 1.0, "confidence": 0.99, "channel": 0,
+                 "transcript": "Hello there.", "speaker": 0, "id": "u1",
+                 "words": [
+                    {"word": "hello", "start": 0.3, "end": 0.6, "confidence": 0.99,
+                     "speaker": 0, "speaker_confidence": 0.91, "punctuated_word": "Hello"},
+                    {"word": "there", "start": 0.6, "end": 1.0, "confidence": 0.99,
+                     "speaker": 0, "speaker_confidence": 0.9, "punctuated_word": "there."}
+                 ]},
+                {"start": 1.1, "end": 1.8, "confidence": 0.97, "channel": 0,
+                 "transcript": "How are you?", "speaker": 1, "id": "u2",
+                 "words": [
+                    {"word": "how", "start": 1.1, "end": 1.3, "confidence": 0.98,
+                     "speaker": 1, "speaker_confidence": 0.8, "punctuated_word": "How"},
+                    {"word": "are", "start": 1.3, "end": 1.5, "confidence": 0.98,
+                     "speaker": 1, "speaker_confidence": 0.8, "punctuated_word": "are"},
+                    {"word": "you", "start": 1.5, "end": 1.8, "confidence": 0.98,
+                     "speaker": 1, "speaker_confidence": 0.8, "punctuated_word": "you?"}
+                 ]},
+                {"start": 1.9, "end": 2.4, "confidence": 0.96, "channel": 0,
+                 "transcript": "Fine, thanks.", "speaker": 0, "id": "u3",
+                 "words": [
+                    {"word": "fine", "start": 1.9, "end": 2.1, "confidence": 0.97,
+                     "speaker": 0, "speaker_confidence": 0.85, "punctuated_word": "Fine,"},
+                    {"word": "thanks", "start": 2.1, "end": 2.4, "confidence": 0.97,
+                     "speaker": 0, "speaker_confidence": 0.85, "punctuated_word": "thanks."}
+                 ]}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn diarized_utterances_keep_their_speakers() {
+        let t = parse_utterances(DIARIZED_BODY).unwrap();
+        let lines: Vec<(u64, u64, &str, Option<&str>)> = t
+            .segments
+            .iter()
+            .map(|s| (s.start_ms, s.end_ms, s.text.as_str(), s.speaker.as_deref()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (300, 1000, "Hello there.", Some("0")),
+                (1100, 1800, "How are you?", Some("1")),
+                (1900, 2400, "Fine, thanks.", Some("0")),
+            ]
+        );
+        let words: Vec<(&str, Option<&str>)> = t.segments[1]
+            .words
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|w| (w.text.as_str(), w.speaker.as_deref()))
+            .collect();
+        assert_eq!(
+            words,
+            [("How", Some("1")), ("are", Some("1")), ("you?", Some("1"))]
+        );
+    }
+
+    /// On the wire: the recording request asks for speakers, dictation's
+    /// request with the same config does not.
+    #[tokio::test]
+    async fn the_wire_asks_for_speakers_only_on_recording_requests() {
+        let config = diarized("nova-3");
+        let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
+        let request_line = |request: &crate::transcription::test_server::Request| {
+            request.head.lines().next().unwrap().to_string()
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(listener, DIARIZED_BODY));
+        let t = backend.transcribe_segments(&wav, &config).await.unwrap();
+        assert_eq!(t.segments[1].speaker.as_deref(), Some("1"));
+        let line = request_line(&server.await.unwrap());
+        assert!(line.contains("&diarize_model=latest"), "{line}");
+        assert!(!line.contains("diarize=true"), "{line}");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"results": {"channels": [{"alternatives": [{"transcript": "hi"}]}]}}"#,
+        ));
+        assert_eq!(backend.transcribe(&wav, &config).await.unwrap(), "hi");
+        let line = request_line(&server.await.unwrap());
+        assert!(!line.contains("diarize"), "{line}");
+    }
+
+    /// 1.25 s of a 16 kHz tone: the samples, and the WAV that holds them.
+    fn tone_wav() -> (Vec<i16>, Vec<u8>) {
+        let samples: Vec<i16> = (0..20_000)
+            .map(|i| ((i as f64 * 0.17).sin() * 6000.0) as i16)
+            .collect();
+        let wav = crate::audio::wav::encode_wav(&samples).unwrap();
+        (samples, wav)
+    }
+
+    // FLAC needs the encoder, which comes with the recording feature.
+    #[cfg(feature = "recording")]
+    #[tokio::test]
+    async fn recording_chunks_upload_as_flac() {
+        let config = query_config("nova-3", &[]);
+        let (samples, wav) = tone_wav();
+
+        // The streaming backend hands recordings to this REST path in one line.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"results": {"utterances": [{"start": 0.0, "end": 1.0, "transcript": "hi"}]}}"#,
+        ));
+        let t = backend.transcribe_segments(&wav, &config).await.unwrap();
+        assert_eq!(t.segments.len(), 1);
+        let request = server.await.unwrap();
+        assert_eq!(request.header("content-type"), Some("audio/flac"));
+        assert!(request.body.starts_with(b"fLaC"));
+        // Lossless: the body decodes to the samples the WAV held.
+        let decoded: Vec<i16> = claxon::FlacReader::new(&request.body[..])
+            .unwrap()
+            .samples()
+            .map(|s| s.unwrap() as i16)
+            .collect();
+        assert_eq!(decoded, samples);
+    }
+
+    #[tokio::test]
+    async fn dictation_uploads_as_wav() {
+        let config = query_config("nova-3", &[]);
+        let (_, wav) = tone_wav();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"results": {"channels": [{"alternatives": [{"transcript": "hi"}]}]}}"#,
+        ));
+        assert_eq!(backend.transcribe(&wav, &config).await.unwrap(), "hi");
+        let request = server.await.unwrap();
+        assert_eq!(request.header("content-type"), Some("audio/wav"));
+        assert_eq!(request.body, wav);
+    }
+    /// A Cloudflare origin timeout (524) on a recording chunk is retried on the
+    /// server-error schedule, here with short stand-ins for its waits.
+    #[tokio::test]
+    async fn a_524_is_retried_until_the_chunk_goes_through() {
+        let config = query_config("nova-3", &[]);
+        let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![
+                (524, "error code: 524"),
+                (
+                    200,
+                    r#"{"results": {"utterances": [{"start": 0.0, "end": 1.0, "transcript": "hi"}]}}"#,
+                ),
+            ],
+        ));
+        let quick = [std::time::Duration::from_millis(1); 3];
+        let t = retry_transient(RATE_LIMIT_BUDGET, &quick, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap();
+        assert_eq!(t.segments[0].text, "hi");
+        assert_eq!(server.await.unwrap().len(), 2);
     }
 }

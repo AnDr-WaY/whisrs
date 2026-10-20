@@ -6,7 +6,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::hotkey;
+use crate::ipc::validate_language_override;
 use crate::llm;
+use crate::recording::TrackKind;
 use crate::transcription::deepgram;
 use crate::transcription::openai_realtime_protocol::{
     openai_model_supports_languages, openai_model_supports_prompt, OpenAiRealtimeProfile,
@@ -63,24 +65,190 @@ pub struct Config {
     #[serde(default)]
     pub llm_commands: Vec<llm::LlmCommandConfig>,
     /// Word/phrase replacements applied to every dictation before it is
-    /// typed: `"package build" = "PKGBUILD"`. Matching rules are in
+    /// typed, and to every line of a recording's transcript:
+    /// `"package build" = "PKGBUILD"`. Matching rules are in
     /// [`crate::replacements`]. Empty by default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub replacements: BTreeMap<String, String>,
+    /// The recording feature: record mic + system audio, then transcribe it.
+    #[serde(default)]
+    pub recording: Option<RecordingConfig>,
+}
+
+/// Recording feature configuration (`[recording]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordingConfig {
+    /// Transcription backend for recordings. `None` uses `general.backend`.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Name used for the "me" speaker. `None` uses the passwd full name, else `$USER`.
+    #[serde(default)]
+    pub user_name: Option<String>,
+    /// Language of both tracks. `None` uses `[general] language`.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Language of the mic track. `None` uses `language`.
+    #[serde(default)]
+    pub mic_language: Option<String>,
+    /// Language of the system track. `None` uses `language`.
+    #[serde(default)]
+    pub system_language: Option<String>,
+    /// Microphone device. `None` uses `[audio] device`.
+    #[serde(default)]
+    pub mic_device: Option<String>,
+    /// System audio source. `None`/`"default"` = default monitor, `"none"` = mic only.
+    #[serde(default)]
+    pub system_device: Option<String>,
+    /// Recording stops automatically after this many minutes.
+    #[serde(default = "default_recording_max_duration_minutes")]
+    pub max_duration_minutes: u32,
+    /// Days to keep audio of processed recordings (0 = delete right away, negative = keep forever).
+    #[serde(default = "default_recording_audio_retention_days")]
+    pub audio_retention_days: i64,
+    /// Recordings directory. `None` = `$XDG_DATA_HOME/whisrs/recordings`.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// How the voices on the system track are told apart.
+    #[serde(default)]
+    pub diarization: DiarizationMode,
+    /// A diarization sidecar: `POST` a track's speech as a WAV, get each
+    /// voice's turns back. Blank is unset.
+    #[serde(default)]
+    pub diarization_url: Option<String>,
+    /// How many voices the diarization sidecar should find on the system
+    /// track (on the mic of a recording without one). 0 lets it decide.
+    #[serde(default)]
+    pub num_speakers: u32,
+    /// Several people share the mic (an in-person meeting): its voices are
+    /// told apart too. `false` makes the whole mic track the user.
+    #[serde(default)]
+    pub shared_mic: bool,
+    /// Ask the `[llm]` who the voices left unnamed are, from excerpts of the
+    /// transcript ([`crate::recording::llm_names`]). Off by default: it
+    /// sends the transcript's words to the LLM.
+    #[serde(default)]
+    pub name_speakers: bool,
+    /// Summarize each transcript with the `[llm]` once it is written, and
+    /// title a recording that has no title of the user's
+    /// ([`crate::recording::summary`]). Off by default: it sends the whole
+    /// transcript to the LLM. `whisrs recording summarize` works either way.
+    #[serde(default)]
+    pub summary: bool,
+    /// What the summary should look like, in place of the default rules
+    /// ([`crate::recording::summary::DEFAULT_RULES`]). Blank is unset.
+    #[serde(default)]
+    pub summary_instruction: Option<String>,
+}
+
+/// `[recording] diarization`: how the voices of a recording are told apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiarizationMode {
+    /// `sidecar` when `diarization_url` is set, else `backend` on Deepgram,
+    /// else `off`.
+    #[default]
+    Auto,
+    /// The transcription backend labels speakers: Deepgram, or an
+    /// `asr-sidecar` that returns `segments[].speaker`.
+    Backend,
+    /// The diarization sidecar at `diarization_url` finds the voices, and
+    /// any backend transcribes the words.
+    Sidecar,
+    /// One speaker per track, as before speakers were separated.
+    Off,
+}
+
+fn default_recording_max_duration_minutes() -> u32 {
+    180
+}
+
+fn default_recording_audio_retention_days() -> i64 {
+    7
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            user_name: None,
+            language: None,
+            mic_language: None,
+            system_language: None,
+            mic_device: None,
+            system_device: None,
+            max_duration_minutes: default_recording_max_duration_minutes(),
+            audio_retention_days: default_recording_audio_retention_days(),
+            dir: None,
+            diarization: DiarizationMode::default(),
+            diarization_url: None,
+            num_speakers: 0,
+            shared_mic: false,
+            name_speakers: false,
+            summary: false,
+            summary_instruction: None,
+        }
+    }
+}
+
+impl RecordingConfig {
+    /// The effective recording config: `[recording]` if present, else defaults.
+    pub fn effective(config: &Config) -> RecordingConfig {
+        config.recording.clone().unwrap_or_default()
+    }
+
+    /// The rules a summary follows: `summary_instruction`, trimmed, else
+    /// the default ones. Blank is unset.
+    #[cfg(feature = "recording")]
+    pub fn summary_rules(&self) -> &str {
+        self.summary_instruction
+            .as_deref()
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+            .unwrap_or(crate::recording::summary::DEFAULT_RULES)
+    }
+
+    /// `diarization_url`, trimmed; blank is unset.
+    pub fn diarization_url(&self) -> Option<&str> {
+        self.diarization_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+    }
+
+    /// The language track `kind` of a recording is transcribed in when the
+    /// recording does not set one (`-l`, `--mic-language`,
+    /// `--system-language`): `mic_language` or `system_language`, else
+    /// `language`, else `general_language` (`[general] language`). A value
+    /// from this section is normalized like `-l`; blank counts as unset.
+    pub fn language_for(&self, kind: TrackKind, general_language: &str) -> String {
+        let own = match kind {
+            TrackKind::Mic => self.mic_language.as_deref(),
+            TrackKind::System => self.system_language.as_deref(),
+        };
+        [own, self.language.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(|l| validate_language_override(l).unwrap_or_else(|_| l.to_string()))
+            .unwrap_or_else(|| general_language.to_string())
+    }
 }
 
 /// Global hotkey configuration — key combos that trigger actions.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HotkeyConfig {
-    /// Hotkey to toggle recording (e.g. "Super+Shift+D").
+    /// Hotkey to toggle dictation (e.g. "Super+Shift+D").
     pub toggle: Option<String>,
-    /// Hotkey to cancel recording (e.g. "Super+Shift+Escape").
+    /// Hotkey to cancel dictation (e.g. "Super+Shift+Escape").
     pub cancel: Option<String>,
     /// Hotkey to start command mode (e.g. "Super+Shift+C").
     pub command: Option<String>,
     /// Hotkey to read the selected text aloud (e.g. "Super+Shift+R").
     #[serde(alias = "read")]
     pub speak: Option<String>,
+    /// Hotkey to start or stop a recording of mic + system audio (e.g. "Super+Shift+M").
+    pub recording: Option<String>,
 }
 
 /// Recording-lifecycle hooks. `media_auto_pause` pauses the MPRIS players
@@ -1497,6 +1665,20 @@ const BACKEND_NAMES: &[BackendName] = &[
     },
 ];
 
+/// Upper bound for `[recording] max_duration_minutes`: 36 hours, under the
+/// ~37 h a 16 kHz mono 16-bit WAV can hold before its u32 size field wraps.
+pub const MAX_RECORDING_DURATION_MINUTES: u32 = 2160;
+
+/// The backends the recording feature can transcribe with, as named in messages.
+#[cfg(feature = "recording")]
+const RECORDING_BATCH_BACKENDS: &str = "groq, openai, deepgram, asr-sidecar, local-whisper";
+
+/// Backends that only stream live audio and cannot transcribe a recording.
+#[cfg(feature = "recording")]
+fn is_realtime_backend(backend: &str) -> bool {
+    matches!(backend, "openai-realtime" | "openai-compatible-realtime")
+}
+
 /// The names of every [`BACKEND_NAMES`] entry of one kind, in order.
 fn backend_names_of(kind: BackendNameKind) -> Vec<&'static str> {
     BACKEND_NAMES
@@ -1948,6 +2130,8 @@ impl Config {
             }
         }
 
+        warnings.extend(self.validate_recording()?);
+
         // Duplicate-binding detection across [hotkeys] and llm_commands. The
         // listener dispatches every action whose binding matches, with no
         // early exit, so a shared combo silently fires multiple commands and
@@ -1961,6 +2145,10 @@ impl Config {
                 ("[hotkeys] cancel", &hotkeys.cancel),
                 ("[hotkeys] command", &hotkeys.command),
                 ("[hotkeys] speak", &hotkeys.speak),
+                // Not bound in a build without the feature, so it collides
+                // with nothing there.
+                #[cfg(feature = "recording")]
+                ("[hotkeys] recording", &hotkeys.recording),
             ] {
                 if let Some(spec) = value {
                     binding_sources.push((label.to_string(), spec.as_str()));
@@ -2029,7 +2217,8 @@ impl Config {
         if let Err(e) = crate::replacements::Replacer::new(&self.replacements) {
             warnings.push(ConfigWarning {
                 message: format!(
-                    "[replacements] could not be compiled, so dictation will fail: {e}"
+                    "[replacements] could not be compiled, so dictation and recording \
+                     transcription will fail: {e}"
                 ),
             });
         }
@@ -2061,6 +2250,302 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Checks for the recording feature (`[recording]` and `[hotkeys] recording`).
+    ///
+    /// Skipped entirely when neither is set: the recording feature is opt-in, so a
+    /// dictation-only config must not get warnings about a feature it never
+    /// uses (an `openai-realtime` dictation user would otherwise be told on
+    /// every start that recordings cannot use their backend). When it is in
+    /// use, only values the user wrote are errors; a problem inherited from
+    /// `[general] backend` is a warning, because dictation with that backend
+    /// is fine and must keep starting. The recording itself then fails at
+    /// processing time with the audio kept for `whisrs recording retry`.
+    #[cfg(feature = "recording")]
+    fn validate_recording(&self) -> Result<Vec<ConfigWarning>, WhisrsError> {
+        let mut warnings = Vec::new();
+        if self.recording.is_none() && !self.recording_hotkey_set() {
+            return Ok(warnings);
+        }
+        let recording = RecordingConfig::effective(self);
+
+        // The WAV header stores the data size as a u32, which caps a 16 kHz
+        // mono 16-bit track at about 37 hours. 2160 minutes (36 h) stays
+        // under that with room to spare.
+        if !(1..=MAX_RECORDING_DURATION_MINUTES).contains(&recording.max_duration_minutes) {
+            return Err(WhisrsError::Config(format!(
+                "[recording] max_duration_minutes = {} is out of range: use 1 to \
+                 {MAX_RECORDING_DURATION_MINUTES} (36 hours, the most a WAV track can hold).",
+                recording.max_duration_minutes
+            )));
+        }
+
+        // The rule `-l` follows; `auto` is valid.
+        for (key, value, fallback) in [
+            ("language", &recording.language, "[general] language"),
+            (
+                "mic_language",
+                &recording.mic_language,
+                "[recording] language",
+            ),
+            (
+                "system_language",
+                &recording.system_language,
+                "[recording] language",
+            ),
+        ] {
+            let Some(value) = value.as_deref() else {
+                continue;
+            };
+            if validate_language_override(value).is_err() {
+                return Err(WhisrsError::Config(format!(
+                    "[recording] {key} = \"{value}\" is not a language. Use an ISO 639 code \
+                     like \"de\", optionally with a region (\"en-US\"), or \"auto\"; or remove \
+                     the key to use {fallback}."
+                )));
+            }
+        }
+
+        match recording.backend.as_deref().map(str::trim) {
+            Some(backend) => {
+                let Some(entry) = BACKEND_NAMES.iter().find(|b| b.name == backend) else {
+                    return Err(WhisrsError::Config(format!(
+                        "[recording] backend = \"{backend}\" is not a backend. Use one of: \
+                         {RECORDING_BATCH_BACKENDS}, or remove the key to use [general] backend."
+                    )));
+                };
+                if entry.kind == BackendNameKind::Stub {
+                    return Err(WhisrsError::Config(format!(
+                        "[recording] backend = \"{backend}\" is not implemented yet. Use one \
+                         of: {RECORDING_BATCH_BACKENDS}."
+                    )));
+                }
+                if is_realtime_backend(backend) {
+                    return Err(WhisrsError::Config(format!(
+                        "[recording] backend = \"{backend}\" cannot transcribe recordings: \
+                         realtime backends only stream live audio, and a recording is \
+                         transcribed from its audio files after it ends. Use a batch backend: \
+                         {RECORDING_BATCH_BACKENDS} (deepgram-streaming also works and uses \
+                         Deepgram's REST API for recordings)."
+                    )));
+                }
+                if let Some(message) = self.recording_backend_credential_gap(backend) {
+                    warnings.push(ConfigWarning { message });
+                }
+            }
+            None => {
+                let backend = self.general.backend.as_str();
+                if is_realtime_backend(backend) {
+                    warnings.push(ConfigWarning {
+                        message: format!(
+                            "The recording feature uses [general] backend = \"{backend}\", \
+                             which cannot transcribe recordings (realtime backends only stream \
+                             live audio). Recordings still capture audio, but processing fails \
+                             until you set [recording] backend to a batch backend: \
+                             {RECORDING_BATCH_BACKENDS}. Failed recordings keep their audio, so \
+                             `whisrs recording retry` works after the fix."
+                        ),
+                    });
+                }
+            }
+        }
+
+        // The diarization sidecar: a URL it can post to, a mode that has
+        // one, and a number of voices in range.
+        if let Some(url) = recording.diarization_url() {
+            let parsed = reqwest::Url::parse(url).map_err(|e| {
+                WhisrsError::Config(format!(
+                    "[recording] diarization_url = \"{url}\" is not a URL: {e}"
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(WhisrsError::Config(format!(
+                    "[recording] diarization_url must use http:// or https://, got {}://",
+                    parsed.scheme()
+                )));
+            }
+        } else if recording.diarization == DiarizationMode::Sidecar {
+            return Err(WhisrsError::Config(
+                "[recording] diarization = \"sidecar\" needs diarization_url: the address of \
+                 the diarization sidecar, e.g. \"http://127.0.0.1:8770/diarize\"."
+                    .to_string(),
+            ));
+        }
+        if recording.num_speakers > crate::recording::NUM_SPEAKERS_MAX {
+            return Err(WhisrsError::Config(format!(
+                "[recording] num_speakers = {} is out of range: use 0 (let the sidecar decide) \
+                 to {}.",
+                recording.num_speakers,
+                crate::recording::NUM_SPEAKERS_MAX
+            )));
+        }
+
+        // Speaker separation by the backend needs a backend that labels
+        // speakers; otherwise each track stays one speaker, as with "off".
+        if recording.diarization == DiarizationMode::Backend {
+            if let Ok(backend) = crate::transcription::factory::recording_backend_name(self) {
+                if crate::recording::speakers::backend_speakers(&backend, self).is_none() {
+                    let deepgram = matches!(
+                        crate::transcription::factory::canonical_backend_name(&backend),
+                        "deepgram" | "deepgram-streaming"
+                    );
+                    let message = if deepgram {
+                        format!(
+                            "[recording] diarization = \"backend\", but [deepgram] model = \
+                             \"{}\" is one of Deepgram's Whisper models, which do not tell \
+                             voices apart, so each track stays one speaker. Use a Nova model, \
+                             or remove the key.",
+                            self.deepgram_model()
+                        )
+                    } else {
+                        format!(
+                            "[recording] diarization = \"backend\", but the {backend} backend \
+                             does not tell voices apart, so each track stays one speaker. Use \
+                             a backend that does, or remove the key."
+                        )
+                    };
+                    warnings.push(ConfigWarning { message });
+                }
+            }
+        }
+
+        // Naming speakers with the LLM needs the LLM.
+        if recording.name_speakers && self.llm.is_none() {
+            warnings.push(ConfigWarning {
+                message: "[recording] name_speakers = true but there is no [llm] section, so \
+                          the LLM names no speakers (each recording notes why). Add [llm] \
+                          api_key, model and api_url, as for command mode, or remove the key."
+                    .to_string(),
+            });
+        }
+
+        // So does summarizing them.
+        if recording.summary && self.llm.is_none() {
+            warnings.push(ConfigWarning {
+                message: "[recording] summary = true but there is no [llm] section, so \
+                          recordings get no summary (each one notes why). Add [llm] api_key, \
+                          model and api_url, as for command mode, or remove the key."
+                    .to_string(),
+            });
+        }
+
+        // Device sanity. Only an explicit system source can be wrong here:
+        // unset or "default" resolves to the default sink's monitor at start.
+        let mic = recording
+            .mic_device
+            .as_deref()
+            .unwrap_or(self.audio.device.as_str())
+            .trim();
+        if let Some(system) = recording.system_device.as_deref().map(str::trim) {
+            let is_preset = system.is_empty() || system == "default" || system == "none";
+            if !is_preset && system == mic {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "[recording] system_device and the recording microphone are both \
+                         \"{system}\": both tracks would record the same source, so every \
+                         line would appear twice. Point system_device at a monitor source \
+                         (or remove it to use the default monitor)."
+                    ),
+                });
+            } else if !is_preset && !system.ends_with(".monitor") {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "[recording] system_device = \"{system}\" does not end in \
+                         \".monitor\", so it is probably a microphone rather than the audio \
+                         you hear. Run `pactl list short sources` to find the monitor of your \
+                         output device, or remove the key to use the default monitor."
+                    ),
+                });
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    /// The check for a build without the `recording` feature: one warning
+    /// when the config asks for recordings anyway, with a `[recording]`
+    /// section that differs from the defaults or a `[hotkeys] recording`
+    /// binding, since this build ignores both. `Config` still parses them,
+    /// so the unknown-key warning stays quiet and this is the only word
+    /// about it. An absent or default section asks for nothing, and no
+    /// value in it is checked: none is used.
+    #[cfg(not(feature = "recording"))]
+    fn validate_recording(&self) -> Result<Vec<ConfigWarning>, WhisrsError> {
+        let section = self
+            .recording
+            .as_ref()
+            .is_some_and(|r| *r != RecordingConfig::default());
+        let ignored = match (section, self.recording_hotkey_set()) {
+            (false, false) => return Ok(Vec::new()),
+            (true, false) => "[recording] is",
+            (false, true) => "[hotkeys] recording is",
+            (true, true) => "[recording] and [hotkeys] recording are",
+        };
+        Ok(vec![ConfigWarning {
+            message: format!(
+                "this whisrs was built without the recording feature, so {ignored} ignored"
+            ),
+        }])
+    }
+
+    /// Whether `[hotkeys] recording` binds a key. Blank is unset.
+    fn recording_hotkey_set(&self) -> bool {
+        self.hotkeys
+            .as_ref()
+            .and_then(|h| h.recording.as_deref())
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Why an explicit `[recording] backend` will fail for lack of credentials,
+    /// if it will. Only checked when it differs from `[general] backend`,
+    /// whose own credentials `validate` already requires.
+    #[cfg(feature = "recording")]
+    fn recording_backend_credential_gap(&self, backend: &str) -> Option<String> {
+        if backend == self.general.backend {
+            return None;
+        }
+        let key_missing = |config_key: Option<&str>, env: &str| {
+            let has_config = config_key.is_some_and(|k| !k.is_empty());
+            let has_env = std::env::var(env).map(|k| !k.is_empty()).unwrap_or(false);
+            !has_config && !has_env
+        };
+        let missing = match backend {
+            "deepgram" | "deepgram-streaming" => key_missing(
+                self.deepgram.as_ref().map(|d| d.api_key.as_str()),
+                "WHISRS_DEEPGRAM_API_KEY",
+            )
+            .then_some("[deepgram] api_key (or WHISRS_DEEPGRAM_API_KEY)"),
+            "groq" => key_missing(
+                self.groq.as_ref().map(|g| g.api_key.as_str()),
+                "WHISRS_GROQ_API_KEY",
+            )
+            .then_some("[groq] api_key (or WHISRS_GROQ_API_KEY)"),
+            "openai" => key_missing(
+                self.openai.as_ref().map(|o| o.api_key.as_str()),
+                "WHISRS_OPENAI_API_KEY",
+            )
+            .then_some("[openai] api_key (or WHISRS_OPENAI_API_KEY)"),
+            "asr-sidecar" | "asr" | "vibevoice" => self
+                .asr_sidecar
+                .as_ref()
+                .is_none_or(|a| a.url.trim().is_empty())
+                .then_some("[asr-sidecar] url"),
+            "local-whisper" | "local" => {
+                let model_path = self
+                    .local_whisper
+                    .as_ref()
+                    .map(|l| l.model_path.clone())
+                    .unwrap_or_else(default_whisper_model_path);
+                (!std::path::Path::new(&model_path).exists())
+                    .then_some("a whisper model file (run 'whisrs setup' to download one)")
+            }
+            _ => None,
+        }?;
+        Some(format!(
+            "[recording] backend = \"{backend}\" needs {missing}; recordings will capture audio \
+             but fail to transcribe until it is set."
+        ))
     }
 
     /// The Deepgram model this config will actually transcribe with.
@@ -2324,8 +2809,8 @@ impl Config {
     /// stop at groq, openai and asr-sidecar. It is a real backend and it does
     /// send the prompt, but the `whisrs-linux-{x86_64,aarch64}-minimal`
     /// release artifacts are built `--no-default-features --features
-    /// tray,overlay,hooks`, and in those binaries the stub that stands in for
-    /// it bails with "local-whisper feature not enabled". Half the artifacts
+    /// tray,overlay,hooks,recording,mcp`, and in those binaries the stub that
+    /// stands in for it bails with "local-whisper feature not enabled". Half the artifacts
     /// this project ships cannot act on that advice, and a warning cannot tell
     /// which binary it is running in. The test helper
     /// `assert_inert_prompt_advice_is_reachable` holds the line, and it bans
@@ -3416,6 +3901,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
         };
         let err = config.validate().unwrap_err();
@@ -3532,6 +4018,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
         };
         let err = config.validate().unwrap_err();
@@ -3564,6 +4051,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
         };
         let result = config.validate();
@@ -3599,6 +4087,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
         };
         let warnings = config.validate().unwrap();
@@ -3642,6 +4131,7 @@ mod tests {
                 hooks: None,
                 llm_commands: Vec::new(),
                 replacements: BTreeMap::new(),
+                recording: None,
                 overlay: None,
             };
             let warnings = config.validate().unwrap();
@@ -3721,6 +4211,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
         }
     }
@@ -3825,7 +4316,7 @@ mod tests {
     /// `local-whisper` is the third name no warning may send the user to, for
     /// a different reason. It is a real backend in the default build, but the
     /// `whisrs-linux-{x86_64,aarch64}-minimal` release artifacts are built
-    /// `--no-default-features --features tray,overlay,hooks` (see
+    /// `--no-default-features --features tray,overlay,hooks,recording,mcp` (see
     /// `.github/workflows/release.yml`), and in those binaries the stub that
     /// stands in for it bails with "local-whisper feature not enabled". Half
     /// the artifacts this project ships cannot act on the advice, and the
@@ -3945,6 +4436,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
         };
 
@@ -4208,6 +4700,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
         };
         let warnings = config.validate().unwrap();
@@ -4265,6 +4758,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4300,6 +4794,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4336,6 +4831,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4372,6 +4868,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4408,6 +4905,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4441,6 +4939,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4516,6 +5015,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4557,6 +5057,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4600,6 +5101,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4668,6 +5170,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         };
@@ -4724,6 +5227,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             replacements: BTreeMap::new(),
+            recording: None,
             overlay: None,
             tts: None,
         }
@@ -4746,6 +5250,7 @@ mod tests {
             cancel: None,
             command: None,
             speak: None,
+            recording: None,
         });
         config
             .llm_commands
@@ -4806,6 +5311,7 @@ mod tests {
             cancel: None,
             command: None,
             speak: Some("Meta+D".to_string()),
+            recording: None,
         });
 
         let warnings = config.validate().unwrap();
@@ -4825,6 +5331,554 @@ mod tests {
         );
     }
 
+    /// The recording checks, in a build with the feature.
+    #[cfg(feature = "recording")]
+    mod recording {
+        use super::*;
+
+        fn recording_config(edit: impl FnOnce(&mut RecordingConfig)) -> Option<RecordingConfig> {
+            let mut recording = RecordingConfig::default();
+            edit(&mut recording);
+            Some(recording)
+        }
+
+        fn recording_warnings(config: &Config) -> Vec<String> {
+            config
+                .validate()
+                .expect("config validates")
+                .into_iter()
+                .map(|w| w.message)
+                // The feature's own warnings, and a collision on its hotkey.
+                .filter(|m| m.contains("[recording]") || m.contains("[hotkeys] recording"))
+                .collect()
+        }
+
+        /// `diarization` defaults to `auto`, takes the four documented values
+        /// as written, and refuses anything else when the file is read.
+        #[test]
+        fn recording_speaker_keys_parse() {
+            let recording = RecordingConfig::default();
+            assert_eq!(recording.diarization, DiarizationMode::Auto);
+            assert!(!recording.shared_mic);
+            for (value, want) in [
+                ("auto", DiarizationMode::Auto),
+                ("backend", DiarizationMode::Backend),
+                ("sidecar", DiarizationMode::Sidecar),
+                ("off", DiarizationMode::Off),
+            ] {
+                let config: Config = toml::from_str(&format!(
+                    "[recording]\ndiarization = \"{value}\"\nshared_mic = true\n"
+                ))
+                .unwrap();
+                let recording = RecordingConfig::effective(&config);
+                assert_eq!(recording.diarization, want, "{value}");
+                assert!(recording.shared_mic);
+            }
+            for bad in ["on", "Backend", ""] {
+                let parsed: Result<Config, _> =
+                    toml::from_str(&format!("[recording]\ndiarization = \"{bad}\"\n"));
+                let err = parsed.expect_err(bad).to_string();
+                assert!(err.contains("diarization"), "{bad}: {err}");
+            }
+            // Known keys: no unknown-key warning.
+            assert!(unknown_config_keys(
+                "[recording]\ndiarization = \"off\"\nshared_mic = true\nnum_speakers = 2\n\
+             diarization_url = \"http://127.0.0.1:8770/diarize\"\n"
+            )
+            .is_empty());
+            assert_eq!(recording.num_speakers, 0);
+            assert_eq!(recording.diarization_url(), None);
+            let blank = RecordingConfig {
+                diarization_url: Some("  ".into()),
+                ..Default::default()
+            };
+            assert_eq!(blank.diarization_url(), None, "blank is unset");
+        }
+
+        /// `name_speakers` is off by default and a known key; turned on
+        /// without an `[llm]` section it warns, since the LLM can name nobody.
+        #[test]
+        fn name_speakers_needs_an_llm() {
+            assert!(!RecordingConfig::default().name_speakers);
+            let text = "[recording]\nname_speakers = true\n";
+            let config: Config = toml::from_str(text).unwrap();
+            assert!(RecordingConfig::effective(&config).name_speakers);
+            assert!(unknown_config_keys(text).is_empty());
+
+            let mut config = validatable_config("groq");
+            config.recording = recording_config(|r| r.name_speakers = true);
+            config.llm = None;
+            let warnings = recording_warnings(&config);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].contains("name_speakers = true but there is no [llm] section"),
+                "{warnings:?}"
+            );
+            config.llm = Some(crate::llm::LlmConfig::default());
+            assert!(recording_warnings(&config).is_empty());
+            config.llm = None;
+            config.recording = recording_config(|r| r.name_speakers = false);
+            assert!(recording_warnings(&config).is_empty());
+        }
+
+        /// `summary` is off by default and a known key, as is
+        /// `summary_instruction`; turned on without an `[llm]` section it warns.
+        /// A blank instruction keeps the default rules.
+        #[test]
+        fn summary_needs_an_llm() {
+            let recording = RecordingConfig::default();
+            assert!(!recording.summary);
+            assert_eq!(
+                recording.summary_rules(),
+                crate::recording::summary::DEFAULT_RULES
+            );
+            let text = "[recording]\nsummary = true\nsummary_instruction = \"  Five bullets.  \"\n";
+            let config: Config = toml::from_str(text).unwrap();
+            let effective = RecordingConfig::effective(&config);
+            assert!(effective.summary);
+            assert_eq!(effective.summary_rules(), "Five bullets.");
+            assert!(unknown_config_keys(text).is_empty());
+            let blank = RecordingConfig {
+                summary_instruction: Some(" \n ".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                blank.summary_rules(),
+                crate::recording::summary::DEFAULT_RULES
+            );
+
+            let mut config = validatable_config("groq");
+            config.recording = recording_config(|r| r.summary = true);
+            config.llm = None;
+            let warnings = recording_warnings(&config);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].contains("summary = true but there is no [llm] section"),
+                "{warnings:?}"
+            );
+            config.llm = Some(crate::llm::LlmConfig::default());
+            assert!(recording_warnings(&config).is_empty());
+            config.llm = None;
+            config.recording = recording_config(|r| r.summary = false);
+            assert!(recording_warnings(&config).is_empty());
+        }
+
+        /// The sidecar's URL must be http(s), `sidecar` needs one, and the
+        /// number of voices is 0 to 20: each a config error, since the user
+        /// wrote it.
+        #[test]
+        fn diarization_sidecar_keys_are_validated() {
+            let check = |edit: fn(&mut RecordingConfig)| {
+                let mut config = validatable_config("groq");
+                config.recording = recording_config(edit);
+                config.validate().map(|_| ()).map_err(|e| e.to_string())
+            };
+            assert!(
+                check(|r| r.diarization_url = Some("http://127.0.0.1:8770/diarize".into())).is_ok()
+            );
+            assert!(check(|r| {
+                r.diarization = DiarizationMode::Sidecar;
+                r.diarization_url = Some("https://diar.lan/diarize".into());
+            })
+            .is_ok());
+            let err =
+                check(|r| r.diarization_url = Some("ws://127.0.0.1:8770".into())).unwrap_err();
+            assert!(err.contains("http:// or https://"), "{err}");
+            let err =
+                check(|r| r.diarization_url = Some("127.0.0.1:8770/diarize".into())).unwrap_err();
+            assert!(err.contains("diarization_url"), "{err}");
+            let err = check(|r| r.diarization = DiarizationMode::Sidecar).unwrap_err();
+            assert!(err.contains("needs diarization_url"), "{err}");
+            assert!(check(|r| r.num_speakers = 20).is_ok());
+            let err = check(|r| r.num_speakers = 21).unwrap_err();
+            assert!(err.contains("num_speakers = 21"), "{err}");
+        }
+
+        /// `diarization = "backend"` with a backend that labels no speakers
+        /// warns: each track would stay one speaker. An `asr-sidecar` may label
+        /// them, so it does not.
+        #[test]
+        fn backend_diarization_needs_a_backend_that_labels_speakers() {
+            let mut config = validatable_config("groq");
+            config.recording = recording_config(|r| r.diarization = DiarizationMode::Backend);
+            let warnings = recording_warnings(&config);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].contains("does not tell voices apart"),
+                "{warnings:?}"
+            );
+
+            config.recording = recording_config(|r| {
+                r.diarization = DiarizationMode::Backend;
+                r.backend = Some("asr-sidecar".into());
+            });
+            config.asr_sidecar = Some(AsrSidecarConfig {
+                url: "http://127.0.0.1:8765/transcribe".into(),
+                model: default_asr_sidecar_model(),
+                api_key: None,
+            });
+            assert!(recording_warnings(&config)
+                .iter()
+                .all(|w| !w.contains("voices apart")));
+
+            // With Deepgram, only its Whisper models cannot, and the warning
+            // says the model is why.
+            let mut config = validatable_config("deepgram");
+            config.recording = recording_config(|r| r.diarization = DiarizationMode::Backend);
+            assert!(recording_warnings(&config).is_empty(), "nova-3");
+            config.deepgram.as_mut().unwrap().model = "whisper-large".into();
+            let warnings = recording_warnings(&config);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0]
+                    .contains("model = \"whisper-large\" is one of Deepgram's Whisper models"),
+                "{warnings:?}"
+            );
+
+            // `auto` and `off` never warn.
+            for mode in [DiarizationMode::Auto, DiarizationMode::Off] {
+                let mut config = validatable_config("groq");
+                config.recording = recording_config(|r| r.diarization = mode);
+                assert!(recording_warnings(&config).is_empty(), "{mode:?}");
+            }
+        }
+
+        #[test]
+        fn recording_checks_are_skipped_when_the_feature_is_unused() {
+            // A realtime dictation user who never touched recordings gets no
+            // recording warning on every start.
+            let config = validatable_config("openai-realtime");
+            assert!(recording_warnings(&config).is_empty());
+        }
+
+        #[test]
+        fn recording_max_duration_out_of_range_is_an_error() {
+            for minutes in [0, MAX_RECORDING_DURATION_MINUTES + 1] {
+                let mut config = validatable_config("groq");
+                config.recording = recording_config(|m| m.max_duration_minutes = minutes);
+                let err = config.validate().expect_err("out-of-range duration");
+                assert!(err.to_string().contains("max_duration_minutes"), "{err}");
+            }
+            for minutes in [1, MAX_RECORDING_DURATION_MINUTES] {
+                let mut config = validatable_config("groq");
+                config.recording = recording_config(|m| m.max_duration_minutes = minutes);
+                config.validate().expect("in-range duration");
+            }
+        }
+
+        /// `[general] language` -> `[recording] language` -> the track's own key,
+        /// each a default for the next.
+        #[test]
+        fn recording_languages_default_in_a_chain() {
+            let both = |recording: &RecordingConfig| {
+                (
+                    recording.language_for(TrackKind::Mic, "en"),
+                    recording.language_for(TrackKind::System, "en"),
+                )
+            };
+            let mut recording = RecordingConfig::default();
+            assert_eq!(both(&recording), ("en".into(), "en".into()));
+            recording.language = Some("de".into());
+            assert_eq!(both(&recording), ("de".into(), "de".into()));
+            recording.system_language = Some("auto".into());
+            assert_eq!(both(&recording), ("de".into(), "auto".into()));
+            recording.mic_language = Some("fr".into());
+            assert_eq!(both(&recording), ("fr".into(), "auto".into()));
+            // Normalized like `-l`; a blank key counts as unset.
+            recording.mic_language = Some(" PT_br ".into());
+            recording.language = Some("  ".into());
+            recording.system_language = None;
+            assert_eq!(both(&recording), ("pt-BR".into(), "en".into()));
+
+            // Parsed from config.toml.
+            let config: Config = toml::from_str(
+                "[general]\nlanguage = \"en\"\n[recording]\nlanguage = \"de\"\n\
+             system_language = \"auto\"\n",
+            )
+            .unwrap();
+            let recording = RecordingConfig::effective(&config);
+            assert_eq!(
+                recording.language_for(TrackKind::Mic, &config.general.language),
+                "de"
+            );
+            assert_eq!(
+                recording.language_for(TrackKind::System, &config.general.language),
+                "auto"
+            );
+        }
+
+        #[test]
+        fn invalid_recording_language_is_an_error() {
+            type Key = fn(&mut RecordingConfig) -> &mut Option<String>;
+            let keys: [(&str, Key); 3] = [
+                ("language", |r| &mut r.language),
+                ("mic_language", |r| &mut r.mic_language),
+                ("system_language", |r| &mut r.system_language),
+            ];
+            for (key, field) in keys {
+                for bad in ["english", "", "1"] {
+                    let mut config = validatable_config("groq");
+                    config.recording = recording_config(|r| *field(r) = Some(bad.to_string()));
+                    let err = config.validate().expect_err("invalid language").to_string();
+                    assert!(
+                        err.contains(&format!("[recording] {key} = \"{bad}\"")),
+                        "{key} = {bad:?}: {err}"
+                    );
+                }
+                for good in ["de", "auto", "en-US", "multi"] {
+                    let mut config = validatable_config("groq");
+                    config.recording = recording_config(|r| *field(r) = Some(good.to_string()));
+                    assert!(
+                        recording_warnings(&config).is_empty(),
+                        "{key} = {good:?}: {:?}",
+                        recording_warnings(&config)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn explicit_realtime_recording_backend_is_an_error() {
+            for backend in ["openai-realtime", "openai-compatible-realtime"] {
+                let mut config = validatable_config("groq");
+                config.recording = recording_config(|m| m.backend = Some(backend.to_string()));
+                let err = config.validate().expect_err("realtime recording backend");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(backend) && msg.contains("groq, openai, deepgram"),
+                    "{msg}"
+                );
+            }
+        }
+
+        #[test]
+        fn unknown_or_stub_recording_backend_is_an_error() {
+            for backend in ["nope", "local-vosk"] {
+                let mut config = validatable_config("groq");
+                config.recording = recording_config(|m| m.backend = Some(backend.to_string()));
+                assert!(config.validate().is_err(), "{backend} must be rejected");
+            }
+        }
+
+        #[test]
+        fn batch_recording_backends_are_accepted() {
+            for backend in ["groq", "openai", "deepgram", "deepgram-streaming"] {
+                let mut config = validatable_config("openai-realtime");
+                config.recording = recording_config(|m| m.backend = Some(backend.to_string()));
+                assert!(
+                    recording_warnings(&config).is_empty(),
+                    "{backend}: {:?}",
+                    recording_warnings(&config)
+                );
+            }
+        }
+
+        #[test]
+        fn inherited_realtime_backend_is_a_warning_not_an_error() {
+            // Via the hotkey alone, no [recording] section.
+            let mut config = validatable_config("openai-realtime");
+            config.hotkeys = Some(HotkeyConfig {
+                recording: Some("Super+Shift+M".to_string()),
+                ..Default::default()
+            });
+            let warnings = recording_warnings(&config);
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains("openai-realtime") && w.contains("[recording] backend")),
+                "{warnings:?}"
+            );
+
+            // Via a [recording] section that leaves the backend unset.
+            let mut config = validatable_config("openai-compatible-realtime");
+            config.recording = recording_config(|_| {});
+            assert!(!recording_warnings(&config).is_empty());
+        }
+
+        #[test]
+        fn recording_backend_without_credentials_warns() {
+            let mut config = validatable_config("groq");
+            config.recording = recording_config(|m| m.backend = Some("asr-sidecar".to_string()));
+            let warnings = recording_warnings(&config);
+            assert!(
+                warnings.iter().any(|w| w.contains("[asr-sidecar] url")),
+                "{warnings:?}"
+            );
+        }
+
+        #[test]
+        fn recording_system_device_equal_to_mic_warns() {
+            let mut config = validatable_config("groq");
+            config.audio.device = "alsa_input.usb-mic".to_string();
+            config.recording =
+                recording_config(|m| m.system_device = Some("alsa_input.usb-mic".to_string()));
+            let warnings = recording_warnings(&config);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("same source"), "{warnings:?}");
+        }
+
+        #[test]
+        fn recording_system_device_that_is_not_a_monitor_warns() {
+            let mut config = validatable_config("groq");
+            config.recording =
+                recording_config(|m| m.system_device = Some("alsa_input.webcam".to_string()));
+            let warnings = recording_warnings(&config);
+            assert!(
+                warnings.iter().any(|w| w.contains(".monitor")),
+                "{warnings:?}"
+            );
+        }
+
+        #[test]
+        fn recording_system_device_presets_and_monitors_do_not_warn() {
+            for system in [
+                "default",
+                "none",
+                "alsa_output.pci-0000.analog-stereo.monitor",
+            ] {
+                let mut config = validatable_config("groq");
+                config.recording = recording_config(|m| m.system_device = Some(system.to_string()));
+                assert!(
+                    recording_warnings(&config).is_empty(),
+                    "{system}: {:?}",
+                    recording_warnings(&config)
+                );
+            }
+        }
+
+        #[test]
+        fn recording_hotkey_collision_is_reported() {
+            let mut config = validatable_config("groq");
+            config.hotkeys = Some(HotkeyConfig {
+                toggle: Some("Super+Shift+M".to_string()),
+                recording: Some("shift+super+m".to_string()),
+                ..Default::default()
+            });
+            let warnings = config.validate().unwrap();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.message.contains("[hotkeys] recording")),
+                "{warnings:?}"
+            );
+        }
+    }
+
+    /// A build without the recording feature ignores `[recording]` and
+    /// `[hotkeys] recording`, and says so once.
+    #[cfg(not(feature = "recording"))]
+    mod without_recording {
+        use super::*;
+
+        const IGNORED: &str = "this whisrs was built without the recording feature";
+
+        fn ignored_warnings(config: &Config) -> Vec<String> {
+            config
+                .validate()
+                .expect("config validates")
+                .into_iter()
+                .map(|w| w.message)
+                .filter(|m| m.contains("recording"))
+                .collect()
+        }
+
+        fn hotkey(recording: &str) -> Option<HotkeyConfig> {
+            Some(HotkeyConfig {
+                recording: Some(recording.to_string()),
+                ..Default::default()
+            })
+        }
+
+        #[test]
+        fn no_section_and_a_default_one_say_nothing() {
+            let mut config = validatable_config("groq");
+            assert!(ignored_warnings(&config).is_empty());
+            // An empty `[recording]` table is the defaults.
+            config.recording = toml::from_str::<Config>("[recording]\n").unwrap().recording;
+            assert_eq!(config.recording, Some(RecordingConfig::default()));
+            assert!(ignored_warnings(&config).is_empty());
+            // A blank binding is unset.
+            config.hotkeys = hotkey("  ");
+            assert!(ignored_warnings(&config).is_empty());
+        }
+
+        #[test]
+        fn a_section_that_differs_from_the_default_is_ignored_with_a_warning() {
+            let mut config = validatable_config("groq");
+            config.recording = toml::from_str::<Config>("[recording]\nsummary = true\n")
+                .unwrap()
+                .recording;
+            assert_eq!(
+                ignored_warnings(&config),
+                [format!("{IGNORED}, so [recording] is ignored")]
+            );
+            // A value the feature would refuse is not checked: it is unused.
+            config.recording = Some(RecordingConfig {
+                max_duration_minutes: 0,
+                backend: Some("openai-realtime".to_string()),
+                ..Default::default()
+            });
+            assert_eq!(
+                ignored_warnings(&config),
+                [format!("{IGNORED}, so [recording] is ignored")]
+            );
+        }
+
+        #[test]
+        fn a_recording_hotkey_is_ignored_with_a_warning() {
+            let mut config = validatable_config("groq");
+            config.hotkeys = hotkey("Super+Shift+M");
+            assert_eq!(
+                ignored_warnings(&config),
+                [format!("{IGNORED}, so [hotkeys] recording is ignored")]
+            );
+        }
+
+        #[test]
+        fn both_get_one_warning() {
+            let mut config = validatable_config("groq");
+            config.hotkeys = hotkey("Super+Shift+M");
+            config.recording = Some(RecordingConfig {
+                user_name: Some("Ada".to_string()),
+                ..Default::default()
+            });
+            let warnings = ignored_warnings(&config);
+            assert_eq!(
+                warnings,
+                [format!(
+                    "{IGNORED}, so [recording] and [hotkeys] recording are ignored"
+                )]
+            );
+            assert!(!warnings[0].contains('\u{2014}'), "no em dash");
+        }
+
+        /// The binding is never registered here, so it collides with
+        /// nothing: the only warning is the one that says it is ignored.
+        #[test]
+        fn an_ignored_recording_hotkey_collides_with_nothing() {
+            let mut config = validatable_config("groq");
+            config.hotkeys = Some(HotkeyConfig {
+                toggle: Some("Super+Shift+M".to_string()),
+                recording: Some("shift+super+m".to_string()),
+                ..Default::default()
+            });
+            let warnings: Vec<String> = config
+                .validate()
+                .unwrap()
+                .into_iter()
+                .map(|w| w.message)
+                .collect();
+            assert!(
+                warnings.iter().all(|w| !w.contains("duplicate hotkey")),
+                "{warnings:?}"
+            );
+            assert_eq!(
+                ignored_warnings(&config),
+                [format!("{IGNORED}, so [hotkeys] recording is ignored")]
+            );
+        }
+    }
+
     #[test]
     fn config_validate_no_collision_warning_for_distinct_bindings() {
         let mut config = validatable_config("groq");
@@ -4833,6 +5887,7 @@ mod tests {
             cancel: Some("Super+Shift+Escape".to_string()),
             command: Some("Super+Shift+C".to_string()),
             speak: Some("Super+Shift+R".to_string()),
+            recording: Some("Super+Shift+M".to_string()),
         });
         config
             .llm_commands
@@ -6023,6 +7078,7 @@ mod tests {
                 model: case.model.to_string(),
                 prompt: config.general.prompt.clone(),
                 keyterms: Vec::new(),
+                diarize: false,
             };
             assert!(
                 request

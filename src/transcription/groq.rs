@@ -1,9 +1,9 @@
 //! Groq Whisper API transcription backend.
 //!
-//! Sends WAV audio to Groq's `/openai/v1/audio/transcriptions` endpoint
-//! and returns the transcribed text. Supports chunked pseudo-streaming
-//! by splitting audio at silence boundaries and sending each chunk
-//! independently.
+//! Sends WAV audio (FLAC for recording chunks) to Groq's
+//! `/openai/v1/audio/transcriptions` endpoint and returns the transcribed
+//! text. Supports chunked pseudo-streaming by splitting audio at silence
+//! boundaries and sending each chunk independently.
 
 use asr_dedup::{TextDedup, TimestampDedup, Word as AsrWord};
 use async_trait::async_trait;
@@ -16,7 +16,9 @@ use tracing::{debug, error, info, warn};
 use crate::audio::wav::encode_wav;
 use crate::audio::AudioChunk;
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::flac::{recording_upload, UploadFormat};
+use super::verbose_json::parse_verbose_segments;
+use super::{Transcript, TranscriptionBackend, TranscriptionConfig, UPLOAD_CHUNK_SECS};
 
 /// Maximum file size accepted by the Groq API (25 MB).
 const MAX_FILE_SIZE: usize = 25 * 1024 * 1024;
@@ -42,6 +44,8 @@ const MIN_SILENCE_SAMPLES: usize = 16_000 * 300 / 1000;
 pub struct GroqBackend {
     client: reqwest::Client,
     api_key: String,
+    /// [`GROQ_TRANSCRIPTION_URL`]; tests point it at a local server.
+    url: String,
 }
 
 impl GroqBackend {
@@ -50,6 +54,7 @@ impl GroqBackend {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            url: GROQ_TRANSCRIPTION_URL.to_string(),
         }
     }
 
@@ -59,52 +64,96 @@ impl GroqBackend {
         wav_data: &[u8],
         config: &TranscriptionConfig,
     ) -> anyhow::Result<GroqTranscriptionResponse> {
-        let file_part = multipart::Part::bytes(wav_data.to_vec())
-            .file_name("audio.wav")
-            .mime_str("audio/wav")?;
+        let body = self
+            .post(wav_data, UploadFormat::WAV, config, &["word"])
+            .await?;
+        let parsed: GroqTranscriptionResponse = serde_json::from_str(&body)?;
+        Ok(parsed)
+    }
 
-        let mut form = multipart::Form::new()
-            .part("file", file_part)
-            .text("model", config.model.clone())
-            .text("response_format", "verbose_json")
-            .text("timestamp_granularities[]", "word");
-
-        if config.language != "auto" {
-            form = form.text("language", config.language.clone());
-        }
-        if let Some(prompt) = &config.prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
+    /// POST `audio`, in `format`, as a `verbose_json` request with the given
+    /// `timestamp_granularities[]` and return the raw success body.
+    async fn post(
+        &self,
+        audio: &[u8],
+        format: UploadFormat,
+        config: &TranscriptionConfig,
+        granularities: &[&str],
+    ) -> anyhow::Result<String> {
         let response = self
             .client
-            .post(GROQ_TRANSCRIPTION_URL)
+            .post(&self.url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(form)
+            .multipart(build_form(audio, format, config, granularities)?)
             .send()
             .await?;
 
         let status = response.status();
+        let retry_after = super::retry_after_header(response.headers());
         let body = response.text().await?;
 
         if !status.is_success() {
-            if let Ok(err_resp) = serde_json::from_str::<GroqErrorResponse>(&body) {
-                match status.as_u16() {
-                    401 => anyhow::bail!("Groq API: invalid API key — {}", err_resp.error.message),
-                    429 => anyhow::bail!("Groq API: rate limited — {}", err_resp.error.message),
-                    _ => anyhow::bail!(
-                        "Groq API error ({}): {}",
-                        status.as_u16(),
-                        err_resp.error.message
-                    ),
-                }
-            }
-            anyhow::bail!("Groq API error ({}): {}", status.as_u16(), body);
+            let code = status.as_u16();
+            // Try to parse error response for a better message.
+            let message = match serde_json::from_str::<GroqErrorResponse>(&body) {
+                Ok(err_resp) => match code {
+                    401 => format!("Groq API: invalid API key: {}", err_resp.error.message),
+                    429 => format!("Groq API: rate limited: {}", err_resp.error.message),
+                    _ => format!("Groq API error ({code}): {}", err_resp.error.message),
+                },
+                Err(_) => format!("Groq API error ({code}): {body}"),
+            };
+            return Err(super::http_error(code, retry_after, message));
         }
-
-        let parsed: GroqTranscriptionResponse = serde_json::from_str(&body)?;
-        Ok(parsed)
+        Ok(body)
     }
+}
+
+/// Reject audio the API would refuse before uploading it.
+fn check_audio_size(audio: &[u8]) -> anyhow::Result<()> {
+    if audio.len() > MAX_FILE_SIZE {
+        anyhow::bail!(
+            "audio file too large ({} bytes, max {} bytes / 25MB)",
+            audio.len(),
+            MAX_FILE_SIZE
+        );
+    }
+    if audio.is_empty() {
+        anyhow::bail!("cannot transcribe empty audio");
+    }
+    Ok(())
+}
+
+/// The multipart form for one transcription request.
+///
+/// Dictation sends WAV and asks for `word` timestamps only; recordings send
+/// FLAC and add `segment`.
+fn build_form(
+    audio: &[u8],
+    format: UploadFormat,
+    config: &TranscriptionConfig,
+    granularities: &[&str],
+) -> anyhow::Result<multipart::Form> {
+    let file_part = multipart::Part::bytes(audio.to_vec())
+        .file_name(format.file_name)
+        .mime_str(format.mime)?;
+
+    let mut form = multipart::Form::new()
+        .part("file", file_part)
+        .text("model", config.model.clone())
+        .text("response_format", "verbose_json");
+    for granularity in granularities {
+        form = form.text("timestamp_granularities[]", granularity.to_string());
+    }
+
+    // Only set language if not "auto" — letting the API auto-detect is the default.
+    if config.language != "auto" {
+        form = form.text("language", config.language.clone());
+    }
+    if let Some(prompt) = &config.prompt {
+        form = form.text("prompt", prompt.clone());
+    }
+    Ok(form)
 }
 
 /// The verbose JSON response from Groq's transcription API.
@@ -155,17 +204,7 @@ impl TranscriptionBackend for GroqBackend {
         audio: &[u8],
         config: &TranscriptionConfig,
     ) -> anyhow::Result<String> {
-        if audio.len() > MAX_FILE_SIZE {
-            anyhow::bail!(
-                "audio file too large ({} bytes, max {} bytes / 25MB)",
-                audio.len(),
-                MAX_FILE_SIZE
-            );
-        }
-
-        if audio.is_empty() {
-            anyhow::bail!("cannot transcribe empty audio");
-        }
+        check_audio_size(audio)?;
 
         debug!(
             "sending {} bytes to Groq API (model={}, language={})",
@@ -174,51 +213,9 @@ impl TranscriptionBackend for GroqBackend {
             config.language
         );
 
-        let file_part = multipart::Part::bytes(audio.to_vec())
-            .file_name("audio.wav")
-            .mime_str("audio/wav")?;
-
-        let mut form = multipart::Form::new()
-            .part("file", file_part)
-            .text("model", config.model.clone())
-            .text("response_format", "verbose_json")
-            .text("timestamp_granularities[]", "word");
-
-        // Only set language if not "auto" — letting the API auto-detect is the default.
-        if config.language != "auto" {
-            form = form.text("language", config.language.clone());
-        }
-        if let Some(prompt) = &config.prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
-        let response = self
-            .client
-            .post(GROQ_TRANSCRIPTION_URL)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(form)
-            .send()
+        let body = self
+            .post(audio, UploadFormat::WAV, config, &["word"])
             .await?;
-
-        let status = response.status();
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            // Try to parse error response for a better message.
-            if let Ok(err_resp) = serde_json::from_str::<GroqErrorResponse>(&body) {
-                match status.as_u16() {
-                    401 => anyhow::bail!("Groq API: invalid API key — {}", err_resp.error.message),
-                    429 => anyhow::bail!("Groq API: rate limited — {}", err_resp.error.message),
-                    _ => anyhow::bail!(
-                        "Groq API error ({}): {}",
-                        status.as_u16(),
-                        err_resp.error.message
-                    ),
-                }
-            }
-            anyhow::bail!("Groq API error ({}): {}", status.as_u16(), body);
-        }
-
         let parsed: GroqTranscriptionResponse = serde_json::from_str(&body)?;
 
         if !parsed.words.is_empty() {
@@ -354,6 +351,33 @@ impl TranscriptionBackend for GroqBackend {
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         true
     }
+
+    // Native timestamps: verbose_json segments, parsed by
+    // `verbose_json::parse_verbose_segments` (no-speech heuristic included).
+    // The chunk goes up as FLAC.
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        let upload = recording_upload(audio).await;
+        check_audio_size(&upload.bytes)?;
+        debug!(
+            "sending {} bytes ({}, WAV was {}) to Groq API for segments (model={})",
+            upload.bytes.len(),
+            upload.format.mime,
+            audio.len(),
+            config.model
+        );
+        let body = self
+            .post(&upload.bytes, upload.format, config, &["segment", "word"])
+            .await?;
+        parse_verbose_segments(&body)
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(UPLOAD_CHUNK_SECS)
+    }
 }
 
 /// Parse a Groq verbose JSON response body into a `GroqTranscriptionResponse`.
@@ -367,6 +391,10 @@ pub fn parse_response(body: &str) -> anyhow::Result<GroqTranscriptionResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcription::retry::{retry_transient, RateLimitExhausted, RATE_LIMIT_BUDGET};
+    use crate::transcription::test_server::{serve_once, serve_responses};
+    use crate::transcription::RetryableHttpError;
+    use std::time::Duration;
 
     #[test]
     fn groq_sends_the_prompt() {
@@ -375,6 +403,7 @@ mod tests {
             model: "whisper-large-v3-turbo".to_string(),
             prompt: Some("Hyprland, whisrs".to_string()),
             keyterms: Vec::new(),
+            diarize: false,
         };
 
         assert!(GroqBackend::new(String::new()).sends_prompt(&request));
@@ -451,6 +480,7 @@ mod tests {
             model: "whisper-large-v3-turbo".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -464,9 +494,206 @@ mod tests {
             model: "whisper-large-v3-turbo".to_string(),
             prompt: None,
             keyterms: Vec::new(),
+            diarize: false,
         };
         let huge = vec![0u8; MAX_FILE_SIZE + 1];
         let err = backend.transcribe(&huge, &config).await.unwrap_err();
         assert!(err.to_string().contains("too large"));
+    }
+
+    /// reqwest's Form is opaque; building must at least succeed for both the
+    /// dictation and recording shapes, with this config.
+    fn form_config() -> TranscriptionConfig {
+        TranscriptionConfig {
+            language: "auto".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            prompt: Some("whisrs".to_string()),
+            keyterms: Vec::new(),
+            diarize: false,
+        }
+    }
+
+    #[test]
+    fn dictation_form_builds_with_word_timestamps() {
+        let config = form_config();
+        assert!(build_form(&[1, 2, 3], UploadFormat::WAV, &config, &["word"]).is_ok());
+    }
+
+    // The recording shape is FLAC, which comes with the recording feature.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn recording_form_builds_with_segment_and_word_timestamps() {
+        let config = form_config();
+        let recording = build_form(
+            &[1, 2, 3],
+            UploadFormat::FLAC,
+            &config,
+            &["segment", "word"],
+        );
+        assert!(recording.is_ok());
+    }
+
+    #[test]
+    fn groq_chunks_fit_the_upload_cap() {
+        let backend = GroqBackend::new(String::new());
+        let config = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+            diarize: false,
+        };
+        let secs = backend.max_segment_chunk_secs(&config).unwrap() as usize;
+        // 16 kHz mono i16 plus a 44-byte header.
+        assert!(secs * 32_000 + 44 <= MAX_FILE_SIZE);
+    }
+
+    /// A backend that posts to the local server on `listener`.
+    fn local_backend(listener: &tokio::net::TcpListener) -> GroqBackend {
+        GroqBackend {
+            url: format!("http://{}/transcriptions", listener.local_addr().unwrap()),
+            ..GroqBackend::new("test-key".to_string())
+        }
+    }
+
+    // FLAC needs the encoder, which comes with the recording feature.
+    #[cfg(feature = "recording")]
+    #[tokio::test]
+    async fn recording_chunks_upload_as_flac() {
+        let config = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+            diarize: false,
+        };
+        let wav = encode_wav(&[300i16; 16_000]).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"text": "hi", "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}"#,
+        ));
+        let t = backend.transcribe_segments(&wav, &config).await.unwrap();
+        assert_eq!(t.segments.len(), 1);
+        let request = server.await.unwrap();
+        let (headers, data) = request.file_part();
+        assert!(headers.contains("filename=\"audio.flac\""), "{headers}");
+        assert!(headers.contains("Content-Type: audio/flac"), "{headers}");
+        assert!(data.starts_with(b"fLaC"));
+    }
+
+    #[tokio::test]
+    async fn dictation_uploads_as_wav() {
+        let config = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+            diarize: false,
+        };
+        let wav = encode_wav(&[300i16; 16_000]).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(listener, r#"{"text": "hi"}"#));
+        assert_eq!(backend.transcribe(&wav, &config).await.unwrap(), "hi");
+        let request = server.await.unwrap();
+        let (headers, data) = request.file_part();
+        assert!(headers.contains("filename=\"audio.wav\""), "{headers}");
+        assert!(headers.contains("Content-Type: audio/wav"), "{headers}");
+        assert!(data.starts_with(&wav));
+    }
+
+    /// Short stand-ins for the server-error waits, so these tests talk to a
+    /// real socket without sleeping 50 s.
+    const QUICK: [Duration; 3] = [Duration::from_millis(1); 3];
+    const CLOUDFLARE_524: &str = "error code: 524";
+    const SEGMENTS: &str =
+        r#"{"text": "hi", "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}"#;
+
+    fn recording_request() -> (Vec<u8>, TranscriptionConfig) {
+        let config = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            prompt: None,
+            keyterms: Vec::new(),
+            diarize: false,
+        };
+        (encode_wav(&[300i16; 16_000]).unwrap(), config)
+    }
+
+    /// A Cloudflare origin timeout (524) on a recording chunk is retried, and
+    /// the chunk goes through on the next try.
+    #[tokio::test]
+    async fn a_524_is_retried_until_the_chunk_goes_through() {
+        let (wav, config) = recording_request();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![(524, CLOUDFLARE_524), (200, SEGMENTS)],
+        ));
+        let t = retry_transient(RATE_LIMIT_BUDGET, &QUICK, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap();
+        assert_eq!(t.segments[0].text, "hi");
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    /// A 524 on every try ends after the bounded retries in the error the
+    /// server gave, as a final error the recording reports.
+    #[tokio::test]
+    async fn a_lasting_524_gives_up_after_the_bounded_retries() {
+        let (wav, config) = recording_request();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_responses(listener, vec![(524, CLOUDFLARE_524); 4]));
+        let err = retry_transient(RATE_LIMIT_BUDGET, &QUICK, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap_err();
+        // Bounded, so a client that stops early fails here instead of hanging.
+        let served = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the server waited for four requests")
+            .unwrap();
+        assert_eq!(served.len(), 4, "one try and three retries");
+        let exhausted = err.downcast_ref::<RateLimitExhausted>().unwrap();
+        assert_eq!(exhausted.status, 524);
+        assert!(
+            err.to_string()
+                .ends_with("Groq API error (524): error code: 524"),
+            "{err}"
+        );
+        assert!(err.downcast_ref::<RetryableHttpError>().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_400_is_not_retried() {
+        let (wav, config) = recording_request();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![(
+                400,
+                r#"{"error": {"message": "could not decode the audio"}}"#,
+            )],
+        ));
+        let err = retry_transient(RATE_LIMIT_BUDGET, &QUICK, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(server.await.unwrap().len(), 1);
+        assert_eq!(
+            err.to_string(),
+            "Groq API error (400): could not decode the audio"
+        );
     }
 }
