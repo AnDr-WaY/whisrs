@@ -230,11 +230,10 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                             Ok(Ok((StreamingDelivery::Typed, text))) => {
                                 debug!("typed: {text:?}");
                             }
-                            Ok(Ok((StreamingDelivery::Cancelled { typed }, text))) => {
+                            Ok(Ok((StreamingDelivery::Cancelled { typed }, _))) => {
                                 info!(
                                     "cancelled while a modifier key was held; typed {typed} \
-                                     of {} bytes, discarded the rest",
-                                    text.len()
+                                     bytes of the delta, discarded the rest"
                                 );
                             }
                             Ok(Err(e)) => warn!("failed to type text: {e:#}"),
