@@ -653,6 +653,9 @@ pub struct InputConfig {
     /// - Typing mode (`paste = false`): the text is copied after the
     ///   keystroke injection runs, whether that injection succeeded or
     ///   failed — the clipboard copy *is* the fallback for the failure case.
+    ///   The exception is a held modifier that stops the typing at
+    ///   [`Self::modifier_wait_ms`]: the clipboard then holds only the
+    ///   untyped rest, so pasting it does not repeat the typed part.
     /// - Paste mode (`paste = true`): pasting already puts the text on the
     ///   clipboard, so the usual restore of the previous clipboard contents
     ///   is skipped entirely; the transcribed text simply stays there.

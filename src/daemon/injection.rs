@@ -830,9 +830,10 @@ fn modifier_probe() -> impl FnMut() -> bool {
 /// [`whisrs::InputConfig::clipboard_fallback`]) the final text is left in
 /// the clipboard as a manual-fix fallback for silent injection failures:
 /// in typing mode it is copied after the keystrokes run, success or failure
-/// (a `warn!` on copy error, never a change to the returned `Result`); in
-/// paste mode the post-paste restore is skipped entirely, so the pasted text
-/// simply stays in the clipboard. The unreadable-clipboard fallback to
+/// (a `warn!` on copy error, never a change to the returned `Result`),
+/// unless a held modifier stopped them (then the clipboard holds only the
+/// untyped rest, see below); in paste mode the post-paste restore is
+/// skipped entirely, so the pasted text simply stays in the clipboard. The unreadable-clipboard fallback to
 /// typing above still applies in paste mode: it exists to protect non-text
 /// content, and typing already delivered the text, so no clipboard write
 /// happens on that degraded path.
@@ -910,10 +911,11 @@ fn inject_text_with_clipboard(
     if !paste {
         let result = type_text_with_clear(text, keys, clear_line);
         if let Ok(Typed::StoppedAt(typed)) = result {
-            // Typing stopped at a held modifier: the copy delivers the
-            // untyped rest, and it stands in for what `clipboard_fallback`
-            // would have written. `typed` counts bytes of this sanitized
-            // `text`, the string that was typed.
+            // Typing stopped at a held modifier: the clipboard gets only the
+            // untyped rest, to paste after the typed part. The full copy
+            // `clipboard_fallback` would make is skipped on purpose: pasting
+            // it there would repeat the typed part. `typed` counts bytes of
+            // this sanitized `text`, the string that was typed.
             return copy_instead_of_keystrokes(
                 clipboard.as_ref(),
                 untyped_rest(text, typed),

@@ -173,7 +173,10 @@ paste = false
 # With paste mode (`paste = true`) the clipboard is normally restored to its
 # previous content right after pasting; with clipboard_fallback set, that
 # restore is skipped and the transcribed text stays in the clipboard. In
-# typing mode (default) the text is copied to the clipboard after typing.
+# typing mode (default) the text is copied to the clipboard after typing,
+# except when a held modifier stopped the typing (see modifier_wait_ms): then
+# the clipboard holds only the untyped rest, so pasting it does not repeat
+# the typed part.
 # Streaming backends (deepgram-streaming, openai-realtime, local-whisper, ...)
 # type incrementally and copy the full final transcript when recording stops.
 # `whisrs cancel` never copies anything, on any backend — cancel discards.
