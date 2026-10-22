@@ -778,10 +778,11 @@ fn edit_key_delay(config: &mut Config) -> Result<()> {
 
     println!(
         "\n  {DIM}How long to wait for held Super/Alt/Ctrl/Shift keys to be released \
-         before typing, with batch backends and in command mode. Still held after \
-         this, the text is copied to the clipboard instead. 0 = don't wait: if a \
-         modifier is held, the text goes straight to the clipboard. Streaming \
-         backends always wait for the release.{RESET}"
+         before each typed key, with batch backends and in command mode. Typing pauses \
+         while one is held; still held after this, the rest of the text is copied to \
+         the clipboard instead. 0 = don't wait: if a modifier is held, the rest goes \
+         straight to the clipboard. Streaming backends always wait for the \
+         release.{RESET}"
     );
     let input: String = Input::new()
         .with_prompt("modifier_wait_ms")

@@ -27,6 +27,7 @@
 //! `zwp_virtual_keyboard_v1`, otherwise it falls back to uinput. It never
 //! picks `xtest`, which is opt-in.
 
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use xkb_type::KeyInjector;
@@ -170,6 +171,7 @@ fn main() -> anyhow::Result<()> {
     }
     eprintln!("typing now");
 
-    injector.type_text(&text)?;
+    // Type everything: the gate never stops it.
+    let _ = injector.type_text(&text, &mut |_| ControlFlow::Continue(()))?;
     Ok(())
 }

@@ -142,7 +142,7 @@ The **primitives** they call live in the `xkb-type` workspace crate, not in `src
 
 ```
 crates/
-├── xkb-type/src/           # 0.1.4 — key injection
+├── xkb-type/src/           # 0.2.0 — key injection
 │   ├── lib.rs              #   KeyInjector + ClipboardBackend traits
 │   ├── keyboard.rs         #   uinput virtual keyboard (evdev)
 │   ├── keymap.rs           #   XKB reverse lookup (char → keycode+modifiers)

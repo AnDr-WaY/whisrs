@@ -217,8 +217,9 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                         // Streaming deliberately bypasses `inject_text` / `[input]
                         // paste`: partial deltas are typed as they arrive, and a
                         // paste per delta would thrash the clipboard. A held
-                        // modifier makes the delta wait, uncapped, until it is
-                        // released or the session is cancelled (#154).
+                        // modifier pauses the delta before its next key, uncapped,
+                        // until it is released or the session is cancelled
+                        // (#154, #171).
                         let delta = text_to_type.clone();
                         match tokio::task::spawn_blocking(move || {
                             deliver_streaming_delta(&delta, keys, &cancel, &modifier_waits)
@@ -229,10 +230,10 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                             Ok(Ok((StreamingDelivery::Typed, text))) => {
                                 debug!("typed: {text:?}");
                             }
-                            Ok(Ok((StreamingDelivery::Cancelled, text))) => {
+                            Ok(Ok((StreamingDelivery::Cancelled { typed }, text))) => {
                                 info!(
-                                    "cancelled while a modifier key was held; discarded \
-                                     {} untyped chars",
+                                    "cancelled while a modifier key was held; typed {typed} \
+                                     of {} bytes, discarded the rest",
                                     text.len()
                                 );
                             }
@@ -1175,9 +1176,9 @@ pub(crate) async fn process_recording_batch(
     .await
     {
         Ok(Ok(Injection::Delivered)) => {}
-        Ok(Ok(Injection::CopiedForHeldModifier)) => {
+        Ok(Ok(Injection::CopiedForHeldModifier(copied))) => {
             if context.notify_error() {
-                notify_copied_for_held_modifier(&outcome.text);
+                notify_copied_for_held_modifier(&copied);
             }
         }
         Ok(Err(e)) => warn!("failed to inject text: {e:#}"),

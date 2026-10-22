@@ -5,6 +5,7 @@
 //! XKB keymap to produce the correct characters regardless of the user's
 //! keyboard layout.
 
+use std::ops::{ControlFlow, Range};
 use std::thread;
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ macro_rules! warn {
 }
 
 use crate::keymap::{KeyboardLayout, XkbKeymap};
-use crate::{default_clipboard, ClipboardBackend, KeyTap};
+use crate::{default_clipboard, run_gated, ClipboardBackend, KeyMapping, KeyTap, Typed};
 
 /// Delay after creating the virtual device on the runtime path (e.g. when
 /// the daemon re-creates the keyboard after an error). Short, because this
@@ -92,6 +93,47 @@ impl Sink {
             Sink::Xtest(xtest) => xtest.sync(),
         }
     }
+}
+
+/// One gated step of [`Keyboard::type_text_gated`], from [`plan_steps`].
+#[derive(Debug, Clone)]
+enum Step {
+    /// One character the keymap has: tap `main`, then `follow` (a dead
+    /// key's base letter) when there is one. The pair is one step, so a
+    /// pause can never split it.
+    Key(KeyMapping),
+    /// A run of consecutive characters the keymap lacks, pasted through
+    /// the clipboard in one go: this byte range of the text.
+    Paste(Range<usize>),
+}
+
+/// Split `text` into the steps [`Keyboard::type_text_gated`] sends, in
+/// order, each with the byte offset of its first character (what the gate
+/// is asked with). `lookup` is the keymap lookup. A run of characters it
+/// does not map becomes one [`Step::Paste`] that starts where the run does.
+fn plan_steps(
+    text: &str,
+    mut lookup: impl FnMut(char) -> Option<KeyMapping>,
+) -> Vec<(usize, Step)> {
+    let mut steps = Vec::new();
+    let mut paste_start = None;
+    for (at, ch) in text.char_indices() {
+        match lookup(ch) {
+            Some(mapping) => {
+                if let Some(start) = paste_start.take() {
+                    steps.push((start, Step::Paste(start..at)));
+                }
+                steps.push((at, Step::Key(mapping)));
+            }
+            None => {
+                paste_start.get_or_insert(at);
+            }
+        }
+    }
+    if let Some(start) = paste_start {
+        steps.push((start, Step::Paste(start..text.len())));
+    }
+    steps
 }
 
 /// Virtual keyboard that injects keystrokes via uinput, or via XTEST on X11
@@ -257,37 +299,43 @@ impl Keyboard {
     /// Characters *not* found in the keymap are accumulated and pasted as
     /// a batch via the clipboard (Ctrl+V), with clipboard save/restore
     /// so the user's clipboard is not permanently overwritten.
+    ///
+    /// Types everything; [`Keyboard::type_text_gated`] (and
+    /// [`crate::KeyInjector::type_text`]) can pause or stop between keys.
     pub fn type_text(&mut self, text: &str) -> anyhow::Result<()> {
+        self.type_text_gated(text, &mut |_| ControlFlow::Continue(()))
+            .map(|_| ())
+    }
+
+    /// [`Keyboard::type_text`], asking `gate` before every key tap and
+    /// before every clipboard paste, with the byte offset of the next unsent
+    /// character (for a paste, the first character of the run). A dead key
+    /// and its base letter are one character: asked about once, never
+    /// split. On [`ControlFlow::Break`] nothing more is sent, the events
+    /// sent so far are flushed, and the result is [`Typed::StoppedAt`] that
+    /// offset. See [`crate::KeyInjector::type_text`].
+    pub fn type_text_gated(
+        &mut self,
+        text: &str,
+        gate: &mut dyn FnMut(usize) -> ControlFlow<()>,
+    ) -> anyhow::Result<Typed> {
         self.release_all_modifiers()?;
 
-        let mut paste_buf = String::new();
-
-        for ch in text.chars() {
-            // Copy the lookup result to release the immutable borrow on
-            // self.keymap before calling mutable methods below.
-            let mapping = self.keymap.lookup(ch).copied();
-            if let Some(mapping) = mapping {
-                // Flush any pending paste buffer first.
-                if !paste_buf.is_empty() {
-                    self.paste_text(&paste_buf)?;
-                    paste_buf.clear();
-                }
+        let keymap = &self.keymap;
+        let steps = plan_steps(text, |ch| keymap.lookup(ch).copied());
+        let typed = run_gated(steps, gate, |step| match step {
+            Step::Key(mapping) => {
                 self.tap_key(&mapping.main)?;
                 if let Some(follow) = mapping.follow.as_ref() {
                     self.tap_key(follow)?;
                 }
-            } else {
-                // Character not in keymap — accumulate for clipboard paste.
-                paste_buf.push(ch);
+                Ok(())
             }
-        }
+            Step::Paste(range) => self.paste_text(&text[range]),
+        })?;
 
-        // Flush remaining paste buffer.
-        if !paste_buf.is_empty() {
-            self.paste_text(&paste_buf)?;
-        }
-
-        self.sink.sync()
+        self.sink.sync()?;
+        Ok(typed)
     }
 
     /// Emit Backspace `count` times.
@@ -436,5 +484,148 @@ impl Keyboard {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tap(keycode: u16) -> KeyTap {
+        KeyTap {
+            keycode,
+            shift: false,
+            altgr: false,
+        }
+    }
+
+    /// A stand-in keymap: ASCII letters are one tap (keycode = the byte),
+    /// `ã` is a dead tilde (100) followed by `a`, and nothing else maps
+    /// (so it is pasted).
+    fn lookup(ch: char) -> Option<KeyMapping> {
+        match ch {
+            'a'..='z' | ' ' => Some(KeyMapping {
+                main: tap(ch as u16),
+                follow: None,
+            }),
+            'ã' => Some(KeyMapping {
+                main: tap(100),
+                follow: Some(tap('a' as u16)),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Each step as (offset, what it sends): `key:<main>[+<follow>]` or
+    /// the pasted text.
+    fn plan(text: &str) -> Vec<(usize, String)> {
+        plan_steps(text, lookup)
+            .into_iter()
+            .map(|(at, step)| {
+                let what = match step {
+                    Step::Key(m) => match m.follow {
+                        Some(f) => format!("key:{}+{}", m.main.keycode, f.keycode),
+                        None => format!("key:{}", m.main.keycode),
+                    },
+                    Step::Paste(range) => {
+                        assert_eq!(range.start, at, "a paste is asked about at its start");
+                        format!("paste:{}", &text[range])
+                    }
+                };
+                (at, what)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mapped_characters_are_one_step_each_at_their_byte_offset() {
+        assert_eq!(
+            plan("ab c"),
+            vec![
+                (0, "key:97".to_string()),
+                (1, "key:98".to_string()),
+                (2, "key:32".to_string()),
+                (3, "key:99".to_string()),
+            ]
+        );
+        assert!(plan("").is_empty());
+    }
+
+    #[test]
+    fn a_dead_key_pair_is_one_step() {
+        // `ã` is two UTF-8 bytes, so `b` sits at offset 2.
+        assert_eq!(
+            plan("ãb"),
+            vec![(0, "key:100+97".to_string()), (2, "key:98".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_run_of_unmapped_characters_is_one_paste_at_its_start() {
+        // Each emoji is 4 bytes, `€` is 3.
+        assert_eq!(
+            plan("a😀😀b€€"),
+            vec![
+                (0, "key:97".to_string()),
+                (1, "paste:😀😀".to_string()),
+                (9, "key:98".to_string()),
+                (10, "paste:€€".to_string()),
+            ]
+        );
+        assert_eq!(
+            plan("😀a"),
+            vec![(0, "paste:😀".to_string()), (4, "key:97".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_steps_cover_the_text_in_order() {
+        let text = "grüße ã 😀 x€y";
+        let mut covered = String::new();
+        let mut last = None;
+        for (at, step) in plan_steps(text, lookup) {
+            assert!(text.is_char_boundary(at), "offset {at} splits a character");
+            if let Some(last) = last {
+                assert!(last < at, "offsets go up");
+            }
+            last = Some(at);
+            match step {
+                Step::Key(_) => {
+                    let ch = text[at..].chars().next().unwrap();
+                    covered.push(ch);
+                }
+                Step::Paste(range) => covered.push_str(&text[range]),
+            }
+        }
+        assert_eq!(covered, text);
+    }
+
+    /// The gate is asked once per step, so a break mid-text stops at a step
+    /// boundary: never between a dead key and its letter, never inside a
+    /// paste run. What is left is exactly the untyped rest.
+    #[test]
+    fn a_break_leaves_the_rest_from_a_step_boundary() {
+        let text = "aã😀😀b";
+        let steps = plan_steps(text, lookup);
+        let offsets: Vec<usize> = steps.iter().map(|(at, _)| *at).collect();
+        assert_eq!(offsets, vec![0, 1, 3, 11]);
+
+        for (n, &stop) in offsets.iter().enumerate() {
+            let mut gate = |at: usize| {
+                if at == stop {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            };
+            let mut sent = 0;
+            let typed = run_gated(plan_steps(text, lookup), &mut gate, |_| {
+                sent += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(typed, Typed::StoppedAt(stop));
+            assert_eq!(sent, n, "steps before the break");
+        }
     }
 }
