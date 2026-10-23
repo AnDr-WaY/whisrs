@@ -10,7 +10,7 @@ use super::openai_realtime_protocol::{
     openai_turn_detection_mode_for_model, OpenAiRealtimeProfile, OpenAiRealtimeProtocolEngine,
     RealtimeEngineConfig,
 };
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{StreamText, TranscriptionBackend, TranscriptionConfig};
 
 /// OpenAI Realtime API transcription backend.
 pub struct OpenAIRealtimeBackend {
@@ -143,6 +143,11 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
         openai_model_supports_prompt(&config.model)
     }
 
+    // The profile `engine_for_request` always uses: append deltas.
+    fn stream_text(&self) -> StreamText {
+        OpenAiRealtimeProfile::OpenAi.stream_text()
+    }
+
     // Live-only: a recording needs a batch backend.
     async fn transcribe_segments(
         &self,
@@ -190,6 +195,16 @@ mod tests {
         assert!(
             backend.sends_prompt(&request_for_model("gpt-live-transcribe")),
             "gpt-live-transcribe accepts a prompt despite manual commit"
+        );
+    }
+
+    /// Append deltas split words ("Deep", "gram"): the daemon must not space
+    /// them.
+    #[test]
+    fn stream_text_is_fragments() {
+        assert_eq!(
+            OpenAIRealtimeBackend::new(String::new()).stream_text(),
+            StreamText::Fragments
         );
     }
 

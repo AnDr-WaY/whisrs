@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 use super::phrase_split::{decode_windows, DecodeWindow, PhraseSplitter};
 use super::verbose_json::is_no_speech;
 use super::{
-    decode_wav_samples, samples_to_ms, Segment, Transcript, TranscriptionBackend,
+    decode_wav_samples, samples_to_ms, Segment, StreamText, Transcript, TranscriptionBackend,
     TranscriptionConfig, LOCAL_CHUNK_SECS,
 };
 use crate::audio::AudioChunk;
@@ -766,6 +766,11 @@ impl TranscriptionBackend for LocalWhisperBackend {
     // whisper.cpp really does decode conditioned on it.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         true
+    }
+
+    // One trimmed phrase, or a window's new words, per send.
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
     }
 
     // Native timestamps from whisper's segments, decoded a window of phrases

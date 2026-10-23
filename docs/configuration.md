@@ -129,14 +129,19 @@ backend = "auto"
 # selection copy. A key typed while a modifier is held becomes a shortcut, so
 # stopping a dictation with Super+W and keeping Super down would otherwise
 # fire Super+<letter> compositor binds. whisrs never types while a modifier
-# is held: if one is still down when this runs out, the text is copied to the
-# clipboard instead and a warning is logged (paste it with Ctrl+V). In command
-# mode at a terminal the line is then not cleared either. 0 = don't wait: if
-# a modifier is held, the text goes straight to the clipboard.
+# is held, and checks before every key: pressing one while the text is being
+# typed pauses the typing until it is released. If one is still down when
+# this runs out, typing stops there: the rest of the text (all of it if
+# nothing was typed yet) is copied to the clipboard and a warning is logged
+# (paste it with Ctrl+V). Text already typed stays where it is. In command
+# mode at a terminal, a modifier held from the start keeps the line from
+# being cleared too. 0 = don't wait: if a modifier is held, the rest of the
+# text goes straight to the clipboard.
 # Streaming backends (deepgram-streaming, openai-realtime,
-# openai-compatible-realtime) ignore this setting: they always wait for the
-# release, however long it takes, and then type the waiting text in order.
-# `whisrs cancel` ends that wait and discards the text.
+# openai-compatible-realtime) ignore this setting: they also pause before
+# any key while a modifier is held, wait for the release however long it
+# takes, and then type the waiting text in order. `whisrs cancel` ends that
+# wait and discards the text not typed yet.
 # The check reads /dev/input; when it can't, it can't see held keys and keys
 # are sent as before. Default: 10000.
 modifier_wait_ms = 10000
@@ -168,7 +173,10 @@ paste = false
 # With paste mode (`paste = true`) the clipboard is normally restored to its
 # previous content right after pasting; with clipboard_fallback set, that
 # restore is skipped and the transcribed text stays in the clipboard. In
-# typing mode (default) the text is copied to the clipboard after typing.
+# typing mode (default) the text is copied to the clipboard after typing,
+# except when a held modifier stopped the typing (see modifier_wait_ms): then
+# the clipboard holds only the untyped rest, so pasting it does not repeat
+# the typed part.
 # Streaming backends (deepgram-streaming, openai-realtime, local-whisper, ...)
 # type incrementally and copy the full final transcript when recording stops.
 # `whisrs cancel` never copies anything, on any backend — cancel discards.

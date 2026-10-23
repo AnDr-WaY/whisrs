@@ -503,9 +503,10 @@ async fn command_mode_background_inner(
     //
     // A physical modifier still held after `[input] modifier_wait_ms` (#154)
     // withholds the clear *and* the injection: the rewrite is copied to the
-    // clipboard instead (see `clear_line_and_inject`).
+    // clipboard instead. One pressed after the clear pauses the typing, and at
+    // the cap the untyped rest is copied (#171, see `clear_line_and_inject`).
     info!("command mode: injecting {} chars", result.len());
-    let text_clone = result.clone();
+    let text_clone = result;
     let keys = KeystrokeSettings::from_config(&context.config.input);
     let paste = context.config.input.paste;
     let clipboard_fallback = context.config.input.clipboard_fallback;
@@ -526,9 +527,9 @@ async fn command_mode_background_inner(
     .await
     {
         Ok(Ok(Injection::Delivered)) => {}
-        Ok(Ok(Injection::CopiedForHeldModifier)) => {
+        Ok(Ok(Injection::CopiedForHeldModifier(copied))) => {
             if context.notify_error() {
-                notify_copied_for_held_modifier(&result);
+                notify_copied_for_held_modifier(&copied);
             }
         }
         Ok(Err(e)) => warn!("command mode: failed to inject text: {e:#}"),
@@ -1024,9 +1025,9 @@ async fn llm_command_background_inner(
     .await
     {
         Ok(Ok(Injection::Delivered)) => {}
-        Ok(Ok(Injection::CopiedForHeldModifier)) => {
+        Ok(Ok(Injection::CopiedForHeldModifier(copied))) => {
             if context.notify_error() {
-                notify_copied_for_held_modifier(&result);
+                notify_copied_for_held_modifier(&copied);
             }
         }
         Ok(Err(e)) => warn!(

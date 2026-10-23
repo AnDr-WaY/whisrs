@@ -42,6 +42,10 @@ pub mod local_whisper {
             false
         }
 
+        fn stream_text(&self) -> super::StreamText {
+            super::StreamText::Phrases
+        }
+
         async fn transcribe_segments(
             &self,
             _audio: &[u8],
@@ -326,6 +330,24 @@ pub struct TranscriptionConfig {
     pub diarize: bool,
 }
 
+/// How the pieces of text a backend sends on `text_tx` in
+/// [`TranscriptionBackend::transcribe_stream`] join up.
+///
+/// The daemon's typing batcher coalesces pieces that arrive close together
+/// (several queue up while typing waits on a held modifier), and only the
+/// backend knows whether two of them need a space between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamText {
+    /// Whole phrases, usually trimmed (Deepgram streaming, Groq, local
+    /// whisper, Lemonade's completed utterances): the daemon puts a space
+    /// between two of them unless one already has it at the boundary or the
+    /// next one starts with closing punctuation.
+    Phrases,
+    /// Fragments that carry their own spacing and may split a word (OpenAI
+    /// realtime append deltas: "Deep", "gram"): appended verbatim.
+    Fragments,
+}
+
 /// Trait for transcription backends.
 ///
 /// Each backend takes WAV-encoded audio bytes and returns the transcribed text.
@@ -402,6 +424,15 @@ pub trait TranscriptionBackend: Send + Sync {
     /// so one backend struct sends it for one model and not for another.
     /// Backends whose answer is fixed ignore the argument.
     fn sends_prompt(&self, config: &TranscriptionConfig) -> bool;
+
+    /// How the text [`Self::transcribe_stream`] sends joins up.
+    ///
+    /// Required, like `sends_prompt`: a default of `Phrases` would put spaces
+    /// inside the words a fragment backend splits, and treating everything as
+    /// `Fragments` is what glued queued phrases together ("itcopies") before
+    /// this existed. A backend on the default `transcribe_stream` sends one
+    /// text, so its answer never matters: it says `Phrases`.
+    fn stream_text(&self) -> StreamText;
 
     /// Transcribe one chunk of a recording track into timed segments.
     ///
@@ -500,6 +531,9 @@ mod tests {
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
+        }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
         }
         async fn transcribe_segments(
             &self,
@@ -608,6 +642,9 @@ mod tests {
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
+        }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
         }
         async fn transcribe_segments(
             &self,

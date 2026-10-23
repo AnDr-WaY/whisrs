@@ -2587,7 +2587,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use whisrs::recording::Segment;
     use whisrs::state::Action;
-    use whisrs::transcription::{Transcript, TranscriptionBackend, TranscriptionConfig};
+    use whisrs::transcription::{
+        StreamText, Transcript, TranscriptionBackend, TranscriptionConfig,
+    };
     use whisrs::State;
 
     fn active(id: &str) -> ActiveRecording {
@@ -2764,6 +2766,9 @@ mod tests {
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
+        }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
         }
         async fn transcribe_segments(
             &self,
@@ -3795,6 +3800,9 @@ mod tests {
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
         }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
+        }
         async fn transcribe_segments(
             &self,
             _audio: &[u8],
@@ -4068,6 +4076,9 @@ mod tests {
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
         }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
+        }
         async fn transcribe_segments(
             &self,
             _audio: &[u8],
@@ -4192,6 +4203,9 @@ mod tests {
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
+        }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
         }
         async fn transcribe_segments(
             &self,
@@ -5004,6 +5018,9 @@ mod tests {
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
+        }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
         }
         async fn transcribe_segments(
             &self,

@@ -46,6 +46,21 @@ let keymap = XkbKeymap::from_layout(&layout)?;
 let mut kb = Keyboard::with_components(keymap, default_clipboard(), Duration::from_millis(5))?;
 ```
 
+To pause or stop between keys, type through the `KeyInjector` trait. Its `type_text` asks a gate before every key with the byte offset of the next character; the gate may block, and `ControlFlow::Break` stops before that character:
+
+```rust
+use std::ops::ControlFlow;
+use std::time::Duration;
+use xkb_type::{KeyInjector, Keyboard, Typed};
+
+let mut kb: Box<dyn KeyInjector> = Box::new(Keyboard::new(Duration::from_millis(2))?);
+let text = "hello world";
+let mut gate = |at: usize| if at < 5 { ControlFlow::Continue(()) } else { ControlFlow::Break(()) };
+if let Typed::StoppedAt(at) = kb.type_text(text, &mut gate)? {
+    println!("not typed: {:?}", &text[at..]);
+}
+```
+
 ## Requirements
 
 - Linux

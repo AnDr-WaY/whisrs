@@ -589,19 +589,22 @@ pub struct InputConfig {
     /// A keystroke sent while a modifier is held becomes a shortcut: stopping
     /// a dictation with `Super+W` and keeping Super down would otherwise turn
     /// the typed text into `Super+<letter>` compositor binds (#154). whisrs
-    /// never types while a modifier is held. If one is still down when this
-    /// cap runs out, the text is copied to the clipboard instead of typed,
-    /// and a warning is logged.
+    /// never types while a modifier is held. The check runs before every
+    /// typed key (#171), so a modifier pressed while the text is being typed
+    /// pauses the typing, and the cap applies to each such wait. If one is
+    /// still down when the cap runs out, typing stops there: the rest of the
+    /// text (all of it if nothing was typed yet) is copied to the clipboard
+    /// instead, and a warning is logged. Text already typed stays put.
     ///
-    /// Streaming backends ignore this cap: each delta waits for the release
-    /// however long it takes, later deltas queue behind it and are typed in
-    /// order, and nothing goes to the clipboard. `whisrs cancel` ends the
-    /// wait and discards the waiting text.
+    /// Streaming backends ignore this cap: before every key they wait for
+    /// the release however long it takes, later deltas queue behind it and
+    /// are typed in order, and nothing goes to the clipboard. `whisrs cancel`
+    /// ends the wait and discards the text not typed yet.
     ///
-    /// `0` means don't wait: if a modifier is held, the text goes straight
-    /// to the clipboard; otherwise it is typed at once. When `/dev/input`
-    /// cannot be read, the check cannot see held keys and keys are sent as
-    /// before.
+    /// `0` means don't wait: if a modifier is held, the rest of the text goes
+    /// straight to the clipboard; otherwise it is typed at once. When
+    /// `/dev/input` cannot be read, the check cannot see held keys and keys
+    /// are sent as before.
     #[serde(default = "default_modifier_wait_ms")]
     pub modifier_wait_ms: u64,
     /// Keyboard-injection backend. `auto` (the recommended default) prefers
@@ -650,6 +653,9 @@ pub struct InputConfig {
     /// - Typing mode (`paste = false`): the text is copied after the
     ///   keystroke injection runs, whether that injection succeeded or
     ///   failed — the clipboard copy *is* the fallback for the failure case.
+    ///   The exception is a held modifier that stops the typing at
+    ///   [`Self::modifier_wait_ms`]: the clipboard then holds only the
+    ///   untyped rest, so pasting it does not repeat the typed part.
     /// - Paste mode (`paste = true`): pasting already puts the text on the
     ///   clipboard, so the usual restore of the previous clipboard contents
     ///   is skipped entirely; the transcribed text simply stays there.

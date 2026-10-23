@@ -142,7 +142,7 @@ The **primitives** they call live in the `xkb-type` workspace crate, not in `src
 
 ```
 crates/
-├── xkb-type/src/           # 0.1.4 — key injection
+├── xkb-type/src/           # 0.2.0 — key injection
 │   ├── lib.rs              #   KeyInjector + ClipboardBackend traits
 │   ├── keyboard.rs         #   uinput virtual keyboard (evdev)
 │   ├── keymap.rs           #   XKB reverse lookup (char → keycode+modifiers)
@@ -322,6 +322,7 @@ cargo clippy --all-targets --no-default-features --features tray,overlay,hooks -
 cargo clippy --all-targets --no-default-features --features tray,overlay,hooks,recording -- -D warnings   # without mcp (CI runs it)
 cargo test                                     # all tests must pass
 cargo test --no-default-features --features tray,overlay,hooks   # the "built without recording" answers (CI runs it)
+cargo test -p xkb-type --all-features -- --skip us_qwerty_fr_typeable_via_uinput --skip from_localectl_returns_layout_when_available   # xkb-type (CI runs it; root `cargo test` skips it)
 cargo build                                    # must compile
 ```
 
