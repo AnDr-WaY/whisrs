@@ -16,7 +16,9 @@ use whisrs::history::{self, HistoryEntry};
 use whisrs::llm;
 use whisrs::replacements::Replacer;
 use whisrs::state::Action;
-use whisrs::transcription::{transcription_prompt, TranscriptionBackend, TranscriptionConfig};
+use whisrs::transcription::{
+    transcription_prompt, StreamText, TranscriptionBackend, TranscriptionConfig,
+};
 use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
 use xkb_type::ClipboardBackend;
@@ -134,6 +136,10 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     let replacer =
         Replacer::new(&replacements).context("invalid [replacements] key in configuration")?;
 
+    // Asked before the backend moves into its task: the batcher joins what
+    // it sends by this.
+    let stream_text = backend.stream_text();
+
     // Spawn the transcription backend.
     let config_clone = config.clone();
     let backend_task = tokio::spawn(async move {
@@ -171,6 +177,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         let terminal_classes = Arc::new(terminal_classes);
         let full_text = run_typing_batcher(
             text_rx,
+            stream_text,
             typing_cancel,
             filler_filter,
             replacer,
@@ -445,12 +452,17 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 /// text reaches the cursor.
 ///
 /// Deltas arriving within 150ms of each other are coalesced into one batch so
-/// we don't create a new virtual keyboard per word delta. Each batch is
-/// sanitized ([`sanitize_for_injection`]) before it reaches the sink. The
-/// sink returns the text it handed on, which can differ from what it was
-/// given (line breaks folded at a terminal), and the batcher returns all of
-/// it accumulated: the transcript the clipboard copy and history get, so they
-/// hold exactly what was typed. Exits when the text channel closes or
+/// we don't create a new virtual keyboard per word delta. `stream_text` says
+/// how two of them join: `Phrases` by the same rule that joins a batch to the
+/// text before it ([`needs_space_between`]), `Fragments` verbatim. Phrases
+/// queue up whenever the sink is busy (a held modifier, slow typing), so they
+/// often share a batch.
+///
+/// Each batch is sanitized ([`sanitize_for_injection`]) before it reaches the
+/// sink. The sink returns the text it handed on, which can differ from what
+/// it was given (line breaks folded at a terminal), and the batcher returns
+/// all of it accumulated: the transcript the clipboard copy and history get,
+/// so they hold exactly what was typed. Exits when the text channel closes or
 /// `cancel` is set.
 ///
 /// The cancel flag is checked when a delta arrives and again right before a
@@ -461,11 +473,12 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 ///
 /// The daemon text channel is intentionally append-only. For OpenAI realtime
 /// this still feels token-by-token because the backend emits stable append
-/// deltas. For Lemonade-compatible profiles, the protocol layer only forwards
-/// completed utterances, so this loop naturally types phrase-sized chunks
-/// without needing any replacement semantics.
+/// deltas (`Fragments`). For Lemonade-compatible profiles, the protocol layer
+/// only forwards completed utterances (`Phrases`), so this loop naturally
+/// types phrase-sized chunks without needing any replacement semantics.
 pub(crate) async fn run_typing_batcher<F, Fut>(
     mut text_rx: tokio::sync::mpsc::Receiver<String>,
+    stream_text: StreamText,
     cancel: Arc<AtomicBool>,
     filler_filter: Option<FillerFilter>,
     replacer: Option<Replacer>,
@@ -491,6 +504,9 @@ where
         // Collect this delta and any others that arrive within the batch window.
         let mut batch = first;
         while let Ok(Some(more)) = tokio::time::timeout(batch_delay, text_rx.recv()).await {
+            if stream_text == StreamText::Phrases && needs_space_between(&batch, &more) {
+                batch.push(' ');
+            }
             batch.push_str(&more);
         }
 
@@ -527,14 +543,10 @@ where
         // Add space separator between turns if needed.
         // Don't insert a space before punctuation streaming deltas,
         // as they arrive as bare tokens.
-        let text_to_type = if full_text.is_empty()
-            || batch.starts_with(' ')
-            || full_text.ends_with(' ')
-            || leads_with_punct(&batch)
-        {
-            batch
-        } else {
+        let text_to_type = if needs_space_between(&full_text, &batch) {
             format!(" {batch}")
+        } else {
+            batch
         };
 
         // Last gate before the sink: cancel may have arrived while this
@@ -1315,6 +1327,18 @@ fn leads_with_punct(text: &str) -> bool {
     ])
 }
 
+/// Whether streamed `next` needs a space to follow `before`: not when either
+/// is empty, not when the boundary already has one, and not before closing
+/// punctuation ([`leads_with_punct`]). The one rule for joining a batch to
+/// the text already typed and, for `Phrases`, two deltas inside a batch.
+fn needs_space_between(before: &str, next: &str) -> bool {
+    !(before.is_empty()
+        || next.is_empty()
+        || before.ends_with(' ')
+        || next.starts_with(' ')
+        || leads_with_punct(next))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1501,14 +1525,18 @@ mod tests {
         tokio::task::JoinHandle<String>,
     );
 
-    /// Spawn `run_typing_batcher` with a recording sink.
+    /// Spawn `run_typing_batcher` for a phrase backend with a recording sink.
     fn spawn_test_batcher() -> TestBatcher {
-        spawn_test_batcher_with(str::to_string)
+        spawn_test_batcher_with(StreamText::Phrases, str::to_string)
     }
 
-    /// [`spawn_test_batcher`] with a sink that hands on `deliver(text)`
-    /// instead of `text`, the way the production sink folds line breaks.
-    fn spawn_test_batcher_with(deliver: fn(&str) -> String) -> TestBatcher {
+    /// [`spawn_test_batcher`] for a `stream_text` backend, with a sink that
+    /// hands on `deliver(text)` instead of `text`, the way the production
+    /// sink folds line breaks.
+    fn spawn_test_batcher_with(
+        stream_text: StreamText,
+        deliver: fn(&str) -> String,
+    ) -> TestBatcher {
         let (text_tx, text_rx) = tokio::sync::mpsc::channel::<String>(64);
         let cancel = Arc::new(AtomicBool::new(false));
         let typed = Arc::new(StdMutex::new(Vec::<String>::new()));
@@ -1516,6 +1544,7 @@ mod tests {
         let sink_log = Arc::clone(&typed);
         let batcher = tokio::spawn(run_typing_batcher(
             text_rx,
+            stream_text,
             Arc::clone(&cancel),
             None,
             None,
@@ -1537,9 +1566,10 @@ mod tests {
     /// the sink changed (line breaks folded at a terminal) kept.
     #[tokio::test(start_paused = true)]
     async fn typing_batcher_returns_the_sanitized_text_the_sink_handed_on() {
-        let (text_tx, _cancel, typed, batcher) = spawn_test_batcher_with(|text| {
-            crate::injection::fold_line_breaks_at_terminal(text, || true).into_owned()
-        });
+        let (text_tx, _cancel, typed, batcher) =
+            spawn_test_batcher_with(StreamText::Phrases, |text| {
+                crate::injection::fold_line_breaks_at_terminal(text, || true).into_owned()
+            });
 
         text_tx.send("ls\u{1b}\r\nrm x".to_string()).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1608,6 +1638,7 @@ mod tests {
         let replacer = Replacer::new(&table).unwrap();
         let batcher = tokio::spawn(run_typing_batcher(
             text_rx,
+            StreamText::Phrases,
             Arc::new(AtomicBool::new(false)),
             None,
             replacer,
@@ -1619,6 +1650,121 @@ mod tests {
             .unwrap();
         drop(text_tx);
         assert_eq!(batcher.await.unwrap(), "edit the PKGBUILD file");
+    }
+
+    /// Send `deltas` back to back (one batch window) to a `stream_text`
+    /// batcher; return what reached the sink and the transcript.
+    async fn type_in_one_batch(stream_text: StreamText, deltas: &[&str]) -> (Vec<String>, String) {
+        let (text_tx, _cancel, typed, batcher) =
+            spawn_test_batcher_with(stream_text, str::to_string);
+        for delta in deltas {
+            text_tx.send(delta.to_string()).await.unwrap();
+        }
+        drop(text_tx);
+        let full_text = batcher.await.unwrap();
+        let typed = typed.lock().unwrap().clone();
+        (typed, full_text)
+    }
+
+    #[test]
+    fn needs_space_between_rule() {
+        assert!(needs_space_between("a", "b"));
+        assert!(needs_space_between("a.", "(b)"));
+        assert!(!needs_space_between("", "b"), "nothing before");
+        assert!(!needs_space_between("a", ""), "nothing to separate");
+        assert!(!needs_space_between("a ", "b"));
+        assert!(!needs_space_between("a", " b"));
+        assert!(!needs_space_between("a", ", b"));
+        assert!(!needs_space_between("a", "\u{201D}"));
+    }
+
+    /// Phrase backends (Deepgram streaming, Groq, local whisper) send
+    /// trimmed phrases: two in one batch window used to be glued ("itcopies").
+    #[tokio::test(start_paused = true)]
+    async fn typing_batcher_spaces_phrases_in_one_batch() {
+        let (typed, full_text) = type_in_one_batch(StreamText::Phrases, &["a", "b"]).await;
+        assert_eq!(typed, ["a b"]);
+        assert_eq!(full_text, "a b");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_batcher_puts_no_space_before_closing_punctuation_in_a_batch() {
+        let (typed, full_text) =
+            type_in_one_batch(StreamText::Phrases, &["word", ", next", "."]).await;
+        assert_eq!(typed, ["word, next."]);
+        assert_eq!(full_text, "word, next.");
+    }
+
+    /// A space already at the boundary, on either side, is not doubled.
+    #[tokio::test(start_paused = true)]
+    async fn typing_batcher_adds_no_second_space_between_phrases() {
+        let (typed, full_text) =
+            type_in_one_batch(StreamText::Phrases, &["one ", "two", " three"]).await;
+        assert_eq!(typed, ["one two three"]);
+        assert_eq!(full_text, "one two three");
+    }
+
+    /// OpenAI realtime append deltas split words and carry their own spaces.
+    #[tokio::test(start_paused = true)]
+    async fn typing_batcher_glues_fragments_in_one_batch() {
+        let (typed, full_text) =
+            type_in_one_batch(StreamText::Fragments, &["Deep", "gram", " is", " fast"]).await;
+        assert_eq!(typed, ["Deepgram is fast"]);
+        assert_eq!(full_text, "Deepgram is fast");
+    }
+
+    /// The real trigger: phrases that arrive while the sink is still typing
+    /// (or waiting on a held modifier) queue up and come out as one batch.
+    #[tokio::test(start_paused = true)]
+    async fn typing_batcher_spaces_phrases_queued_while_the_sink_is_busy() {
+        let (text_tx, text_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let typed = Arc::new(StdMutex::new(Vec::<String>::new()));
+
+        let sink_release = Arc::clone(&release);
+        let sink_log = Arc::clone(&typed);
+        let batcher = tokio::spawn(run_typing_batcher(
+            text_rx,
+            StreamText::Phrases,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            move |text| {
+                let release = Arc::clone(&sink_release);
+                let sink_log = Arc::clone(&sink_log);
+                async move {
+                    let first = {
+                        let mut log = sink_log.lock().unwrap();
+                        log.push(text.clone());
+                        log.len() == 1
+                    };
+                    // The first batch blocks the sink until released.
+                    if first {
+                        release.notified().await;
+                    }
+                    text
+                }
+            },
+        ));
+
+        text_tx.send("it".to_string()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(*typed.lock().unwrap(), ["it"], "the sink is now busy");
+
+        text_tx
+            .send("copies to clipboard.".to_string())
+            .await
+            .unwrap();
+        text_tx.send("Okay.".to_string()).await.unwrap();
+        release.notify_one();
+        drop(text_tx);
+
+        let full_text = batcher.await.unwrap();
+        assert_eq!(
+            *typed.lock().unwrap(),
+            ["it", " copies to clipboard. Okay."]
+        );
+        assert_eq!(full_text, "it copies to clipboard. Okay.");
     }
 
     // ── BatchOptions / BatchOrigin decision logic ───────────────────────
@@ -1858,6 +2004,10 @@ mod tests {
 
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             self.sends_prompt
+        }
+
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
         }
 
         // The batch path never asks for segments; recordings have their own

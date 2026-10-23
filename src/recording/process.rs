@@ -1300,7 +1300,7 @@ mod tests {
     use crate::recording::echo::fixtures;
     use crate::recording::split::split_by_energies;
     use crate::recording::TrackMeta;
-    use crate::transcription::{RetryableHttpError, Transcript};
+    use crate::transcription::{RetryableHttpError, StreamText, Transcript};
     use audio_silence_gate::SILENCE_RMS_THRESHOLD;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1358,6 +1358,9 @@ mod tests {
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
+        }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
         }
         async fn transcribe_segments(
             &self,
@@ -1834,6 +1837,9 @@ mod tests {
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
         }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
+        }
         async fn transcribe_segments(
             &self,
             audio: &[u8],
@@ -2056,6 +2062,9 @@ mod tests {
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
+        }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
         }
         async fn transcribe_segments(
             &self,
@@ -2547,6 +2556,9 @@ mod tests {
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
         }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
+        }
         async fn transcribe_segments(
             &self,
             audio: &[u8],
@@ -2694,6 +2706,9 @@ mod tests {
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
+        }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
         }
         async fn transcribe_segments(
             &self,
@@ -3928,6 +3943,9 @@ mod tests {
         }
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             false
+        }
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
         }
         async fn transcribe_segments(
             &self,

@@ -18,7 +18,7 @@ use crate::audio::AudioChunk;
 
 use super::flac::{recording_upload, UploadFormat};
 use super::verbose_json::parse_verbose_segments;
-use super::{Transcript, TranscriptionBackend, TranscriptionConfig, UPLOAD_CHUNK_SECS};
+use super::{StreamText, Transcript, TranscriptionBackend, TranscriptionConfig, UPLOAD_CHUNK_SECS};
 
 /// Maximum file size accepted by the Groq API (25 MB).
 const MAX_FILE_SIZE: usize = 25 * 1024 * 1024;
@@ -350,6 +350,11 @@ impl TranscriptionBackend for GroqBackend {
     // (`form.text("prompt", ...)` in `transcribe` and in the chunked path).
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         true
+    }
+
+    // One chunk's words, space-joined, per send.
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
     }
 
     // Native timestamps: verbose_json segments, parsed by

@@ -11,7 +11,7 @@ use crate::audio::AudioChunk;
 use super::openai_realtime_protocol::{
     OpenAiRealtimeProfile, OpenAiRealtimeProtocolEngine, RealtimeEngineConfig, TurnDetectionMode,
 };
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{StreamText, TranscriptionBackend, TranscriptionConfig};
 
 /// External OpenAI-compatible realtime backend.
 #[derive(Debug)]
@@ -152,6 +152,12 @@ impl TranscriptionBackend for OpenAiCompatibleRealtimeBackend {
     // transcripts discarded as echoes of a prompt that was never sent.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
+    }
+
+    // The profile `engine` always uses (`new` accepts no other): completed
+    // utterances.
+    fn stream_text(&self) -> StreamText {
+        OpenAiRealtimeProfile::Lemonade.stream_text()
     }
 
     // Live-only: a recording needs a batch backend.
@@ -321,6 +327,22 @@ mod tests {
         .unwrap();
 
         assert!(!backend.sends_prompt(&test_request()));
+    }
+
+    /// Lemonade forwards only completed utterances, so queued ones need a
+    /// space between them. Pinned for the same reason as the prompt answer.
+    #[test]
+    fn lemonade_stream_text_is_phrases() {
+        let backend = OpenAiCompatibleRealtimeBackend::new(
+            "ws://localhost:1234/realtime".to_string(),
+            "Whisper-Tiny".to_string(),
+            "lemonade".to_string(),
+            "server-vad".to_string(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(backend.stream_text(), StreamText::Phrases);
     }
 
     #[test]

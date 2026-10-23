@@ -16,7 +16,9 @@ use tracing::{debug, error, info, warn};
 use crate::audio::AudioChunk;
 
 use super::flac::{recording_upload, UploadFormat};
-use super::{secs_to_ms, Segment, Transcript, TranscriptionBackend, TranscriptionConfig, Word};
+use super::{
+    secs_to_ms, Segment, StreamText, Transcript, TranscriptionBackend, TranscriptionConfig, Word,
+};
 
 /// Deepgram REST API endpoint for pre-recorded audio.
 const DEEPGRAM_REST_URL: &str = "https://api.deepgram.com/v1/listen";
@@ -627,6 +629,10 @@ impl TranscriptionBackend for DeepgramRestBackend {
         false
     }
 
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
+    }
+
     // Native timestamps via `utterances=true`, and speakers via
     // `diarize_model` when the request asks for them. The chunk goes up as
     // FLAC.
@@ -856,6 +862,11 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
     // as `keyterm` query params.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
+    }
+
+    // Trimmed final results, one per utterance.
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
     }
 
     // A recording has no use for the live socket: same key and model,

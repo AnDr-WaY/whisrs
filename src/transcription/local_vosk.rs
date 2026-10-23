@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{StreamText, TranscriptionBackend, TranscriptionConfig};
 
 /// Vosk-based local transcription backend.
 pub struct VoskBackend {
@@ -41,6 +41,10 @@ impl TranscriptionBackend for VoskBackend {
     // implements Vosk answers it again off the real request.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
+    }
+
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
     }
 
     // Unreachable for the same reason as `transcribe`: there is no backend yet.

@@ -2767,7 +2767,8 @@ mod tests {
     }
 
     /// Deltas that arrive while one waits on a held modifier queue in the
-    /// batcher and are typed in order once it is released.
+    /// batcher and are typed in order once it is released, with a space
+    /// between the phrases that shared a batch (Deepgram sends them trimmed).
     #[test]
     fn streaming_deltas_queued_during_a_modifier_wait_are_typed_in_order() {
         let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2784,12 +2785,12 @@ mod tests {
             readings += 1;
             if readings == 2 {
                 if let Some(tx) = &probe_tx {
-                    tx.try_send(" two".to_string()).unwrap();
+                    tx.try_send("two".to_string()).unwrap();
                 }
             }
             if readings == 3 {
                 if let Some(tx) = probe_tx.take() {
-                    tx.try_send(" three".to_string()).unwrap();
+                    tx.try_send("three".to_string()).unwrap();
                 }
             }
             readings <= 6
@@ -2806,6 +2807,7 @@ mod tests {
                     .unwrap();
                 full_text = runtime.block_on(crate::pipeline::run_typing_batcher(
                     text_rx,
+                    whisrs::transcription::StreamText::Phrases,
                     Arc::clone(&cancel),
                     None,
                     None,

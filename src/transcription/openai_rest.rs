@@ -12,7 +12,8 @@ use tracing::{debug, warn};
 use super::flac::{recording_upload, UploadFormat};
 use super::verbose_json::parse_verbose_segments;
 use super::{
-    segments_by_phrase, Transcript, TranscriptionBackend, TranscriptionConfig, UPLOAD_CHUNK_SECS,
+    segments_by_phrase, StreamText, Transcript, TranscriptionBackend, TranscriptionConfig,
+    UPLOAD_CHUNK_SECS,
 };
 
 /// Maximum file size accepted by the OpenAI API (25 MB).
@@ -197,6 +198,10 @@ impl TranscriptionBackend for OpenAIRestBackend {
     // `transcribe` puts the prompt on the wire as the `prompt` multipart field.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         true
+    }
+
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
     }
 
     // whisper-1: verbose_json segments, the chunk sent as FLAC. Everything

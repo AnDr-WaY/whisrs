@@ -2,6 +2,7 @@ use base64::Engine;
 use tracing::warn;
 
 use super::wire::{LemonadeSessionUpdate, OpenAiSessionUpdate};
+use crate::transcription::StreamText;
 
 /// OpenAI Realtime API rejects transcription prompts longer than this.
 pub const PROMPT_MAX_CHARS: usize = 1024;
@@ -49,6 +50,15 @@ impl OpenAiRealtimeProfile {
         match self {
             Self::OpenAi => DeltaMode::AppendOnly,
             Self::Lemonade => DeltaMode::ReplaceableInterim,
+        }
+    }
+
+    /// How the text the engine sends for this profile joins up: append
+    /// deltas are fragments, completed utterances are phrases.
+    pub fn stream_text(self) -> StreamText {
+        match self.delta_mode() {
+            DeltaMode::AppendOnly => StreamText::Fragments,
+            DeltaMode::ReplaceableInterim => StreamText::Phrases,
         }
     }
 
@@ -219,6 +229,18 @@ mod tests {
         assert_eq!(
             OpenAiRealtimeProfile::Lemonade.delta_mode(),
             DeltaMode::ReplaceableInterim
+        );
+    }
+
+    #[test]
+    fn stream_text_follows_the_delta_mode() {
+        assert_eq!(
+            OpenAiRealtimeProfile::OpenAi.stream_text(),
+            StreamText::Fragments
+        );
+        assert_eq!(
+            OpenAiRealtimeProfile::Lemonade.stream_text(),
+            StreamText::Phrases
         );
     }
 

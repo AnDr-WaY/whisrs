@@ -11,7 +11,8 @@ use tracing::{debug, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
-    secs_to_ms, segments_by_phrase, Segment, Transcript, TranscriptionBackend, TranscriptionConfig,
+    secs_to_ms, segments_by_phrase, Segment, StreamText, Transcript, TranscriptionBackend,
+    TranscriptionConfig,
 };
 
 /// Keep a guardrail so a runaway recording does not create an unbounded
@@ -271,6 +272,10 @@ impl TranscriptionBackend for AsrSidecarBackend {
     // sent as the `hotwords` multipart field.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         true
+    }
+
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
     }
 
     // Native segments when the sidecar returns them; otherwise the phrase
