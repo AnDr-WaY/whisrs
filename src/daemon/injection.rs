@@ -1939,6 +1939,7 @@ mod tests {
     struct ScriptedClipboard {
         texts: StdMutex<Vec<Option<String>>>,
         writes: StdMutex<Vec<String>>,
+        reads: StdMutex<usize>,
         fail_writes: bool,
     }
 
@@ -1947,6 +1948,7 @@ mod tests {
             Self {
                 texts: StdMutex::new(texts.iter().map(|t| t.map(String::from)).collect()),
                 writes: StdMutex::new(Vec::new()),
+                reads: StdMutex::new(0),
                 fail_writes: false,
             }
         }
@@ -1954,10 +1956,15 @@ mod tests {
         fn writes(&self) -> Vec<String> {
             self.writes.lock().unwrap().clone()
         }
+
+        fn reads(&self) -> usize {
+            *self.reads.lock().unwrap()
+        }
     }
 
     impl ClipboardBackend for ScriptedClipboard {
         fn get_text(&self) -> anyhow::Result<String> {
+            *self.reads.lock().unwrap() += 1;
             let mut texts = self.texts.lock().unwrap();
             assert!(!texts.is_empty(), "get_text called with no scripted result");
             let head = if texts.len() > 1 {
@@ -3126,8 +3133,8 @@ mod tests {
         assert_eq!(*events, expected);
     }
 
-    /// Paste mode with a non-text clipboard overwrites it and pastes; a hold
-    /// at the Ctrl+V withholds the paste and the text stays on the clipboard.
+    /// Paste mode with a non-text clipboard overwrites it, the Ctrl+V goes
+    /// out, and nothing is restored afterwards (nothing was saved).
     #[test]
     fn unreadable_clipboard_is_overwritten_and_pasted() {
         let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3136,29 +3143,27 @@ mod tests {
         let typed = Arc::clone(&keyboard.typed);
         let events = Arc::clone(&keyboard.events);
 
-        let mut result = None;
-        with_modifier_held_forever(|| {
-            result = Some(inject_with_keys(
-                test_keys_waiting(std::time::Duration::from_millis(30)),
-                keyboard,
-                Arc::clone(&clipboard),
-                "hello world",
-                /* paste = */ true,
-                /* clipboard_fallback = */ false,
-                /* clipboard_only = */ false,
-            ));
-        });
-
-        assert_eq!(
-            result.unwrap().unwrap(),
-            Injection::CopiedForHeldModifier("hello world".to_string())
+        let result = inject(
+            keyboard,
+            Arc::clone(&clipboard),
+            "hello world",
+            /* paste = */ true,
+            /* clipboard_fallback = */ false,
+            /* clipboard_only = */ false,
         );
+
+        assert_eq!(result.unwrap(), Injection::Delivered);
         assert!(
             typed.lock().unwrap().is_empty(),
             "the typing fallback must not fire for a non-text clipboard"
         );
-        assert!(events.lock().unwrap().is_empty(), "no Ctrl+V went out");
+        assert!(!events.lock().unwrap().is_empty(), "the Ctrl+V must go out");
         assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
+        assert_eq!(
+            clipboard.reads(),
+            1,
+            "only the pre-paste read: a restore thread would need another"
+        );
     }
 
     /// Streaming: a modifier pressed partway through a delta and held far

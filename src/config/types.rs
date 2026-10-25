@@ -668,10 +668,10 @@ pub struct InputConfig {
     /// copied beforehand is gone, and it is not restored. That is the point
     /// of the feature (the fallback only works because the text is there),
     /// but it also means the clipboard no longer survives a dictation. In
-    /// paste mode a non-text clipboard (an image, a file list) is still
-    /// protected: an unreadable clipboard makes the paste path fall back to
-    /// typing without touching the clipboard, since overwriting content that
-    /// can never be restored is worse than losing the fallback (issue #69).
+    /// paste mode a non-text clipboard (an image, a file list) is
+    /// overwritten by the paste itself — the dictated text is worth more
+    /// than content that can simply be re-copied — and nothing is restored,
+    /// so the clipboard keeps the dictation afterwards.
     #[serde(default)]
     pub clipboard_fallback: bool,
     /// Copy-only mode: the final text is written to the system clipboard
