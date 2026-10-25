@@ -814,12 +814,13 @@ fn modifier_probe() -> impl FnMut() -> bool {
 /// wrap it in `spawn_blocking`), so the sleeps/restore use std threads.
 ///
 /// `ClipboardBackend` is text-only, so a clipboard holding non-text content
-/// (an image, a file list, ...) can't be captured and round-tripped at all.
-/// If the pre-paste read fails, this falls back to typing instead of pasting
-/// — overwriting the clipboard via `set_text` first and only then discovering
-/// there's nothing valid to restore would destroy that content permanently
-/// (see #69), which skipping the *restore* alone can't undo since the damage
-/// already happened at `set_text`.
+/// (an image, a file list, ...) can't be captured and round-tripped. Rather
+/// than falling back to typing, the paste overwrites such content
+/// deliberately: the dictated text is worth more than content that can
+/// simply be re-copied (an image re-pasted from the screenshot tool, a file
+/// list re-picked), and the old typing fallback broke the flow silently.
+/// Nothing is saved in that case, so no restore runs afterwards — the
+/// clipboard keeps the dictation until the user copies something else.
 ///
 /// The restore is otherwise skipped, rather than clobbering the clipboard,
 /// when the clipboard no longer holds the text we set — something else (the
@@ -833,10 +834,9 @@ fn modifier_probe() -> impl FnMut() -> bool {
 /// (a `warn!` on copy error, never a change to the returned `Result`),
 /// unless a held modifier stopped them (then the clipboard holds only the
 /// untyped rest, see below); in paste mode the post-paste restore is
-/// skipped entirely, so the pasted text simply stays in the clipboard. The unreadable-clipboard fallback to
-/// typing above still applies in paste mode: it exists to protect non-text
-/// content, and typing already delivered the text, so no clipboard write
-/// happens on that degraded path.
+/// skipped entirely, so the pasted text simply stays in the clipboard. A
+/// non-text clipboard is overwritten by the paste itself (see above), so
+/// there is no degraded path to consider.
 ///
 /// With `clipboard_only` (see
 /// [`whisrs::InputConfig::clipboard_only`]) the text is never injected at
@@ -933,21 +933,19 @@ fn inject_text_with_clipboard(
         return result.map(|_| Injection::Delivered);
     }
 
+    // The pre-paste read: on success, the saved text is restored after the
+    // paste. On failure (non-text content — an image, a file list), the
+    // clipboard is overwritten with the dictation on purpose: the text is
+    // worth more than content that can simply be re-copied, and the old
+    // typing fallback broke the flow silently. Nothing valid was saved, so
+    // there is nothing to restore afterwards.
     let saved = match clipboard.get_text() {
-        Ok(s) => s,
+        Ok(s) => Some(s),
         Err(e) => {
-            warn!("clipboard unreadable as text, typing instead of pasting: {e:#}");
-            return match type_text_with_clear(text, keys, clear_line)? {
-                Typed::All => Ok(Injection::Delivered),
-                // Overwrites the non-text clipboard (#69's concern), but the
-                // alternative is dropping the rest of the dictation, which is
-                // worse.
-                Typed::StoppedAt(typed) => copy_instead_of_keystrokes(
-                    clipboard.as_ref(),
-                    untyped_rest(text, typed),
-                    keys.modifier_wait,
-                ),
-            };
+            info!(
+                "clipboard holds non-text content; overwriting it with the dictation (nothing to restore): {e:#}"
+            );
+            None
         }
     };
     clipboard
@@ -978,24 +976,28 @@ fn inject_text_with_clipboard(
 
     // Restore the user's clipboard after the paste has landed, regardless of
     // whether the keystroke succeeded — but only if it's safe to (see doc
-    // comment above).
-    let pasted_text = text.to_string();
-    std::thread::spawn(move || {
-        std::thread::sleep(restore_delay);
-        match clipboard.get_text() {
-            Ok(current) if current == pasted_text => {
-                if let Err(e) = clipboard.set_text(&saved) {
-                    warn!("failed to restore clipboard: {e}");
+    // comment above). Skipped when the pre-paste read found non-text
+    // content: that content was overwritten on purpose, and nothing valid
+    // was saved to bring back.
+    if let Some(saved) = saved {
+        let pasted_text = text.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(restore_delay);
+            match clipboard.get_text() {
+                Ok(current) if current == pasted_text => {
+                    if let Err(e) = clipboard.set_text(&saved) {
+                        warn!("failed to restore clipboard: {e}");
+                    }
+                }
+                Ok(_) => {
+                    debug!("clipboard changed during paste injection; skipping restore");
+                }
+                Err(e) => {
+                    warn!("failed to read clipboard before restore, skipping restore: {e}");
                 }
             }
-            Ok(_) => {
-                debug!("clipboard changed during paste injection; skipping restore");
-            }
-            Err(e) => {
-                warn!("failed to read clipboard before restore, skipping restore: {e}");
-            }
-        }
-    });
+        });
+    }
 
     paste_result
 }
@@ -2611,9 +2613,9 @@ mod tests {
     #[test]
     fn held_modifier_with_unreadable_clipboard_still_copies() {
         let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Paste mode, non-text clipboard: the path falls back to typing, and
-        // a held modifier then withholds that too. The text is copied rather
-        // than lost.
+        // Paste mode with a non-text clipboard overwrites it (set_text) and
+        // still withholds the Ctrl+V while a modifier is held: the text is
+        // left on the clipboard for a manual paste, no keys go out.
         let clipboard = Arc::new(ScriptedClipboard::new(&[None]));
         let keyboard = MockKeyboard::default();
         let events = Arc::clone(&keyboard.events);
@@ -3124,19 +3126,18 @@ mod tests {
         assert_eq!(*events, expected);
     }
 
-    /// Paste mode with a non-text clipboard types instead; a hold mid-text
-    /// there copies only the untyped rest too.
+    /// Paste mode with a non-text clipboard overwrites it and pastes; a hold
+    /// at the Ctrl+V withholds the paste and the text stays on the clipboard.
     #[test]
-    fn unreadable_clipboard_typing_copies_only_the_untyped_rest() {
+    fn unreadable_clipboard_is_overwritten_and_pasted() {
         let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let clipboard = Arc::new(ScriptedClipboard::new(&[None]));
         let keyboard = MockKeyboard::default();
         let typed = Arc::clone(&keyboard.typed);
         let events = Arc::clone(&keyboard.events);
-        let probe = logged_probe(&events, |n| n > 6);
 
         let mut result = None;
-        with_modifier_probe(probe, || {
+        with_modifier_held_forever(|| {
             result = Some(inject_with_keys(
                 test_keys_waiting(std::time::Duration::from_millis(30)),
                 keyboard,
@@ -3150,10 +3151,14 @@ mod tests {
 
         assert_eq!(
             result.unwrap().unwrap(),
-            Injection::CopiedForHeldModifier(" world".to_string())
+            Injection::CopiedForHeldModifier("hello world".to_string())
         );
-        assert_eq!(*typed.lock().unwrap(), vec!["hello".to_string()]);
-        assert_eq!(clipboard.writes(), vec![" world".to_string()]);
+        assert!(
+            typed.lock().unwrap().is_empty(),
+            "the typing fallback must not fire for a non-text clipboard"
+        );
+        assert!(events.lock().unwrap().is_empty(), "no Ctrl+V went out");
+        assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
     }
 
     /// Streaming: a modifier pressed partway through a delta and held far
