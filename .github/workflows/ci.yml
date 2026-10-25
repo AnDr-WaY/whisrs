@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -31,8 +34,52 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # No release row builds without `recording` or `mcp` (the minimal build
+      # has both), so these keep a source build without them compiling: the
+      # `whisrs recording` and `whisrs mcp` stubs, the daemon's refusal and
+      # the config warning without `recording`, then `recording` without `mcp`.
+      - name: Clippy without recording
+        run: cargo clippy --all-targets --no-default-features --features tray,overlay,hooks -- -D warnings
+
+      - name: Clippy without mcp
+        run: cargo clippy --all-targets --no-default-features --features tray,overlay,hooks,recording -- -D warnings
+
       - name: Test
         run: cargo test
+
+      # `cargo test` above covers only the root package, so the xkb-type tests
+      # (key planning, the per-key gate) run here, with every feature so the
+      # wayland-vk and xtest code is tested too. Two tests read the host's
+      # keyboard setup and are skipped: us(qwerty-fr) is a third-party layout
+      # that xkeyboard-config does not ship, and the runner's localectl may
+      # report no X11 layout.
+      - name: Test xkb-type
+        run: cargo test -p xkb-type --all-features -- --skip us_qwerty_fr_typeable_via_uinput --skip from_localectl_returns_layout_when_available
+
+      # The "built without the recording feature" answers (CLI, daemon, config
+      # warning) exist only in a build without it, and dictation must pass
+      # there too. Without a warm cache this builds much of the tree again:
+      # clippy above only type-checks, and without `recording` shared deps
+      # (serde, futures-sink, uuid) get other features, so what sits on them
+      # compiles again.
+      - name: Test without recording
+        run: cargo test --no-default-features --features tray,overlay,hooks
+
+      # The GPU features are passthroughs to whisper-rs and are never compiled
+      # here: a Vulkan build needs shaderc, and no runner has a CUDA or ROCm
+      # toolchain. Resolving them takes about a second and is enough to catch an
+      # upstream feature rename, which would otherwise surface as a resolver
+      # error for the first user running `cargo install whisrs --features cuda`.
+      # `--locked` also pins the lock file against a future upstream change that
+      # adds a dependency edge to one of them (today only `vulkan` has one,
+      # `dep:libc`).
+      - name: GPU feature flags resolve
+        run: |
+          for feature in vulkan cuda hipblas; do
+            echo "::group::$feature"
+            cargo metadata --locked --format-version 1 --features "$feature" > /dev/null
+            echo "::endgroup::"
+          done
 
   release-build:
     name: Release build — ${{ matrix.name }}
@@ -43,7 +90,11 @@ jobs:
           - name: full (default features)
             features: ""
           - name: minimal (no local-whisper)
-            features: "--no-default-features --features tray,overlay,hooks"
+            features: "--no-default-features --features tray,overlay,hooks,recording,mcp"
+    # Same CPU baseline as the x86_64 rows of release.yml, so a regression
+    # fails the PR instead of the tag (#152).
+    env:
+      GGML_NATIVE: "OFF"
     steps:
       - uses: actions/checkout@v4
 
@@ -53,6 +104,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: GGML
 
       - name: Release build
         run: cargo build --release ${{ matrix.features }}
+
+      - name: Check for AVX-512 instructions
+        run: scripts/check-no-avx512.sh

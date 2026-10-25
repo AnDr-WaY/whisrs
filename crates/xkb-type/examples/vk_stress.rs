@@ -26,7 +26,6 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 use xkb_type::wayland_vk::WaylandVkKeyboard;
-use xkb_type::KeyInjector;
 
 /// A line-protocol handle to the spawned recorder client.
 struct Recorder {

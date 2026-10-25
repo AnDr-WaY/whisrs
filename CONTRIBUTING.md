@@ -60,8 +60,12 @@ sudo dnf install gcc-c++ alsa-lib-devel libxkbcommon-devel pkg-config clang-deve
 default feature. To skip that toolchain, build without it:
 
 ```bash
-cargo build --no-default-features --features tray,overlay,hooks
+cargo build --no-default-features --features tray,overlay,hooks,recording,mcp
 ```
+
+That is the minimal release build. Dropping `recording,mcp` too leaves out the recording
+feature and `whisrs mcp` (which needs it). CI lints that build and the one without `mcp`, and
+runs the tests of the one without `recording`.
 
 ### Build and test
 

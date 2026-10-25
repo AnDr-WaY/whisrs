@@ -1,0 +1,26 @@
+[Unit]
+Description=Nemotron speaker diarization sidecar for whisrs (nemo-speech serve)
+Documentation=https://github.com/y0sif/whisrs/blob/main/contrib/diarization-sidecars/nemotron/README.md
+
+[Service]
+Type=simple
+# CPU build. For the Vulkan build, use the -vulkan directory and --device vulkan:0.
+ExecStart=%h/.local/share/nemo-speech/nemo-speech-0.2.0-linux-x86_64-cpu/bin/nemo-speech serve \
+    --host 127.0.0.1 --port 8771 --no-ui \
+    --config %h/.config/nemo-speech/diarization.yaml --device cpu
+# Keep any model nemo-speech downloads on its own beside the binary.
+Environment=NEMO_SPEECH_MODEL_DIR=%h/.local/share/nemo-speech/models
+Nice=10
+Restart=on-failure
+RestartSec=5
+# Memory grows with the speech it is sent, about 22 MB a minute (measured on
+# the CPU build: 440 MB for 15 minutes, 1.4 GB for an hour, 2.7 GB for two),
+# so some 3.9 GB for three hours, whisrs' default longest recording. Past
+# this cap the kernel stops the sidecar alone, not your session, and whisrs
+# writes that transcript without speakers. Lower it to refuse long tracks on
+# a small machine. No swap, so the cap stops it instead of swapping.
+MemoryMax=4500M
+MemorySwapMax=0
+
+[Install]
+WantedBy=default.target

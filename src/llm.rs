@@ -8,7 +8,11 @@
 //! `model` to whatever the server has loaded; local servers don't validate
 //! `api_key`, so any placeholder string works.
 //!
-//! One entry point, [`rewrite_text`], shared by both callers: `whisrs command`
+//! [`chat`] is the plain entry point for any other use: a prepared
+//! conversation in, the reply out as it arrived, with a time limit. The
+//! recording feature names speakers with it.
+//!
+//! One rewrite entry point, [`rewrite_text`], shared by both callers: `whisrs command`
 //! applies a spoken instruction to the text the user selected, and an
 //! `[[llm_commands]]` entry does the same with the roles swapped (dictated
 //! text + a preset instruction). A generic instruction — "treat the following
@@ -22,6 +26,8 @@
 //! question the injection site needs in order to decide whether a reply may be
 //! sent to a terminal. The decision itself is not here — see
 //! `daemon/injection.rs`, which knows what is focused.
+
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -97,21 +103,22 @@ struct ChatRequest {
     temperature: f32,
 }
 
+/// One message of a chat request ([`chat`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ChatMessage {
+pub struct ChatMessage {
     role: String,
     content: String,
 }
 
 impl ChatMessage {
-    fn system(content: &str) -> Self {
+    pub fn system(content: &str) -> Self {
         Self {
             role: "system".to_string(),
             content: content.to_string(),
         }
     }
 
-    fn user(content: String) -> Self {
+    pub fn user(content: String) -> Self {
         Self {
             role: "user".to_string(),
             content,
@@ -134,6 +141,27 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatResponseMessage,
+    /// Why the model stopped: `stop`, or `length` for a reply cut off at
+    /// its output limit. Not every server sends it.
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+/// A reply from [`chat_reply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatReply {
+    /// The reply as it arrived.
+    pub content: String,
+    /// Why the model stopped, when the server says: `length` means the
+    /// reply was cut off at the model's output limit.
+    pub finish_reason: Option<String>,
+}
+
+impl ChatReply {
+    /// The model stopped at its output limit: the reply is cut off.
+    pub fn is_cut_off(&self) -> bool {
+        self.finish_reason.as_deref() == Some("length")
+    }
 }
 
 #[derive(Deserialize)]
@@ -311,6 +339,11 @@ pub fn contains_line_break(text: &str) -> bool {
     text.contains(LINE_BREAKS)
 }
 
+/// Whether `c` is one of the characters [`contains_line_break`] looks for.
+pub fn is_line_break(c: char) -> bool {
+    LINE_BREAKS.contains(&c)
+}
+
 /// Normalize CRLF and bare CR to LF, so exactly one character has to be
 /// looked for downstream.
 fn normalize_line_endings(text: &str) -> String {
@@ -336,7 +369,7 @@ fn is_fence_language_tag(info: &str) -> bool {
 
 /// Strip a code fence that wraps the whole answer, returning `text` unchanged
 /// when the answer isn't a single fenced block.
-fn strip_wrapping_code_fence(text: &str) -> &str {
+pub(crate) fn strip_wrapping_code_fence(text: &str) -> &str {
     let trimmed = text.trim();
     let Some(rest) = trimmed.strip_prefix("```") else {
         return text;
@@ -353,10 +386,10 @@ fn strip_wrapping_code_fence(text: &str) -> &str {
         // Content on the fence line: stripping would drop it. Leave the reply
         // whole and let the caller decide (see `is_fence_language_tag`).
         warn!(
-            "llm: fenced reply carries content on the fence line ({:?}); \
-             leaving the fence in place rather than dropping it",
-            info.trim()
+            "llm: fenced reply carries content on the fence line; \
+             leaving the fence in place rather than dropping it"
         );
+        debug!("fence line: {:?}", info.trim());
         return text;
     }
     let Some(body) = body.trim_end().strip_suffix("```") else {
@@ -381,10 +414,8 @@ pub async fn rewrite_text(
     instruction: &str,
 ) -> anyhow::Result<String> {
     let api_key = resolve_api_key(config)?;
-    info!(
-        "llm: sending to LLM (model={}, instruction={:?})",
-        config.model, instruction
-    );
+    info!("llm: sending to LLM (model={})", config.model);
+    debug!("instruction: {:?}", instruction);
     debug!("selected text: {:?}", selected_text);
 
     chat_with_key(
@@ -393,6 +424,35 @@ pub async fn rewrite_text(
         rewrite_messages(selected_text, instruction),
     )
     .await
+    .map(|reply| reply.content)
+}
+
+/// Send `messages` to the configured `/chat/completions` endpoint and return
+/// the reply as it arrived: unlike command mode's, it is not run through
+/// [`clean_llm_output`], so a caller that wants JSON or Markdown gets it
+/// whole. Gives up after `timeout`.
+pub async fn chat(
+    config: &LlmConfig,
+    messages: Vec<ChatMessage>,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    chat_reply(config, messages, timeout)
+        .await
+        .map(|reply| reply.content)
+}
+
+/// [`chat`], with why the model stopped ([`ChatReply::finish_reason`]).
+pub async fn chat_reply(
+    config: &LlmConfig,
+    messages: Vec<ChatMessage>,
+    timeout: Duration,
+) -> anyhow::Result<ChatReply> {
+    let api_key = resolve_api_key(config)?;
+    info!("llm: sending a chat request (model={})", config.model);
+    match tokio::time::timeout(timeout, chat_with_key(config, &api_key, messages)).await {
+        Ok(reply) => reply,
+        Err(_) => anyhow::bail!("the LLM did not answer within {timeout:?}"),
+    }
 }
 
 /// The configured key, or the env-var fallback when `[llm] api_key` is empty.
@@ -414,6 +474,9 @@ fn resolve_api_key(config: &LlmConfig) -> anyhow::Result<String> {
     Ok(key)
 }
 
+/// How much of an error answer's body an error carries.
+const ERROR_BODY_CHARS: usize = 300;
+
 /// POST a prepared messages array to the configured `/chat/completions`
 /// endpoint.
 ///
@@ -425,7 +488,7 @@ async fn chat_with_key(
     config: &LlmConfig,
     api_key: &str,
     messages: Vec<ChatMessage>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ChatReply> {
     let request = ChatRequest {
         model: config.model.clone(),
         messages,
@@ -440,35 +503,142 @@ async fn chat_with_key(
         .json(&request)
         .send()
         .await
-        .context("failed to reach LLM API — check your internet connection")?;
+        // Without the URL, which some endpoints carry a key in: the error
+        // reaches recording.json when the LLM names speakers.
+        .map_err(reqwest::Error::without_url)
+        .context("failed to reach the LLM API; check your internet connection")?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         if status.as_u16() == 401 {
-            anyhow::bail!("LLM API: invalid API key — check [llm] api_key in config.toml");
+            anyhow::bail!("LLM API: invalid API key; check [llm] api_key in config.toml");
         }
-        anyhow::bail!("LLM API error ({status}): {body}");
+        let detail: String = body.trim().chars().take(ERROR_BODY_CHARS).collect();
+        anyhow::bail!("LLM API error ({status}): {detail}");
     }
 
     let chat_response: ChatResponse = response
         .json()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("failed to parse LLM response")?;
 
-    let result = chat_response
+    let reply = chat_response
         .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .unwrap_or_default();
+        .into_iter()
+        .next()
+        .map(|c| ChatReply {
+            content: c.message.content,
+            finish_reason: c.finish_reason,
+        })
+        .unwrap_or(ChatReply {
+            content: String::new(),
+            finish_reason: None,
+        });
 
-    info!("llm: LLM returned {} chars", result.len());
-    Ok(result)
+    info!("llm: LLM returned {} chars", reply.content.len());
+    Ok(reply)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local(url: String) -> LlmConfig {
+        LlmConfig {
+            api_key: "local-key".into(),
+            model: "local-model".into(),
+            api_url: url,
+        }
+    }
+
+    /// `chat` posts the messages as given and returns the reply untouched:
+    /// a fenced answer keeps its fence for the caller to read.
+    #[tokio::test]
+    async fn chat_returns_the_reply_as_it_arrived() {
+        use crate::transcription::test_server::serve_once;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"choices":[{"message":{"role":"assistant","content":"```json\n{\"S1\": null}\n```"}}]}"#,
+        ));
+        let reply = chat(
+            &local(url),
+            vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("hello".into()),
+            ],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, "```json\n{\"S1\": null}\n```");
+        let request = server.await.unwrap();
+        assert_eq!(request.header("authorization"), Some("Bearer local-key"));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "local-model");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["content"], "hello");
+    }
+
+    /// An answer that is not a chat completion, and an error answer, leave
+    /// the URL out and carry at most 300 characters of the body.
+    #[tokio::test]
+    async fn chat_errors_are_short_and_leave_the_url_out() {
+        use crate::transcription::test_server::serve_responses;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions?key=s3cret",
+            listener.local_addr().unwrap()
+        );
+        let long: &'static str = Box::leak("x".repeat(5000).into_boxed_str());
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![(200, "<html>not json</html>"), (500, long), (401, "{}")],
+        ));
+        let config = local(url);
+        let send = || chat(&config, Vec::new(), Duration::from_secs(10));
+        let err = format!("{:#}", send().await.unwrap_err());
+        assert!(err.starts_with("failed to parse LLM response"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+        let err = format!("{:#}", send().await.unwrap_err());
+        assert!(err.starts_with("LLM API error (500"), "{err}");
+        assert_eq!(err.matches('x').count(), 300, "{err}");
+        let err = format!("{:#}", send().await.unwrap_err());
+        assert_eq!(
+            err,
+            "LLM API: invalid API key; check [llm] api_key in config.toml"
+        );
+        server.await.unwrap();
+    }
+
+    /// A server that never answers ends in a clear error at the timeout.
+    #[tokio::test]
+    async fn chat_gives_up_at_the_timeout() {
+        use crate::transcription::test_server::accept_request;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = accept_request(&listener).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(stream);
+        });
+        let started = std::time::Instant::now();
+        let err = chat(&local(url), Vec::new(), Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(err.to_string(), "the LLM did not answer within 300ms");
+        server.abort();
+    }
 
     #[test]
     fn default_config() {

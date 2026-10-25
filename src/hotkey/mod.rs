@@ -5,15 +5,17 @@
 
 mod parse;
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use evdev::{Device, EventType, InputEventKind, Key};
+use evdev::{AttributeSetRef, Device, EventType, InputEventKind, Key};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::llm::LlmCommandConfig;
+#[cfg(feature = "recording")]
+use crate::recording::{RecordingAction, RecordingOptions};
 use crate::{Command, HotkeyConfig};
 pub use parse::{parse_hotkey, HotkeyBinding};
 
@@ -134,6 +136,19 @@ fn build_actions(config: &HotkeyConfig, llm_commands: &[LlmCommandConfig]) -> Ve
         ("cancel", &config.cancel, Command::Cancel),
         ("command", &config.command, Command::CommandMode),
         ("speak", &config.speak, Command::Speak),
+        // A build without the recording feature binds nothing for it; the
+        // config warns that `[hotkeys] recording` is ignored.
+        #[cfg(feature = "recording")]
+        (
+            "recording",
+            &config.recording,
+            Command::Recording {
+                action: RecordingAction::Toggle,
+                title: None,
+                id: None,
+                options: RecordingOptions::default(),
+            },
+        ),
     ];
     for (label, spec, command) in fixed {
         let Some(spec) = spec else { continue };
@@ -188,43 +203,208 @@ fn build_actions(config: &HotkeyConfig, llm_commands: &[LlmCommandConfig]) -> Ve
     actions
 }
 
+/// Modifier keys, left and right. A physically held one turns injected
+/// keystrokes into shortcuts (#154).
+const MODIFIER_KEYS: [Key; 8] = [
+    Key::KEY_LEFTMETA,
+    Key::KEY_RIGHTMETA,
+    Key::KEY_LEFTALT,
+    Key::KEY_RIGHTALT,
+    Key::KEY_LEFTCTRL,
+    Key::KEY_RIGHTCTRL,
+    Key::KEY_LEFTSHIFT,
+    Key::KEY_RIGHTSHIFT,
+];
+
+/// Whether `keys` (a device's `EVIOCGKEY` state) holds any modifier down.
+///
+/// `pub` only so the `whisrsd` binary crate can reach it. Hidden from the
+/// docs to keep it off the supported surface.
+#[doc(hidden)]
+pub fn any_modifier_down(keys: &AttributeSetRef<Key>) -> bool {
+    MODIFIER_KEYS.iter().any(|&k| keys.contains(k))
+}
+
 /// Enumerate all keyboard input devices.
+///
+/// Opens each device without grabbing it. Used by the hotkey listener; the
+/// injection path uses the incremental [`KeyboardCache`] instead.
 fn enumerate_keyboards() -> anyhow::Result<Vec<Device>> {
-    let mut keyboards = Vec::new();
     let input_dir = Path::new("/dev/input");
 
     if !input_dir.exists() {
         anyhow::bail!("/dev/input does not exist");
     }
 
+    let mut keyboards = Vec::new();
     for entry in std::fs::read_dir(input_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        // Only look at eventN devices.
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.starts_with("event") {
+        let path = entry?.path();
+        if !is_event_node(&path) {
             continue;
         }
-
-        match Device::open(&path) {
-            Ok(device) => {
-                // Check if this device has keyboard capabilities.
-                if let Some(keys) = device.supported_keys() {
-                    if keys.contains(Key::KEY_A) && keys.contains(Key::KEY_LEFTMETA) {
-                        let dev_name = device.name().unwrap_or("unknown").to_string();
-                        debug!("found keyboard: {} ({})", dev_name, path.display());
-                        keyboards.push(device);
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("cannot open {}: {e}", path.display());
-            }
+        if let Some(device) = open_keyboard(&path) {
+            keyboards.push(device);
         }
     }
 
     Ok(keyboards)
+}
+
+/// Whether `path` names an `eventN` node.
+fn is_event_node(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("event"))
+}
+
+/// Open `path` (without grabbing it) and return it if it is a keyboard.
+/// `None` when it is not a keyboard or cannot be opened.
+fn open_keyboard(path: &Path) -> Option<Device> {
+    let device = match Device::open(path) {
+        Ok(device) => device,
+        Err(e) => {
+            debug!("cannot open {}: {e}", path.display());
+            return None;
+        }
+    };
+    is_keyboard(&device, path).then_some(device)
+}
+
+/// Whether `device` is a keyboard: it reports both `KEY_A` and `KEY_LEFTMETA`.
+fn is_keyboard(device: &Device, path: &Path) -> bool {
+    let Some(keys) = device.supported_keys() else {
+        return false;
+    };
+    if !(keys.contains(Key::KEY_A) && keys.contains(Key::KEY_LEFTMETA)) {
+        return false;
+    }
+    let dev_name = device.name().unwrap_or("unknown");
+    debug!("found keyboard: {} ({})", dev_name, path.display());
+    true
+}
+
+/// Identity of a `/dev/input` node: its path plus its inode. The inode
+/// changes when a node is recreated, so a replugged device that reuses an
+/// `eventN` number is reclassified rather than served from the cache.
+type NodeId = (PathBuf, u64);
+
+/// Keyboards open for read-only key-state probes (#154), cached per node so
+/// a probe does not reopen every `/dev/input/event*` node each time (that
+/// costs 100+ ms; the key-state read itself is microseconds).
+///
+/// [`refresh`](Self::refresh) lists `/dev/input`, opens only new nodes, and
+/// drops vanished ones. A node that fails to open is not cached, so it is
+/// retried next time: udev applies the `input` group a few ms after a
+/// hotplugged node appears, and a probe in that window must not skip the
+/// keyboard for good. [`any_modifier_held`](Self::any_modifier_held)
+/// evicts a device whose read fails (unplugged), so it is reclassified if
+/// its node comes back. Devices are never grabbed.
+///
+/// `pub` only so the `whisrsd` binary crate can reach it. Hidden from the
+/// docs to keep it off the supported surface.
+#[doc(hidden)]
+pub struct KeyboardCache {
+    /// Device names never probed: our own uinput devices, whose modifiers
+    /// are the ones we press.
+    skip_names: &'static [&'static str],
+    /// `Some` = a keyboard to probe; `None` = not a keyboard, or skipped by
+    /// name. Unopenable nodes are left out so they are retried.
+    nodes: HashMap<NodeId, Option<Device>>,
+}
+
+impl KeyboardCache {
+    /// An empty cache that will ignore devices named in `skip_names`.
+    pub fn new(skip_names: &'static [&'static str]) -> Self {
+        Self {
+            skip_names,
+            nodes: HashMap::new(),
+        }
+    }
+
+    /// Bring the cache in line with `/dev/input`: classify new nodes, drop
+    /// vanished ones. Cheap when nothing changed (one `read_dir`).
+    pub fn refresh(&mut self) -> anyhow::Result<()> {
+        use std::os::unix::fs::DirEntryExt;
+
+        let mut current = HashSet::new();
+        for entry in std::fs::read_dir("/dev/input")? {
+            let entry = entry?;
+            let path = entry.path();
+            if is_event_node(&path) {
+                current.insert((path, entry.ino()));
+            }
+        }
+
+        let (added, removed) = diff_nodes(self.nodes.keys(), &current);
+        for node in removed {
+            self.nodes.remove(&node);
+        }
+        for node in added {
+            let device = match Device::open(&node.0) {
+                Ok(device) => device,
+                Err(e) => {
+                    debug!("cannot open {}: {e}", node.0.display());
+                    continue;
+                }
+            };
+            let probe = is_keyboard(&device, &node.0)
+                && !device.name().is_some_and(|n| self.skip_names.contains(&n));
+            self.nodes.insert(node, probe.then_some(device));
+        }
+        Ok(())
+    }
+
+    /// Whether any cached keyboard reports a modifier down (`EVIOCGKEY`).
+    /// A device whose read fails is evicted and counts as not held.
+    pub fn any_modifier_held(&mut self) -> bool {
+        let mut held = false;
+        let mut failed = Vec::new();
+        for (node, device) in &self.nodes {
+            let Some(device) = device else { continue };
+            match device.get_key_state() {
+                Ok(keys) => {
+                    if any_modifier_down(&keys) {
+                        held = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    debug!("cannot read key state of {}: {e}", node.0.display());
+                    failed.push(node.clone());
+                }
+            }
+        }
+        for node in failed {
+            self.nodes.remove(&node);
+        }
+        held
+    }
+
+    /// Number of cached keyboards (probed devices).
+    pub fn keyboard_count(&self) -> usize {
+        self.nodes.values().filter(|d| d.is_some()).count()
+    }
+}
+
+/// Split the node sets: (in `current` but not `cached`, in `cached` but not
+/// `current`). Pure, so the cache bookkeeping is testable without
+/// `/dev/input`.
+fn diff_nodes<'a>(
+    cached: impl Iterator<Item = &'a NodeId>,
+    current: &HashSet<NodeId>,
+) -> (Vec<NodeId>, Vec<NodeId>) {
+    let cached: HashSet<&NodeId> = cached.collect();
+    let added = current
+        .iter()
+        .filter(|n| !cached.contains(n))
+        .cloned()
+        .collect();
+    let removed = cached
+        .into_iter()
+        .filter(|n| !current.contains(*n))
+        .cloned()
+        .collect();
+    (added, removed)
 }
 
 /// Listen on a single device for hotkey combos.
@@ -347,12 +527,26 @@ mod tests {
         assert!(modifiers_held(&held, &[Key::KEY_LEFTCTRL]));
     }
 
+    #[test]
+    fn bare_binding_requires_no_modifier_held() {
+        // A bare binding ("ScrollLock") fires only when no modifier is held,
+        // so it stays distinct from "Shift+ScrollLock".
+        let held: HashSet<Key> = HashSet::from([Key::KEY_SCROLLLOCK]);
+        assert!(modifiers_held(&held, &[]));
+
+        for m in [Key::KEY_LEFTSHIFT, Key::KEY_RIGHTCTRL, Key::KEY_LEFTMETA] {
+            let held: HashSet<Key> = HashSet::from([m, Key::KEY_SCROLLLOCK]);
+            assert!(!modifiers_held(&held, &[]), "{m:?} held must not match");
+        }
+    }
+
     fn all_hotkeys_set() -> HotkeyConfig {
         HotkeyConfig {
             toggle: Some("Super+Shift+W".to_string()),
             cancel: Some("Super+Shift+D".to_string()),
             command: Some("Super+Shift+G".to_string()),
             speak: Some("Super+Shift+R".to_string()),
+            recording: Some("Super+Shift+M".to_string()),
         }
     }
 
@@ -370,12 +564,53 @@ mod tests {
             .len();
 
         let actions = build_actions(&config, &[]);
+        // `[hotkeys] recording` alone binds nothing in a build without the
+        // recording feature, which warns that it is ignored.
+        let ignored = usize::from(!cfg!(feature = "recording"));
         assert_eq!(
             actions.len(),
-            fields,
+            fields - ignored,
             "every set [hotkeys] field must produce a listener action — a new field \
              needs a line in build_actions' `fixed` table"
         );
+    }
+
+    /// Built without the recording feature, `[hotkeys] recording` registers
+    /// no key: pressing it would only reach a daemon that refuses it.
+    #[cfg(not(feature = "recording"))]
+    #[test]
+    fn recording_hotkey_binds_nothing_without_the_feature() {
+        let config = HotkeyConfig {
+            recording: Some("ScrollLock".to_string()),
+            ..Default::default()
+        };
+        assert!(build_actions(&config, &[]).is_empty());
+        let actions = build_actions(&all_hotkeys_set(), &[]);
+        assert!(actions
+            .iter()
+            .all(|a| !matches!(a.command, Command::Recording { .. })));
+    }
+
+    /// `[hotkeys] recording` takes the same forms as the other fields, the
+    /// bare ScrollLock/Pause/F13-F24 bindings included.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn recording_hotkey_accepts_a_bare_binding() {
+        let config = HotkeyConfig {
+            recording: Some("ScrollLock".to_string()),
+            ..Default::default()
+        };
+        let actions = build_actions(&config, &[]);
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].binding.modifiers.is_empty());
+        assert_eq!(actions[0].binding.trigger, Key::KEY_SCROLLLOCK);
+        assert!(matches!(
+            actions[0].command,
+            Command::Recording {
+                action: RecordingAction::Toggle,
+                ..
+            }
+        ));
     }
 
     /// Each field is wired to its own command — a mis-ordered `fixed` table
@@ -388,6 +623,13 @@ mod tests {
             Command::Cancel,
             Command::CommandMode,
             Command::Speak,
+            #[cfg(feature = "recording")]
+            Command::Recording {
+                action: RecordingAction::Toggle,
+                title: None,
+                id: None,
+                options: RecordingOptions::default(),
+            },
         ] {
             assert_eq!(
                 actions
@@ -425,5 +667,84 @@ mod tests {
         let actions = build_actions(&config, &[]);
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0].command, Command::Toggle { .. }));
+    }
+
+    fn key_set(keys: &[Key]) -> evdev::AttributeSet<Key> {
+        let mut set = evdev::AttributeSet::new();
+        for &k in keys {
+            set.insert(k);
+        }
+        set
+    }
+
+    /// Every modifier counts, on either side of the keyboard.
+    #[test]
+    fn any_modifier_down_sees_left_and_right_modifiers() {
+        for &k in &MODIFIER_KEYS {
+            assert!(any_modifier_down(&key_set(&[k])), "{k:?} is a modifier");
+        }
+        assert!(any_modifier_down(&key_set(&[
+            Key::KEY_W,
+            Key::KEY_RIGHTALT
+        ])));
+    }
+
+    /// Ordinary keys, and no keys at all, are not a held modifier.
+    #[test]
+    fn any_modifier_down_ignores_non_modifiers_and_empty() {
+        assert!(!any_modifier_down(&key_set(&[])));
+        assert!(!any_modifier_down(&key_set(&[
+            Key::KEY_W,
+            Key::KEY_A,
+            Key::KEY_CAPSLOCK,
+            Key::KEY_SPACE,
+        ])));
+    }
+
+    fn node(path: &str, ino: u64) -> NodeId {
+        (PathBuf::from(path), ino)
+    }
+
+    fn sorted(mut v: Vec<NodeId>) -> Vec<NodeId> {
+        v.sort();
+        v
+    }
+
+    /// Unchanged nodes need no work: nothing reopened, nothing dropped.
+    #[test]
+    fn diff_nodes_is_empty_when_nothing_changed() {
+        let cached = [node("/dev/input/event0", 1), node("/dev/input/event1", 2)];
+        let current: HashSet<NodeId> = cached.iter().cloned().collect();
+        let (added, removed) = diff_nodes(cached.iter(), &current);
+        assert!(added.is_empty() && removed.is_empty());
+    }
+
+    /// A plugged node is classified, an unplugged one dropped.
+    #[test]
+    fn diff_nodes_sees_hotplug_both_ways() {
+        let cached = [node("/dev/input/event0", 1), node("/dev/input/event1", 2)];
+        let current: HashSet<NodeId> = [node("/dev/input/event0", 1), node("/dev/input/event5", 9)]
+            .into_iter()
+            .collect();
+        let (added, removed) = diff_nodes(cached.iter(), &current);
+        assert_eq!(added, vec![node("/dev/input/event5", 9)]);
+        assert_eq!(removed, vec![node("/dev/input/event1", 2)]);
+    }
+
+    /// A node number reused by a new device (new inode) is reclassified.
+    #[test]
+    fn diff_nodes_reclassifies_a_reused_node_number() {
+        let cached = [node("/dev/input/event3", 7)];
+        let current: HashSet<NodeId> = [node("/dev/input/event3", 8)].into_iter().collect();
+        let (added, removed) = diff_nodes(cached.iter(), &current);
+        assert_eq!(sorted(added), vec![node("/dev/input/event3", 8)]);
+        assert_eq!(sorted(removed), vec![node("/dev/input/event3", 7)]);
+    }
+
+    #[test]
+    fn is_event_node_only_matches_event_nodes() {
+        assert!(is_event_node(Path::new("/dev/input/event12")));
+        assert!(!is_event_node(Path::new("/dev/input/mice")));
+        assert!(!is_event_node(Path::new("/dev/input/by-id")));
     }
 }

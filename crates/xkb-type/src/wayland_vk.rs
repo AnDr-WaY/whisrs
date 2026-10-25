@@ -70,6 +70,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
@@ -83,7 +84,7 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 };
 use xkbcommon::xkb;
 
-use crate::KeyInjector;
+use crate::{run_gated, KeyInjector, Typed};
 
 // Logging via the `log` crate (only active with `logging` feature), matching
 // the conditional shim used in `keyboard.rs`/`keymap.rs`.
@@ -668,6 +669,40 @@ pub(crate) fn distinct_dynamic_chars(text: &str) -> Vec<char> {
     out
 }
 
+/// The key one character of a `type_text` call is typed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VkKey {
+    /// `\n` / `\t`: the base keycode of Return / Tab
+    /// ([`special_base_keycode`]).
+    Base(u32),
+    /// A glyph in the uploaded keymap.
+    Char(CharKey),
+}
+
+/// The keys for `chars` (byte offset in the text, char) against the uploaded
+/// keymap's `char_to_key`, in order, each with its offset (what the gate is
+/// asked with). A char with no key (no keysym, skipped when the keymap was
+/// built) is logged and left out: it is never typed, so it is never gated.
+/// Pure, so the offsets are testable without a Wayland connection.
+fn plan_vk_keys(
+    chars: impl IntoIterator<Item = (usize, char)>,
+    char_to_key: &HashMap<char, CharKey>,
+) -> Vec<(usize, VkKey)> {
+    chars
+        .into_iter()
+        .filter_map(|(at, ch)| {
+            if let Some(keycode) = special_base_keycode(ch) {
+                return Some((at, VkKey::Base(keycode)));
+            }
+            let key = char_to_key.get(&ch).map(|&key| (at, VkKey::Char(key)));
+            if key.is_none() {
+                warn!("wayland-vk: cannot type char {ch:?} (no keysym); skipping");
+            }
+            key
+        })
+        .collect()
+}
+
 /// State threaded through the Wayland event queue. The two protocol objects
 /// (`ZwpVirtualKeyboardManagerV1` / `ZwpVirtualKeyboardV1`) have no events, so
 /// their `Dispatch` impls are empty; the only real work happens in the
@@ -917,7 +952,21 @@ impl WaylandVkKeyboard {
         Ok(())
     }
 
-    /// Type `text`, reusing the uploaded keymap whenever possible.
+    /// Type all of `text`. [`KeyInjector::type_text`] takes a gate that can
+    /// pause or stop between keys.
+    pub fn type_text(&mut self, text: &str) -> anyhow::Result<()> {
+        self.type_text_inner(text, &mut |_| ControlFlow::Continue(()))
+            .map(|_| ())
+    }
+
+    /// Type `text`, reusing the uploaded keymap whenever possible, asking
+    /// `gate` before every key (see [`KeyInjector::type_text`]).
+    ///
+    /// The gate is only asked once the keymap for the text is uploaded, so a
+    /// pause never costs an extra upload, and a stop leaves the keymap state
+    /// exactly as a finished call would: the next call reuses the uploaded
+    /// keymap (or, after the over-capacity batch path, starts over, as it
+    /// always does there).
     ///
     /// Printable ASCII (letters, digits, punctuation, space) is **permanent** in
     /// every keymap, so a delta containing only ASCII (or only already-mapped
@@ -941,9 +990,13 @@ impl WaylandVkKeyboard {
     /// **single** delta itself contains more than `dynamic_capacity` distinct
     /// non-ASCII glyphs does it fall back to the per-batch path — still synced,
     /// still never a silent drop.
-    fn type_text_inner(&mut self, text: &str) -> anyhow::Result<()> {
+    fn type_text_inner(
+        &mut self,
+        text: &str,
+        gate: &mut dyn FnMut(usize) -> ControlFlow<()>,
+    ) -> anyhow::Result<Typed> {
         if text.is_empty() {
-            return Ok(());
+            return Ok(Typed::All);
         }
 
         // Distinct typeable *non-ASCII* dynamic chars in this text (excludes
@@ -956,10 +1009,13 @@ impl WaylandVkKeyboard {
         if wanted.len() > capacity {
             self.ordered_chars.clear();
             self.char_to_key = permanent_ascii_map();
-            self.type_text_batched(text)?;
+            let typed = self.type_text_batched(text, gate);
+            // However the run ended (all typed, stopped by the gate, or
+            // failed), the live keymap is some batch's, not the accumulated
+            // set: the next call starts over.
             self.ordered_chars.clear();
             self.keymap_uploaded = false;
-            return Ok(());
+            return typed;
         }
 
         // Which of this delta's glyphs are genuinely new (not already mapped).
@@ -977,7 +1033,7 @@ impl WaylandVkKeyboard {
                 let ordered = self.ordered_chars.clone();
                 self.upload_keymap(&ordered)?;
             }
-            return self.type_chars(text);
+            return self.type_keys(text.char_indices(), gate);
         }
 
         // Build the next accumulated set. Keep existing glyphs in their stable
@@ -1006,28 +1062,25 @@ impl WaylandVkKeyboard {
         self.ordered_chars = next;
         let ordered = self.ordered_chars.clone();
         self.upload_keymap(&ordered)?;
-        self.type_chars(text)
+        self.type_keys(text.char_indices(), gate)
     }
 
-    /// Type each char of `text` using the currently-uploaded keymap:
-    /// `\n`/`\t` via their base keycodes, everything else via `char_to_key`
-    /// (pressing Shift/AltGr as the char's level requires). Assumes the keymap
-    /// already covers every dynamic glyph in `text` (the caller guarantees this;
-    /// ASCII is always covered).
-    fn type_chars(&mut self, text: &str) -> anyhow::Result<()> {
-        for ch in text.chars() {
-            if let Some(keycode) = special_base_keycode(ch) {
-                self.tap_keycode(keycode)?;
-                continue;
-            }
-            let Some(&key) = self.char_to_key.get(&ch) else {
-                // Char had no keysym (skipped during keymap build).
-                warn!("wayland-vk: cannot type char {ch:?} (no keysym); skipping");
-                continue;
-            };
-            self.tap_char_key(key)?;
-        }
-        Ok(())
+    /// Type `chars` (byte offset in the text, char) using the
+    /// currently-uploaded keymap, asking `gate` before each key: `\n`/`\t`
+    /// via their base keycodes, everything else via `char_to_key` (pressing
+    /// Shift/AltGr as the char's level requires). Assumes the keymap already
+    /// covers every dynamic glyph in `chars` (the caller guarantees this;
+    /// ASCII is always covered). Changes no keymap state.
+    fn type_keys(
+        &mut self,
+        chars: impl IntoIterator<Item = (usize, char)>,
+        gate: &mut dyn FnMut(usize) -> ControlFlow<()>,
+    ) -> anyhow::Result<Typed> {
+        let keys = plan_vk_keys(chars, &self.char_to_key);
+        run_gated(keys, gate, |key| match key {
+            VkKey::Base(keycode) => self.tap_keycode(keycode),
+            VkKey::Char(key) => self.tap_char_key(key),
+        })
     }
 
     /// Fallback path for a single call whose distinct *non-ASCII* glyph count
@@ -1035,9 +1088,13 @@ impl WaylandVkKeyboard {
     /// non-ASCII chars, uploading a fresh (synced + settled) keymap per batch.
     /// ASCII and `\n`/`\t` ride the permanent/base keys present in every keymap,
     /// so they never count against a batch and never cause a split.
-    fn type_text_batched(&mut self, text: &str) -> anyhow::Result<()> {
+    fn type_text_batched(
+        &mut self,
+        text: &str,
+        gate: &mut dyn FnMut(usize) -> ControlFlow<()>,
+    ) -> anyhow::Result<Typed> {
         let capacity = dynamic_capacity();
-        let chars: Vec<char> = text.chars().collect();
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
         let mut idx = 0;
         while idx < chars.len() {
             // Greedily grow a batch until adding the next NEW *non-ASCII* char
@@ -1045,7 +1102,7 @@ impl WaylandVkKeyboard {
             let mut distinct: std::collections::HashSet<char> = std::collections::HashSet::new();
             let start = idx;
             while idx < chars.len() {
-                let ch = chars[idx];
+                let ch = chars[idx].1;
                 let counts = special_base_keycode(ch).is_none() && !is_permanent_ascii(ch);
                 if counts && !distinct.contains(&ch) && distinct.len() >= capacity {
                     break;
@@ -1063,7 +1120,7 @@ impl WaylandVkKeyboard {
                 let mut seen = std::collections::HashSet::new();
                 batch
                     .iter()
-                    .copied()
+                    .map(|&(_, c)| c)
                     .filter(|&c| {
                         special_base_keycode(c).is_none()
                             && !is_permanent_ascii(c)
@@ -1072,27 +1129,22 @@ impl WaylandVkKeyboard {
                     .collect()
             };
             self.upload_keymap(&batch_dynamic)?;
-            for &ch in batch {
-                if let Some(keycode) = special_base_keycode(ch) {
-                    self.tap_keycode(keycode)?;
-                    continue;
-                }
-                let Some(&key) = self.char_to_key.get(&ch) else {
-                    // Char had no keysym (skipped during keymap build).
-                    warn!("wayland-vk: cannot type char {ch:?} (no keysym); skipping");
-                    continue;
-                };
-                self.tap_char_key(key)?;
+            if let Typed::StoppedAt(at) = self.type_keys(batch.iter().copied(), gate)? {
+                return Ok(Typed::StoppedAt(at));
             }
         }
 
-        Ok(())
+        Ok(Typed::All)
     }
 }
 
 impl KeyInjector for WaylandVkKeyboard {
-    fn type_text(&mut self, text: &str) -> anyhow::Result<()> {
-        self.type_text_inner(text)
+    fn type_text(
+        &mut self,
+        text: &str,
+        gate: &mut dyn FnMut(usize) -> ControlFlow<()>,
+    ) -> anyhow::Result<Typed> {
+        self.type_text_inner(text, gate)
     }
 
     fn backspace(&mut self, count: usize) -> anyhow::Result<()> {
@@ -1838,6 +1890,67 @@ mod tests {
         eprintln!(
             "modifier-mask OK: Shift={SHIFT_MOD_MASK} Mod5={ALTGR_MOD_MASK} select levels 1/2, \
              Control={CTRL_MOD_MASK} is a real modifier"
+        );
+    }
+
+    /// The gate is asked with byte offsets into the text, `\n` rides its
+    /// base key, and a char with no key in the uploaded map is skipped
+    /// without being gated (it is never typed).
+    #[test]
+    fn planned_keys_carry_byte_offsets_and_skip_unmapped_chars() {
+        let (_keymap, map) = build_keymap_string(&distinct_dynamic_chars("اب"));
+        // `ا`, `ب` and `ж` are 2 bytes each; `ж` is not in the map.
+        let text = "aا\nب жz";
+        let keys = plan_vk_keys(text.char_indices(), &map);
+        let offsets: Vec<usize> = keys.iter().map(|(at, _)| *at).collect();
+        assert_eq!(offsets, vec![0, 1, 3, 4, 6, 9]);
+        assert_eq!(keys[2].1, VkKey::Base(special_base_keycode('\n').unwrap()));
+        assert_eq!(keys[1].1, VkKey::Char(map[&'ا']));
+        for (at, _) in &keys {
+            assert!(text.is_char_boundary(*at));
+        }
+    }
+
+    /// A stop mid-text sends nothing past the break, and the rest of the
+    /// text still resolves against the same uploaded map: the next call
+    /// types it without a keymap upload (no new glyph), which is why the
+    /// gate runs only after the upload.
+    #[test]
+    fn a_stop_leaves_the_rest_typeable_without_a_new_upload() {
+        let text = "hi مرحبا\tok";
+        let (_keymap, map) = build_keymap_string(&distinct_dynamic_chars(text));
+        let keys = plan_vk_keys(text.char_indices(), &map);
+        let stop = keys[4].0; // the second Arabic letter
+
+        let mut sent = Vec::new();
+        let mut gate = |at: usize| {
+            if at == stop {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let typed = run_gated(keys, &mut gate, |key| {
+            sent.push(key);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(typed, Typed::StoppedAt(stop));
+        assert_eq!(sent.len(), 4);
+
+        let rest = &text[stop..];
+        let new_chars: Vec<char> = distinct_dynamic_chars(rest)
+            .into_iter()
+            .filter(|ch| !map.contains_key(ch))
+            .collect();
+        assert!(
+            new_chars.is_empty(),
+            "the rest needs no upload: {new_chars:?}"
+        );
+        assert_eq!(
+            plan_vk_keys(rest.char_indices(), &map).len(),
+            rest.chars().count(),
+            "every char of the rest still has its key"
         );
     }
 }

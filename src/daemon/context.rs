@@ -10,6 +10,9 @@ use whisrs::transcription::TranscriptionBackend;
 use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
 
+#[cfg(feature = "recording")]
+use crate::recording::RecordingRuntime;
+
 /// Context saved when command mode starts recording.
 pub(crate) struct CommandModeContext {
     pub(crate) selected_text: String,
@@ -64,10 +67,13 @@ pub(crate) struct DaemonState {
     pub(crate) llm_instruction_overrides: std::collections::HashMap<String, String>,
     /// Stop flag for in-progress TTS playback (read-selection-aloud).
     ///
-    /// Set when a `Speak` synthesis succeeds and playback begins; cleared when
-    /// playback finishes. `Cancel` and a repeat `Speak` both flip it to `true`
-    /// to interrupt playback. Read-aloud runs independently of the recording
-    /// state machine, so there is no dedicated `State` variant.
+    /// Installed when a `Speak` session enters `Synthesizing` (before the
+    /// synthesis request is sent), so it also interrupts the request, the
+    /// body reader and playback; cleared when the session finishes. `Cancel`
+    /// and a repeat `Speak` both flip it to `true`. Its identity
+    /// (`Arc::ptr_eq`) marks which session owns the read-aloud state; whether
+    /// read-aloud is active is decided by the `Synthesizing`/`Speaking` states,
+    /// not by this flag.
     pub(crate) tts_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -86,6 +92,30 @@ impl DaemonState {
             llm_instruction_overrides: std::collections::HashMap::new(),
             tts_stop: None,
         }
+    }
+
+    /// End a streaming session's claim on `streaming_cancel`: clear the slot
+    /// only if it still holds `flag`, so a newer session's flag survives.
+    /// Called by whichever side sees the session end first (the pipeline's
+    /// tail, or `handle_toggle` once the pipeline task has been awaited,
+    /// which also covers an early error or panic). After it, `cancel` can no
+    /// longer reach this session.
+    pub(crate) fn release_streaming_cancel(&mut self, flag: &Arc<AtomicBool>) {
+        if self
+            .streaming_cancel
+            .as_ref()
+            .is_some_and(|f| Arc::ptr_eq(f, flag))
+        {
+            self.streaming_cancel = None;
+        }
+    }
+
+    /// A stopped streaming session is still draining its last deltas (#154).
+    /// `streaming_cancel` is `Some` only from a streaming session's start
+    /// until it ends (see `release_streaming_cancel`), and command mode never
+    /// installs one, so this cannot match a command-mode `Transcribing`.
+    pub(crate) fn streaming_session_draining(&self) -> bool {
+        self.state_machine.state() == State::Transcribing && self.streaming_cancel.is_some()
     }
 
     /// Consume the active session's language, falling back to the config
@@ -113,6 +143,11 @@ pub(crate) struct DaemonContext {
     /// overlay already shows recording/transcribing state visually.
     /// Error notifications still fire.
     pub(crate) overlay_enabled: bool,
+    /// The recording feature: its session, its status broadcast (tray only)
+    /// and the processing queue. Kept out of [`DaemonState`] so a recording
+    /// never waits on, or blocks, the dictation lock.
+    #[cfg(feature = "recording")]
+    pub(crate) recording: RecordingRuntime,
 }
 
 impl DaemonContext {

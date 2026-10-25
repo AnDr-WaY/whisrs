@@ -16,13 +16,18 @@
 //! Usage:
 //!
 //! ```text
-//! type [--backend auto|uinput|wayland-vk] [--delay-ms N] <text...>
+//! type [--backend auto|uinput|wayland-vk|xtest] [--delay-ms N] <text...>
 //! ```
+//!
+//! `xtest` (X11 only) needs `--features xtest`. It refuses to start when the
+//! X server's XTEST keyboard has a different layout than the detected one.
 //!
 //! `auto` mirrors the daemon: it uses the Wayland virtual keyboard when
 //! `WAYLAND_DISPLAY` is set and the compositor supports
-//! `zwp_virtual_keyboard_v1`, otherwise it falls back to uinput.
+//! `zwp_virtual_keyboard_v1`, otherwise it falls back to uinput. It never
+//! picks `xtest`, which is opt-in.
 
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use xkb_type::KeyInjector;
@@ -33,16 +38,19 @@ enum Backend {
     Uinput,
     #[cfg(feature = "wayland-vk")]
     WaylandVk,
+    #[cfg(feature = "xtest")]
+    Xtest,
 }
 
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
-        "usage: type [--backend auto|uinput|wayland-vk] [--delay-ms N] <text...>\n\
+        "usage: type [--backend auto|uinput|wayland-vk|xtest] [--delay-ms N] <text...>\n\
          \n\
            --backend   which injection backend to use (default: auto)\n\
            --delay-ms  inter-key-event delay in milliseconds (default: 4)\n\
          \n\
-         The 'wayland-vk' backend requires building with --features wayland-vk."
+         The 'wayland-vk' backend requires building with --features wayland-vk,\n\
+         and 'xtest' with --features xtest."
     );
     std::process::exit(code);
 }
@@ -64,6 +72,17 @@ fn parse_backend(s: &str) -> Backend {
                 std::process::exit(2);
             }
         }
+        "xtest" => {
+            #[cfg(feature = "xtest")]
+            {
+                Backend::Xtest
+            }
+            #[cfg(not(feature = "xtest"))]
+            {
+                eprintln!("error: the 'xtest' backend requires building with --features xtest");
+                std::process::exit(2);
+            }
+        }
         other => {
             eprintln!("error: unknown backend '{other}'");
             print_usage_and_exit(2);
@@ -82,6 +101,8 @@ fn build_backend(
             Box::new(xkb_type::wayland_vk::WaylandVkKeyboard::new(key_delay)?),
             "wayland-vk",
         )),
+        #[cfg(feature = "xtest")]
+        Backend::Xtest => Ok((Box::new(xkb_type::Keyboard::new_xtest(key_delay)?), "xtest")),
         Backend::Auto => {
             // Mirror the daemon's Auto logic: prefer the Wayland virtual
             // keyboard when a Wayland session is detected, else uinput.
@@ -150,6 +171,7 @@ fn main() -> anyhow::Result<()> {
     }
     eprintln!("typing now");
 
-    injector.type_text(&text)?;
+    // Type everything: the gate never stops it.
+    let _ = injector.type_text(&text, &mut |_| ControlFlow::Continue(()))?;
     Ok(())
 }

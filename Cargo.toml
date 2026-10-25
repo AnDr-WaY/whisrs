@@ -11,15 +11,16 @@ members = [
 
 [package]
 name = "whisrs"
-version = "0.1.25"
+version = "0.1.30"
 edition = "2021"
-description = "Linux-first voice-to-text dictation tool with Groq, OpenAI, and local Whisper backends"
+description = "Voice for the Linux desktop: dictation, read-aloud (TTS), and voice-driven LLM commands, with Groq, OpenAI, Deepgram, and local Whisper backends"
 license = "MIT"
 repository = "https://github.com/y0sif/whisrs"
 homepage = "https://y0sif.github.io/whisrs/"
 keywords = ["voice", "dictation", "speech-to-text", "whisper", "linux"]
 categories = ["multimedia::audio", "accessibility", "command-line-utilities"]
 readme = "README.md"
+exclude = ["assets/"]
 
 [package.metadata.docs.rs]
 all-features = false
@@ -38,11 +39,19 @@ name = "issue55_stream_check"
 required-features = ["local-whisper"]
 
 [features]
-default = ["local-whisper", "tray", "overlay", "hooks"]
+default = ["local-whisper", "tray", "overlay", "hooks", "recording", "mcp"]
 local-whisper = ["dep:whisper-rs"]
-tray = ["dep:ksni"]
+tray = ["dep:ksni", "dep:png"]
 overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:tiny-skia", "dep:zbus"]
 hooks = ["dep:zbus"]
+# The recording feature: mic + system audio recordings transcribed after the
+# stop, with speakers, names and summaries (`whisrs recording`, its tray items,
+# `[recording]`). Without it, `whisrs recording` exits with an error, the
+# daemon refuses the command, and a `[recording]` section or a `[hotkeys]
+# recording` binding gets a config warning.
+recording = ["dep:flacenc", "dep:realfft", "dep:bytes"]
+# `whisrs mcp`: a read-only MCP server (stdio) over the recordings folder.
+mcp = ["recording", "dep:rmcp", "dep:schemars"]
 # GPU backends for the bundled whisper.cpp. Opt-in at build time — the backend
 # has to be linked in, so there is no runtime switch — and CPU stays the default.
 # The `whisper-rs?/…` weak syntax applies the feature to whisper-rs without
@@ -58,19 +67,29 @@ asr-dedup = { path = "crates/asr-dedup", version = "0.1" }
 audio-silence-gate = { path = "crates/audio-silence-gate", version = "0.1" }
 filler-remove = { path = "crates/filler-remove", version = "0.1" }
 prompt-echo = { path = "crates/prompt-echo", version = "0.1" }
-xkb-type = { path = "crates/xkb-type", version = "0.1.4", features = ["arboard", "wayland-vk"] }
+xkb-type = { path = "crates/xkb-type", version = "0.2.0", features = ["arboard", "wayland-vk", "xtest"] }
 async-trait = "0.1"
 base64 = "0.22"
+# Shares one upload buffer between the retries of a diarization sidecar
+# request (feature `recording`). Already in the build through reqwest and hyper.
+bytes = { version = "1", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-cpal = "0.15"
+cpal = { version = "0.18", features = ["pulseaudio"] }
 dialoguer = "0.11"
 dirs = "6"
 evdev = { version = "0.12", features = ["tokio"] }
+# Recording uploads to cloud backends (lossless, less than half the WAV size).
+# Default features off: no `par` thread pool, no serde, no log. Feature
+# `recording`: without it a recording chunk would go as WAV, and none is sent.
+flacenc = { version = "0.5.1", default-features = false, optional = true }
 futures-util = "0.3"
 hound = "3"
 libc = "0.2"
 notify-rust = "4"
+# Echo removal on a recording's mic track (feature `recording`).
+realfft = { version = "3.5", optional = true }
+regex = "1"
 indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["multipart", "json", "blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -92,6 +111,12 @@ zbus = { version = "5", optional = true }
 version = "0.3"
 optional = true
 
+# Decodes the embedded tray icons. Already in the build via arboard -> image,
+# so this adds no new crate.
+[dependencies.png]
+version = "0.18"
+optional = true
+
 [dependencies.smithay-client-toolkit]
 version = "0.19"
 optional = true
@@ -110,7 +135,23 @@ features = ["std", "simd"]
 version = "0.16"
 optional = true
 
+# The MCP server of `whisrs mcp`. Pinned to 3.5: the SDK has broken its API
+# across majors (2.0, 3.0) and moves fast. Only the server, its tool macros
+# and the stdio transport.
+[dependencies.rmcp]
+version = "~3.5.1"
+optional = true
+default-features = false
+features = ["server", "macros", "transport-io"]
+
+# Tool input and output schemas for `whisrs mcp`, the version rmcp uses.
+[dependencies.schemars]
+version = "1"
+optional = true
+
 [dev-dependencies]
+# Decodes the FLAC recording uploads back to samples in tests.
+claxon = "0.4"
 tempfile = "3"
 # start_paused tests need tokio's paused clock ("test-util" is not in "full").
 tokio = { version = "1", features = ["test-util"] }

@@ -136,30 +136,98 @@ impl ClipboardBackend for WaylandClipboard {
 // X11: arboard crate (behind "arboard" feature)
 // ---------------------------------------------------------------------------
 
+/// The one process-wide `arboard` handle behind every [`X11Clipboard`] call.
+///
+/// X11 has no clipboard store: the app that copied must keep serving the
+/// selection. arboard treats dropping its last handle as the app exiting, so
+/// it asks the clipboard manager to take the data (waiting at most 100 ms)
+/// and destroys its selection window. The old per-call handle therefore gave
+/// the selection away milliseconds after each copy, and the Ctrl+V that
+/// followed raced the clipboard manager or compositor, often pasting nothing
+/// (#193). This handle is opened on first use and never dropped.
+///
+/// A failed open is returned, not cached, so a later call retries. The guard
+/// must not be held across another clipboard call: the lock is not reentrant.
+#[cfg(feature = "arboard")]
+fn x11_clipboard() -> anyhow::Result<std::sync::MutexGuard<'static, arboard::Clipboard>> {
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    static CLIPBOARD: OnceLock<Mutex<arboard::Clipboard>> = OnceLock::new();
+
+    if CLIPBOARD.get().is_none() {
+        let clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
+        // A lost race drops this extra handle, which is harmless: the
+        // winner's handle still exists, so arboard keeps the selection.
+        let _ = CLIPBOARD.set(Mutex::new(clipboard));
+    }
+    let clipboard = CLIPBOARD.get().expect("X11 clipboard was just initialized");
+    // A panic in another clipboard call leaves the handle itself usable.
+    Ok(clipboard.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Whether nothing owns the X11 CLIPBOARD selection, i.e. the clipboard is
+/// genuinely empty: nothing copied since login, or the app that copied exited
+/// and no clipboard manager took over.
+///
+/// arboard returns the same `ContentNotAvailable` error when nothing owns the
+/// selection, when the owner offers no text target, and when the owner times
+/// out. Only "no owner" means empty: a caller restoring a saved clipboard
+/// reads `Err` as "non-text, do not overwrite it", so `whisrs` typed every
+/// paste-mode dictation on an empty X11 clipboard (#79). Asking the X server
+/// directly gives [`X11Clipboard`] the same contract as `run_wl_paste` on
+/// Wayland. Uses its own short-lived connection, not the arboard handle, and
+/// only runs after a read failed.
+#[cfg(feature = "arboard")]
+fn x11_clipboard_unowned() -> anyhow::Result<bool> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let (conn, _screen) = x11rb::connect(None).context("failed to connect to X server")?;
+    let clipboard = conn.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
+    let owner = conn.get_selection_owner(clipboard)?.reply()?.owner;
+    Ok(owner == x11rb::NONE)
+}
+
+/// Map an arboard text read to the [`ClipboardBackend::get_text`] contract.
+///
+/// `ContentNotAvailable` becomes `Ok("")` only when `is_unowned` (in
+/// production [`x11_clipboard_unowned`]) confirms nothing owns CLIPBOARD. A
+/// negative or failed check keeps the error, so an uncertain clipboard is
+/// still protected. The probe runs only for `ContentNotAvailable`.
+#[cfg(feature = "arboard")]
+fn text_or_empty_if_unowned(
+    result: Result<String, arboard::Error>,
+    is_unowned: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<String> {
+    match result {
+        Err(arboard::Error::ContentNotAvailable) if matches!(is_unowned(), Ok(true)) => {
+            Ok(String::new())
+        }
+        result => result.context("failed to get text from X11 clipboard"),
+    }
+}
+
 /// Clipboard backend that uses the `arboard` crate (X11).
+/// All instances share one handle that lives as long as the process.
 #[cfg(feature = "arboard")]
 pub struct X11Clipboard;
 
 #[cfg(feature = "arboard")]
 impl ClipboardBackend for X11Clipboard {
     fn get_text(&self) -> anyhow::Result<String> {
-        let mut clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
-        clipboard
-            .get_text()
-            .context("failed to get text from X11 clipboard")
+        // Bound first so the handle's guard drops before the owner check.
+        let result = x11_clipboard()?.get_text();
+        text_or_empty_if_unowned(result, x11_clipboard_unowned)
     }
 
     fn set_text(&self, text: &str) -> anyhow::Result<()> {
-        let mut clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
-        clipboard
+        x11_clipboard()?
             .set_text(text)
             .context("failed to set text on X11 clipboard")
     }
 
     fn get_primary_selection(&self) -> anyhow::Result<String> {
         use arboard::GetExtLinux;
-        let mut clipboard = arboard::Clipboard::new().context("failed to open X11 clipboard")?;
-        clipboard
+        x11_clipboard()?
             .get()
             .clipboard(arboard::LinuxClipboardKind::Primary)
             .text()
@@ -292,5 +360,85 @@ mod tests {
     #[test]
     fn offers_text_false_for_empty_list() {
         assert!(!offers_text(&[]));
+    }
+
+    /// `text_or_empty_if_unowned`: only a confirmed unowned CLIPBOARD may
+    /// turn `ContentNotAvailable` into `""` (#79).
+    #[cfg(feature = "arboard")]
+    mod x11 {
+        use super::super::text_or_empty_if_unowned;
+        use std::cell::Cell;
+
+        /// Run the helper with a probe that records whether it was called.
+        fn run(
+            result: Result<String, arboard::Error>,
+            probe: anyhow::Result<bool>,
+        ) -> (anyhow::Result<String>, bool) {
+            let called = Cell::new(false);
+            let out = text_or_empty_if_unowned(result, || {
+                called.set(true);
+                probe
+            });
+            (out, called.get())
+        }
+
+        /// Unwrap the error and check it carries the X11 context.
+        fn x11_error(out: anyhow::Result<String>) -> anyhow::Error {
+            let err = out.expect_err("must stay an error");
+            assert!(format!("{err:#}").contains("failed to get text from X11 clipboard"));
+            err
+        }
+
+        fn is_content_not_available(err: &anyhow::Error) -> bool {
+            matches!(
+                err.downcast_ref::<arboard::Error>(),
+                Some(arboard::Error::ContentNotAvailable)
+            )
+        }
+
+        #[test]
+        fn text_is_returned_without_owner_check() {
+            let (out, called) = run(Ok("hello".into()), Ok(true));
+            assert_eq!(out.unwrap(), "hello");
+            assert!(!called);
+        }
+
+        #[test]
+        fn content_not_available_with_no_owner_is_empty() {
+            let (out, called) = run(Err(arboard::Error::ContentNotAvailable), Ok(true));
+            assert_eq!(out.unwrap(), "");
+            assert!(called);
+        }
+
+        /// An owner without a text target (image, files) must not read as
+        /// empty, or a restore would overwrite it with `""`.
+        #[test]
+        fn content_not_available_with_owner_stays_error() {
+            let (out, called) = run(Err(arboard::Error::ContentNotAvailable), Ok(false));
+            assert!(is_content_not_available(&x11_error(out)));
+            assert!(called);
+        }
+
+        /// A failed owner check is uncertain, so it fails safe.
+        #[test]
+        fn content_not_available_with_failed_owner_check_stays_error() {
+            let (out, called) = run(
+                Err(arboard::Error::ContentNotAvailable),
+                Err(anyhow::anyhow!("no X server")),
+            );
+            assert!(is_content_not_available(&x11_error(out)));
+            assert!(called);
+        }
+
+        #[test]
+        fn other_error_stays_error_without_owner_check() {
+            let (out, called) = run(Err(arboard::Error::ClipboardOccupied), Ok(true));
+            let err = x11_error(out);
+            assert!(matches!(
+                err.downcast_ref::<arboard::Error>(),
+                Some(arboard::Error::ClipboardOccupied)
+            ));
+            assert!(!called);
+        }
     }
 }

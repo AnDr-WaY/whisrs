@@ -1,7 +1,8 @@
 //! Deepgram transcription backend (REST + streaming WebSocket).
 //!
 //! Supports two modes:
-//! - **REST**: POST WAV audio to `/v1/listen` (non-streaming, simple).
+//! - **REST**: POST WAV audio (FLAC for recording chunks) to `/v1/listen`
+//!   (non-streaming, simple).
 //! - **Streaming**: WebSocket to `wss://api.deepgram.com/v1/listen` with raw
 //!   PCM binary frames and real-time transcription results.
 
@@ -14,7 +15,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioChunk;
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::flac::{recording_upload, UploadFormat};
+use super::{
+    secs_to_ms, Segment, StreamText, Transcript, TranscriptionBackend, TranscriptionConfig, Word,
+};
 
 /// Deepgram REST API endpoint for pre-recorded audio.
 const DEEPGRAM_REST_URL: &str = "https://api.deepgram.com/v1/listen";
@@ -48,6 +52,216 @@ fn map_language(language: &str) -> &str {
     }
 }
 
+/// Percent-encode one query-string value.
+///
+/// The streaming URL below is assembled by hand and there is no encoder in the
+/// dependency tree, so this has to exist: Deepgram rejects the handshake with a
+/// bare 400 when a multi-word keyterm leaves a raw space in the URI.
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Assemble a query string from `params`, percent-encoding every value.
+///
+/// Extracted from `transcribe_stream` so the encoding is testable: reqwest does
+/// this for the REST path, but the WebSocket URI is built by hand and a raw
+/// space in a multi-word keyterm makes it invalid.
+fn build_query_string(params: &[(&str, &str)]) -> String {
+    params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", percent_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Byte budget for the `keyterm` portion of a Deepgram request.
+///
+/// Every parameter rides in the URI — the request line for REST, the handshake
+/// target for the WebSocket — and proxies and Deepgram's own edge typically cap
+/// a request line around 8KB. Past that the edge answers a bare `400` that
+/// never mentions the vocabulary, so streaming dictation just stops working.
+/// 4096 leaves ample room for the endpoint, the fixed parameters and any
+/// forward proxy's own additions.
+///
+/// This bounds **bytes and nothing else**. It does not imply a bound on the
+/// number of terms, and it does not imply a bound on tokens: `"ab cd ef"` × 400
+/// stops here at 195 terms / 4095 bytes while carrying at least 585
+/// whitespace-delimited words. [`KEYTERM_MAX_TERMS`] and [`KEYTERM_MAX_WORDS`]
+/// are what bound those.
+pub(crate) const KEYTERM_QUERY_BUDGET_BYTES: usize = 4096;
+
+/// Ceiling on how many `keyterm` params ride in one request.
+///
+/// This bounds **the parameter count and nothing else**: it keeps a vocabulary
+/// of very short terms from turning one request into thousands of query params,
+/// which the byte budget alone permits (single-char terms cost 10 bytes each,
+/// so 4096 bytes is ~409 params). It is deliberately *not* a token bound — an
+/// earlier revision of this comment claimed staying under 200 terms kept a
+/// byte-legal vocabulary inside Deepgram's 500-token cap, and that is false:
+/// the byte budget cuts `"ab cd ef"` × 400 off at 195 terms, below this cap,
+/// with ≥585 words on the wire. [`KEYTERM_MAX_WORDS`] is the token bound.
+pub(crate) const KEYTERM_MAX_TERMS: usize = 200;
+
+/// Ceiling on the total whitespace-delimited word count across all `keyterm`s.
+///
+/// Deepgram caps the keyterm set at 500 **tokens** per request, not 500 terms,
+/// and whisrs cannot tokenize client-side. Neither limit above bounds tokens.
+/// Measured against the two gates as they stood: `"ab cd ef"` × 400 → 195 terms
+/// at 4095 bytes and ≥585 words; `"a b c d e"` × 400 → 157 terms at 4082 bytes
+/// and ≥785 words. So a ~136-term two-word domain glossary ("atrial
+/// fibrillation") passes both, lands at roughly 550-800 tokens, and earns
+/// exactly the opaque `400` these limits exist to prevent — after
+/// `Config::validate` has already told the user how many terms reach Deepgram,
+/// when in fact none do, because the whole request is rejected.
+///
+/// A tokenizer never emits fewer tokens than there are whitespace-delimited
+/// words, so a word count is a lower bound on tokens and capping it at 300
+/// keeps the request conservatively inside the 500-token cap.
+pub(crate) const KEYTERM_MAX_WORDS: usize = 300;
+
+/// `&keyterm=` — the separator and key that precede every term on the wire.
+const KEYTERM_PARAM_OVERHEAD: usize = 9;
+
+/// Worst-case encoded byte length of one `keyterm` value.
+///
+/// Deliberately the worst case of the two encoders, because the two Deepgram
+/// paths do not encode alike: the REST path hands params to `reqwest.query()`,
+/// which **form**-encodes (space → `+`, `~` → `%7E`), while the streaming URI is
+/// assembled by hand with [`percent_encode`] (RFC 3986: `~` stays raw, space →
+/// `%20`). Measuring with either one alone under-counts the other — a
+/// `~`-heavy vocabulary costed with `percent_encode` came out at half what the
+/// REST request line actually carried, which put the request right back on the
+/// ~8KB ceiling this budget exists to stay clear of. So: 3 bytes for any byte
+/// *either* encoder escapes (`~` included, and space as `%20` rather than the
+/// shorter `+`), 1 byte only for `A-Za-z0-9-_.`, which both leave alone.
+fn keyterm_encoded_cost(value: &str) -> usize {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => 1,
+            _ => 3,
+        })
+        .sum()
+}
+
+/// The vocabulary entries that are terms at all: trimmed, blanks dropped.
+///
+/// A hand-edited `config.toml` can hold blank entries and a bare `keyterm=` is
+/// not a term. Kept separate from [`effective_keyterms`] only so callers can
+/// report how many terms the *limits* dropped without counting blank config
+/// entries as drops.
+pub(crate) fn usable_keyterms(keyterms: &[String]) -> impl Iterator<Item = &str> {
+    keyterms.iter().map(|t| t.trim()).filter(|t| !t.is_empty())
+}
+
+/// The `keyterm` values a Deepgram request actually carries, in order.
+///
+/// The single place the effective list is decided — `Config::validate` and
+/// [`build_query_params`] both call this, so the count warned about at load is
+/// by construction the count that goes on the wire. Normalization happens
+/// first: entries are trimmed and blanks dropped *before* anything is charged,
+/// then the remainder is charged against all three of
+/// [`KEYTERM_QUERY_BUDGET_BYTES`], [`KEYTERM_MAX_TERMS`] and
+/// [`KEYTERM_MAX_WORDS`]. Each bounds a different thing and none implies
+/// another — see their own docs.
+///
+/// Ordering matters. An earlier split — count the budget over the raw list,
+/// filter the blanks afterwards — let blank entries burn budget they never
+/// spent: 200 blanks in front of a real vocabulary had `validate` advertise 335
+/// terms while the request carried 135, with 105 real terms discarded for
+/// nothing.
+///
+/// A term that does not fit is **skipped, not fatal**: iteration continues and
+/// later, smaller terms can still make it. Stopping at the first misfit let one
+/// pathological entry discard everything behind it —
+/// `["x" × 5000, "whisrs", "Hyprland"]` put zero terms on the wire and warned
+/// that "the first 0" reached Deepgram, while the same three terms reordered
+/// kept both real ones. The consequence is that the result is no longer a
+/// prefix of the input, so callers must report "N of M", never "the first N".
+pub(crate) fn effective_keyterms(keyterms: &[String]) -> Vec<&str> {
+    let mut used_bytes = 0usize;
+    let mut used_words = 0usize;
+    let mut effective = Vec::new();
+    for term in usable_keyterms(keyterms) {
+        if effective.len() >= KEYTERM_MAX_TERMS {
+            break;
+        }
+        let cost = KEYTERM_PARAM_OVERHEAD + keyterm_encoded_cost(term);
+        let words = term.split_whitespace().count();
+        if used_bytes + cost > KEYTERM_QUERY_BUDGET_BYTES || used_words + words > KEYTERM_MAX_WORDS
+        {
+            continue;
+        }
+        used_bytes += cost;
+        used_words += words;
+        effective.push(term);
+    }
+    effective
+}
+
+/// Whether `model` accepts the `keyterm` parameter.
+///
+/// Deepgram answers `400 INVALID_QUERY_PARAMETER` — "`keyterm` is only
+/// supported for Nova-3 and Flux" — on anything else, so a user who sets
+/// `vocabulary` while pinning an older model must not have every request
+/// rejected because of it. Pre-Nova-3 models bias through a different
+/// parameter (`keywords`, with its own weighting syntax and its own
+/// deprecation story); not wiring that up is deliberate scope for this
+/// change, not an oversight.
+pub(crate) fn supports_keyterm(model: &str) -> bool {
+    model.starts_with("nova-3") || model.starts_with("flux")
+}
+
+/// Whether `model` can tell speakers apart. Deepgram diarizes with every
+/// Nova batch model (Nova-1, 2 and 3) and with enhanced and base, but not
+/// with the Whisper models it hosts.
+pub fn supports_diarization(model: &str) -> bool {
+    !model.starts_with("whisper")
+}
+
+/// Whether `err` is Deepgram refusing a request for its speakers: a 400
+/// whose message is about diarization (an account or model that cannot
+/// have it). The same audio goes through without them.
+pub fn refused_diarization(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let text = cause.to_string();
+        text.starts_with("Deepgram API error (400") && text.to_lowercase().contains("diariz")
+    })
+}
+
+/// The diarization model a recording asks for (`diarize_model`): the newest
+/// batch diarizer (v2 since 2026-05-13).
+pub const DIARIZE_MODEL: &str = "latest";
+
+/// What `recording.json` records as `diarization` for Deepgram.
+pub const DIARIZATION_LABEL: &str = "deepgram:latest";
+
+/// What to log when the configured model cannot take the vocabulary at all, or
+/// `None` when there is nothing to report.
+///
+/// A function rather than an inline condition so the emptiness test is
+/// testable. This branch used to gate on `keyterms.is_empty()` while every
+/// other count in this file goes through [`usable_keyterms`], so a
+/// vocabulary of nothing but blank entries logged "ignoring 0 vocabulary
+/// term(s)" on a nova-2 config.
+fn unsupported_model_keyterm_notice(model: &str, keyterms: &[String]) -> Option<String> {
+    let ignored = usable_keyterms(keyterms).count();
+    if ignored == 0 {
+        return None;
+    }
+    Some(format!(
+        "model {model} does not support keyterm prompting — ignoring {ignored} vocabulary term(s)"
+    ))
+}
+
 /// Build common query parameters for Deepgram requests.
 fn build_query_params<'a>(
     config: &'a TranscriptionConfig,
@@ -58,6 +272,30 @@ fn build_query_params<'a>(
         ("language", map_language(&config.language)),
         ("smart_format", "true"),
     ];
+    // Keyterm prompting: one repeated `keyterm` per term. Deepgram rejects
+    // weights/intensifiers and comma- or semicolon-separated lists, and caps the
+    // set at 500 tokens per request (see `KEYTERM_MAX_WORDS`).
+    if supports_keyterm(&config.model) {
+        let effective = effective_keyterms(&config.keyterms);
+        let usable = usable_keyterms(&config.keyterms).count();
+        if effective.len() < usable {
+            // "N of M", never "the first N": `effective_keyterms` skips a term
+            // that does not fit rather than stopping there, so the terms that
+            // survive are not a prefix of the vocabulary.
+            debug!(
+                "vocabulary exceeds the Deepgram keyterm limits ({} bytes / {} terms / \
+                 {} words) — sending {} of {} term(s)",
+                KEYTERM_QUERY_BUDGET_BYTES,
+                KEYTERM_MAX_TERMS,
+                KEYTERM_MAX_WORDS,
+                effective.len(),
+                usable
+            );
+        }
+        params.extend(effective.into_iter().map(|t| ("keyterm", t)));
+    } else if let Some(notice) = unsupported_model_keyterm_notice(&config.model, &config.keyterms) {
+        debug!("{notice}");
+    }
     params.extend_from_slice(extra);
     params
 }
@@ -118,10 +356,13 @@ struct StreamingChannel {
 
 /// Deepgram REST transcription backend.
 ///
-/// Sends the full WAV file to `/v1/listen` and returns the complete transcript.
+/// Sends the full WAV file (FLAC for a recording chunk) to `/v1/listen` and
+/// returns the complete transcript.
 pub struct DeepgramRestBackend {
     client: reqwest::Client,
     api_key: String,
+    /// [`DEEPGRAM_REST_URL`]; tests point it at a local server.
+    url: String,
 }
 
 impl DeepgramRestBackend {
@@ -129,8 +370,219 @@ impl DeepgramRestBackend {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            url: rest_url(),
         }
     }
+
+    /// A backend that posts to `url` instead of Deepgram: a local stand-in
+    /// for tests.
+    #[cfg(test)]
+    pub(crate) fn with_url(api_key: String, url: String) -> Self {
+        Self {
+            url,
+            ..Self::new(api_key)
+        }
+    }
+
+    /// POST `audio`, in `format`, to `/v1/listen` with the common params plus
+    /// `extra`, and return the raw success body.
+    async fn post(
+        &self,
+        audio: &[u8],
+        format: UploadFormat,
+        config: &TranscriptionConfig,
+        extra: &[(&str, &str)],
+    ) -> anyhow::Result<String> {
+        let api_key = resolve_api_key(&self.api_key)?;
+        let params = build_query_params(config, extra);
+
+        let response = self
+            .client
+            .post(&self.url)
+            .header("Authorization", format!("Token {api_key}"))
+            .header("Content-Type", format.mime)
+            .query(&params)
+            .body(audio.to_vec())
+            .send()
+            .await?;
+
+        let status = response.status();
+        let retry_after = super::retry_after_header(response.headers());
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            let code = status.as_u16();
+            let message = match serde_json::from_str::<DeepgramErrorResponse>(&body) {
+                Ok(err_resp) => match code {
+                    401 | 403 => format!("Deepgram API: invalid API key: {}", err_resp.err_msg),
+                    429 => format!("Deepgram API: rate limited: {}", err_resp.err_msg),
+                    _ => format!(
+                        "Deepgram API error ({code} {}): {}",
+                        err_resp.err_code, err_resp.err_msg
+                    ),
+                },
+                Err(_) => format!("Deepgram API error ({code}): {body}"),
+            };
+            return Err(super::http_error(code, retry_after, message));
+        }
+        Ok(body)
+    }
+}
+
+/// [`DEEPGRAM_REST_URL`], or in a debug build `WHISRS_DEBUG_DEEPGRAM_URL`
+/// when it is set: a local stand-in for end-to-end tests of a daemon built
+/// from source. A release build never reads it.
+fn rest_url() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(url) = std::env::var("WHISRS_DEBUG_DEEPGRAM_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+    {
+        warn!("posting Deepgram requests to {url} (WHISRS_DEBUG_DEEPGRAM_URL)");
+        return url;
+    }
+    DEEPGRAM_REST_URL.to_string()
+}
+
+/// Extra query params for a recording request: `utterances=true` makes Deepgram
+/// group words into timed utterances at pauses.
+const SEGMENT_QUERY_EXTRA: &[(&str, &str)] = &[("utterances", "true")];
+
+/// [`SEGMENT_QUERY_EXTRA`] for a track whose voices Deepgram tells apart:
+/// `diarize_model` both turns diarization on and picks the model, and every
+/// word and utterance comes back with a `speaker`. Never `diarize=true`
+/// beside it: Deepgram rejects a request with both.
+const SEGMENT_QUERY_DIARIZED: &[(&str, &str)] =
+    &[("utterances", "true"), ("diarize_model", DIARIZE_MODEL)];
+
+/// The extra query params of a recording request: with speakers when the
+/// request asks for them ([`TranscriptionConfig::diarize`]) and the model
+/// can tell them apart.
+fn segment_query_extra(config: &TranscriptionConfig) -> &'static [(&'static str, &'static str)] {
+    if config.diarize && supports_diarization(&config.model) {
+        SEGMENT_QUERY_DIARIZED
+    } else {
+        SEGMENT_QUERY_EXTRA
+    }
+}
+
+/// Longest chunk sent to Deepgram in one request. Pre-recorded audio has no
+/// small upload cap, so an hour (~115 MB of WAV) keeps requests few while
+/// bounding how much one failed request costs.
+const DEEPGRAM_CHUNK_SECS: u32 = 3600;
+
+#[derive(Debug, Deserialize)]
+struct UtteranceResponse {
+    results: UtteranceResults,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceResults {
+    #[serde(default)]
+    utterances: Option<Vec<Utterance>>,
+    #[serde(default)]
+    channels: Vec<UtteranceChannel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceChannel {
+    #[serde(default)]
+    alternatives: Vec<UtteranceAlternative>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceAlternative {
+    #[serde(default)]
+    transcript: String,
+    #[serde(default)]
+    words: Vec<UtteranceWord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Utterance {
+    start: f64,
+    end: f64,
+    #[serde(default)]
+    transcript: String,
+    #[serde(default)]
+    speaker: Option<u32>,
+    #[serde(default)]
+    words: Vec<UtteranceWord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UtteranceWord {
+    word: String,
+    #[serde(default)]
+    punctuated_word: Option<String>,
+    start: f64,
+    end: f64,
+    #[serde(default)]
+    speaker: Option<u32>,
+}
+
+impl UtteranceWord {
+    fn to_word(&self) -> Word {
+        Word {
+            start_ms: secs_to_ms(self.start),
+            end_ms: secs_to_ms(self.end),
+            text: self
+                .punctuated_word
+                .clone()
+                .unwrap_or_else(|| self.word.clone()),
+            speaker: self.speaker.map(|s| s.to_string()),
+        }
+    }
+}
+
+/// Parse a `/v1/listen?utterances=true` body into timed segments.
+///
+/// One segment per utterance with its words. Without an `utterances` array
+/// (a request that did not ask for them), the first channel's transcript
+/// becomes one segment spanning its words. With diarization every word and
+/// utterance carries Deepgram's `speaker` number (per request), kept as its
+/// decimal string.
+pub fn parse_utterances(body: &str) -> anyhow::Result<Transcript> {
+    let parsed: UtteranceResponse = serde_json::from_str(body)?;
+    let words_of = |words: &[UtteranceWord]| -> Option<Vec<Word>> {
+        (!words.is_empty()).then(|| words.iter().map(UtteranceWord::to_word).collect())
+    };
+
+    let segments = match parsed.results.utterances {
+        Some(utterances) => utterances
+            .iter()
+            .filter(|u| !u.transcript.trim().is_empty())
+            .map(|u| {
+                let start_ms = secs_to_ms(u.start);
+                Segment {
+                    start_ms,
+                    end_ms: secs_to_ms(u.end).max(start_ms),
+                    text: u.transcript.trim().to_string(),
+                    speaker: u.speaker.map(|s| s.to_string()),
+                    words: words_of(&u.words),
+                }
+            })
+            .collect(),
+        None => parsed
+            .results
+            .channels
+            .first()
+            .and_then(|ch| ch.alternatives.first())
+            .filter(|alt| !alt.transcript.trim().is_empty())
+            .map(|alt| {
+                let start_ms = alt.words.first().map_or(0, |w| secs_to_ms(w.start));
+                let end_ms = alt.words.last().map_or(start_ms, |w| secs_to_ms(w.end));
+                vec![Segment {
+                    start_ms,
+                    end_ms,
+                    text: alt.transcript.trim().to_string(),
+                    speaker: None,
+                    words: words_of(&alt.words),
+                }]
+            })
+            .unwrap_or_default(),
+    };
+    Ok(Transcript { segments })
 }
 
 #[async_trait]
@@ -144,8 +596,6 @@ impl TranscriptionBackend for DeepgramRestBackend {
             anyhow::bail!("cannot transcribe empty audio");
         }
 
-        let api_key = resolve_api_key(&self.api_key)?;
-
         debug!(
             "sending {} bytes to Deepgram REST API (model={}, language={})",
             audio.len(),
@@ -153,40 +603,7 @@ impl TranscriptionBackend for DeepgramRestBackend {
             config.language
         );
 
-        let params = build_query_params(config, &[]);
-
-        let response = self
-            .client
-            .post(DEEPGRAM_REST_URL)
-            .header("Authorization", format!("Token {api_key}"))
-            .header("Content-Type", "audio/wav")
-            .query(&params)
-            .body(audio.to_vec())
-            .send()
-            .await?;
-
-        let status = response.status();
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            if let Ok(err_resp) = serde_json::from_str::<DeepgramErrorResponse>(&body) {
-                match status.as_u16() {
-                    401 | 403 => {
-                        anyhow::bail!("Deepgram API: invalid API key — {}", err_resp.err_msg)
-                    }
-                    429 => {
-                        anyhow::bail!("Deepgram API: rate limited — {}", err_resp.err_msg)
-                    }
-                    _ => anyhow::bail!(
-                        "Deepgram API error ({} {}): {}",
-                        status.as_u16(),
-                        err_resp.err_code,
-                        err_resp.err_msg
-                    ),
-                }
-            }
-            anyhow::bail!("Deepgram API error ({}): {}", status.as_u16(), body);
-        }
+        let body = self.post(audio, UploadFormat::WAV, config, &[]).await?;
 
         let parsed: DeepgramResponse = serde_json::from_str(&body)?;
         let text = parsed
@@ -206,6 +623,47 @@ impl TranscriptionBackend for DeepgramRestBackend {
 
     // Uses the default transcribe_stream (collect + transcribe) since this
     // backend does not support streaming.
+
+    // Deepgram has no prompt field; vocabulary rides as `keyterm` params.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+        false
+    }
+
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
+    }
+
+    // Native timestamps via `utterances=true`, and speakers via
+    // `diarize_model` when the request asks for them. The chunk goes up as
+    // FLAC.
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        if audio.is_empty() {
+            anyhow::bail!("cannot transcribe empty audio");
+        }
+        let upload = recording_upload(audio).await;
+        let extra = segment_query_extra(config);
+        debug!(
+            "sending {} bytes ({}, WAV was {}) to Deepgram REST API for utterances \
+             (model={}, speakers={})",
+            upload.bytes.len(),
+            upload.format.mime,
+            audio.len(),
+            config.model,
+            extra == SEGMENT_QUERY_DIARIZED
+        );
+        let body = self
+            .post(&upload.bytes, upload.format, config, extra)
+            .await?;
+        parse_utterances(&body)
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(DEEPGRAM_CHUNK_SECS)
+    }
 }
 
 // ===========================================================================
@@ -287,11 +745,7 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
         );
 
         // Build the WebSocket URL with query parameters.
-        let query_string: String = params
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
+        let query_string = build_query_string(&params);
         let url = format!("{DEEPGRAM_WS_URL}?{query_string}");
 
         info!("connecting to Deepgram streaming API");
@@ -403,11 +857,54 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
     fn supports_streaming(&self) -> bool {
         true
     }
+
+    // Same as the REST backend: no prompt field on the wire, vocabulary rides
+    // as `keyterm` query params.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+        false
+    }
+
+    // Trimmed final results, one per utterance.
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
+    }
+
+    // A recording has no use for the live socket: same key and model,
+    // sent to the REST endpoint.
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        DeepgramRestBackend::new(self.api_key.clone())
+            .transcribe_segments(audio, config)
+            .await
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(DEEPGRAM_CHUNK_SECS)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcription::retry::{retry_transient, RATE_LIMIT_BUDGET};
+    use crate::transcription::test_server::{serve_once, serve_responses};
+
+    #[test]
+    fn deepgram_backends_never_send_the_prompt() {
+        let request = TranscriptionConfig {
+            language: "en".to_string(),
+            model: "nova-3".to_string(),
+            prompt: Some("Hyprland, whisrs".to_string()),
+            keyterms: Vec::new(),
+            diarize: false,
+        };
+
+        assert!(!DeepgramRestBackend::new(String::new()).sends_prompt(&request));
+        assert!(!DeepgramStreamingBackend::new(String::new()).sends_prompt(&request));
+    }
 
     #[test]
     fn map_language_auto_to_multi() {
@@ -510,25 +1007,48 @@ mod tests {
         assert_eq!(parsed.msg_type, "Metadata");
     }
 
+    /// A [`TranscriptionConfig`] with just the fields the query builder reads.
+    fn query_config(model: &str, keyterms: &[&str]) -> TranscriptionConfig {
+        TranscriptionConfig {
+            language: "en".to_string(),
+            model: model.to_string(),
+            prompt: None,
+            keyterms: keyterms.iter().map(|t| t.to_string()).collect(),
+            diarize: false,
+        }
+    }
+
+    /// Same as [`query_config`] for a vocabulary that is already owned.
+    fn owned_query_config(model: &str, keyterms: &[String]) -> TranscriptionConfig {
+        TranscriptionConfig {
+            language: "en".to_string(),
+            model: model.to_string(),
+            prompt: None,
+            keyterms: keyterms.to_vec(),
+            diarize: false,
+        }
+    }
+
+    /// The `keyterm` values `build_query_params` put on the wire, in order.
+    fn keyterm_values<'a>(params: &'a [(&'a str, &'a str)]) -> Vec<&'a str> {
+        params
+            .iter()
+            .filter(|(k, _)| *k == "keyterm")
+            .map(|(_, v)| *v)
+            .collect()
+    }
+
     #[tokio::test]
     async fn rest_rejects_empty_audio() {
         let backend = DeepgramRestBackend::new("test-key".to_string());
-        let config = TranscriptionConfig {
-            language: "en".to_string(),
-            model: "nova-3".to_string(),
-            prompt: None,
-        };
+        let config = query_config("nova-3", &[]);
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
     }
 
     #[test]
     fn build_query_params_includes_smart_format() {
-        let config = TranscriptionConfig {
-            language: "en".to_string(),
-            model: "nova-3".to_string(),
-            prompt: None,
-        };
+        let config = query_config("nova-3", &[]);
         let params = build_query_params(&config, &[]);
         assert!(params
             .iter()
@@ -539,14 +1059,652 @@ mod tests {
 
     #[test]
     fn build_query_params_auto_language() {
-        let config = TranscriptionConfig {
-            language: "auto".to_string(),
-            model: "nova-3".to_string(),
-            prompt: None,
-        };
+        let mut config = query_config("nova-3", &[]);
+        config.language = "auto".to_string();
         let params = build_query_params(&config, &[]);
         assert!(params
             .iter()
             .any(|(k, v)| *k == "language" && *v == "multi"));
+    }
+
+    #[test]
+    fn build_query_params_emits_one_keyterm_per_vocabulary_entry() {
+        let config = query_config("nova-3", &["whisrs", "GNOME Shell"]);
+        let params = build_query_params(&config, &[]);
+        assert_eq!(keyterm_values(&params), vec!["whisrs", "GNOME Shell"]);
+    }
+
+    #[test]
+    fn build_query_params_omits_keyterm_on_models_that_reject_it() {
+        // nova-2 answers 400 INVALID_QUERY_PARAMETER when `keyterm` is present,
+        // so a vocabulary set alongside an older model must be dropped rather
+        // than break every request.
+        let config = query_config("nova-2", &["whisrs"]);
+        let params = build_query_params(&config, &[]);
+        assert!(!params.iter().any(|(k, _)| *k == "keyterm"));
+    }
+
+    #[test]
+    fn build_query_params_without_vocabulary_sends_no_keyterm() {
+        let config = query_config("nova-3", &[]);
+        let params = build_query_params(&config, &[]);
+        assert!(!params.iter().any(|(k, _)| *k == "keyterm"));
+    }
+
+    #[test]
+    fn build_query_params_skips_blank_vocabulary_entries() {
+        // `whisrs config` strips these, but a hand-edited config.toml can hold
+        // them and a bare `keyterm=` is not a term.
+        let config = query_config("nova-3", &["whisrs", "", "  ", "\t"]);
+        let params = build_query_params(&config, &[]);
+        assert_eq!(keyterm_values(&params), vec!["whisrs"]);
+    }
+
+    #[test]
+    fn build_query_params_sends_keyterms_trimmed() {
+        let config = query_config("nova-3", &["  GNOME Shell  "]);
+        let params = build_query_params(&config, &[]);
+        assert_eq!(keyterm_values(&params), vec!["GNOME Shell"]);
+    }
+
+    #[test]
+    fn build_query_params_truncates_vocabulary_to_the_query_budget() {
+        // 1000 terms builds a ~28KB URI; Deepgram's edge rejects the handshake
+        // with a bare 400 that never mentions the vocabulary. Terms are short
+        // enough here that the byte budget bites before `KEYTERM_MAX_TERMS`
+        // would — 4096 / (9 + 8) is 240, above the 200-term cap, so keep the
+        // assertion on the cap that actually fires.
+        let terms: Vec<String> = (0..1000).map(|i| format!("term{i:04}")).collect();
+        let config = owned_query_config("nova-3", &terms);
+        let params = build_query_params(&config, &[]);
+        let sent = keyterm_values(&params);
+        assert!(
+            sent.len() < terms.len(),
+            "budget must drop terms, sent all {}",
+            sent.len()
+        );
+        assert!(!sent.is_empty(), "budget must still send the leading terms");
+        // The terms it does send are a prefix, and they fit the budget.
+        assert_eq!(sent[0], "term0000");
+        let bytes: usize = sent
+            .iter()
+            .map(|t| KEYTERM_PARAM_OVERHEAD + keyterm_encoded_cost(t))
+            .sum();
+        assert!(
+            bytes <= KEYTERM_QUERY_BUDGET_BYTES,
+            "sent {bytes} bytes of keyterms, over the {KEYTERM_QUERY_BUDGET_BYTES} budget"
+        );
+    }
+
+    #[test]
+    fn effective_keyterms_admits_a_small_vocabulary_whole() {
+        let terms = vec!["whisrs".to_string(), "GNOME Shell".to_string()];
+        assert_eq!(effective_keyterms(&terms), vec!["whisrs", "GNOME Shell"]);
+    }
+
+    #[test]
+    fn effective_keyterms_is_what_build_query_params_puts_on_the_wire() {
+        // The bug this pins: blanks used to be charged against the budget and
+        // filtered afterwards, so the advertised count and the wire disagreed.
+        // 200 whitespace-only entries in front of 1000 real terms had
+        // `validate` promise 335 while the request carried 135 — 105 real terms
+        // discarded and 1801 budget bytes burned on nothing.
+        let mut terms: Vec<String> = vec!["   ".to_string(); 200];
+        terms.extend((0..1000).map(|i| format!("term{i:04}")));
+
+        let config = owned_query_config("nova-3", &terms);
+        let params = build_query_params(&config, &[]);
+        let sent = keyterm_values(&params);
+        let advertised = effective_keyterms(&terms);
+
+        assert_eq!(
+            sent, advertised,
+            "the advertised list must be the list on the wire"
+        );
+        assert!(
+            sent.iter().all(|t| !t.trim().is_empty()),
+            "a blank entry reached the wire: {sent:?}"
+        );
+        assert_eq!(
+            sent[0], "term0000",
+            "blanks must not shift which real terms are kept"
+        );
+        // Blanks cost nothing, so the real terms get the whole budget: the same
+        // 1000 terms with no blanks in front produce exactly the same list.
+        let without_blanks: Vec<String> = (0..1000).map(|i| format!("term{i:04}")).collect();
+        assert_eq!(
+            advertised,
+            effective_keyterms(&without_blanks),
+            "blank entries still consumed budget"
+        );
+
+        // And the number `Config::validate` advertises at load is the number of
+        // `keyterm` params this same vocabulary puts on the wire. This is the
+        // whole point of routing both through `effective_keyterms`: the two
+        // used to be computed separately and disagreed.
+        let mut config: crate::Config = toml::from_str("").expect("empty config uses defaults");
+        config.general.backend = "deepgram".to_string();
+        config.general.vocabulary = terms.clone();
+        config.deepgram = Some(crate::DeepgramConfig {
+            api_key: "test-key".to_string(),
+            model: "nova-3".to_string(),
+        });
+        let warnings = config.validate().expect("a keyed deepgram config is valid");
+        let warning = warnings
+            .iter()
+            .find(|w| w.message.contains("vocabulary"))
+            .unwrap_or_else(|| panic!("a truncated vocabulary must warn: {warnings:?}"));
+        assert!(
+            warning.message.contains(&format!("{} of ", sent.len())),
+            "validate advertised a different count than the {} terms on the wire: {}",
+            sent.len(),
+            warning.message
+        );
+    }
+
+    #[test]
+    fn effective_keyterms_caps_the_word_count_before_the_byte_budget() {
+        // The claim `KEYTERM_MAX_TERMS` used to make — that staying under 200
+        // terms keeps a byte-legal vocabulary inside Deepgram's 500-token cap —
+        // is false, and this is the counterexample. 400 copies of "ab cd ef"
+        // stop at 195 terms on the byte budget alone: under the term cap, at
+        // 4095 of 4096 bytes, and carrying at least 585 whitespace-delimited
+        // words. `KEYTERM_MAX_WORDS` is what actually bounds it.
+        let terms: Vec<String> = vec!["ab cd ef".to_string(); 400];
+
+        // What the other two limits alone would have allowed.
+        let cost = KEYTERM_PARAM_OVERHEAD + keyterm_encoded_cost("ab cd ef");
+        let byte_bound = KEYTERM_QUERY_BUDGET_BYTES / cost;
+        assert!(
+            byte_bound < KEYTERM_MAX_TERMS,
+            "fixture must be byte-bound below the term cap, got {byte_bound}"
+        );
+        assert!(
+            byte_bound * 3 > 500,
+            "fixture must blow the 500-token cap without the word limit: {} words",
+            byte_bound * 3
+        );
+
+        let effective = effective_keyterms(&terms);
+        assert_eq!(
+            effective.len(),
+            KEYTERM_MAX_WORDS / 3,
+            "the word limit, not the byte budget, must be what bites"
+        );
+        let words: usize = effective.iter().map(|t| t.split_whitespace().count()).sum();
+        assert!(
+            words <= KEYTERM_MAX_WORDS,
+            "sent {words} words, over the {KEYTERM_MAX_WORDS} cap"
+        );
+
+        // And the count that goes on the wire is the count `validate` advertises.
+        let config = owned_query_config("nova-3", &terms);
+        let params = build_query_params(&config, &[]);
+        let sent = keyterm_values(&params);
+        assert_eq!(sent.len(), effective.len());
+
+        let mut config: crate::Config = toml::from_str("").expect("empty config uses defaults");
+        config.general.backend = "deepgram".to_string();
+        config.general.vocabulary = terms.clone();
+        config.deepgram = Some(crate::DeepgramConfig {
+            api_key: "test-key".to_string(),
+            model: "nova-3".to_string(),
+        });
+        let warnings = config.validate().expect("a keyed deepgram config is valid");
+        let warning = warnings
+            .iter()
+            .find(|w| w.message.contains("vocabulary"))
+            .unwrap_or_else(|| panic!("a word-capped vocabulary must warn: {warnings:?}"));
+        assert!(
+            warning
+                .message
+                .contains(&format!("{} of {} usable term(s)", sent.len(), terms.len())),
+            "validate advertised a different count than the {} terms on the wire: {}",
+            sent.len(),
+            warning.message
+        );
+    }
+
+    #[test]
+    fn one_oversized_term_does_not_discard_the_rest_of_the_vocabulary() {
+        // `effective_keyterms` used to `break` on the first term that would not
+        // fit, so a single pathological entry nuked everything behind it: this
+        // vocabulary put zero terms on the wire and warned that "the first 0"
+        // reached Deepgram, while the same three terms reordered kept both real
+        // ones. Skipping the misfit and continuing is what makes the outcome
+        // independent of where the long term sits.
+        let long = "x".repeat(5000);
+        let first = vec![long.clone(), "whisrs".to_string(), "Hyprland".to_string()];
+        let last = vec!["whisrs".to_string(), "Hyprland".to_string(), long];
+
+        assert!(
+            KEYTERM_PARAM_OVERHEAD + keyterm_encoded_cost(&"x".repeat(5000))
+                > KEYTERM_QUERY_BUDGET_BYTES,
+            "the fixture term must not fit on its own"
+        );
+        assert_eq!(effective_keyterms(&first), vec!["whisrs", "Hyprland"]);
+        assert_eq!(effective_keyterms(&last), vec!["whisrs", "Hyprland"]);
+
+        let config = owned_query_config("nova-3", &first);
+        let params = build_query_params(&config, &[]);
+        assert_eq!(keyterm_values(&params), vec!["whisrs", "Hyprland"]);
+    }
+
+    #[test]
+    fn unsupported_model_notice_uses_the_same_emptiness_test_as_the_rest_of_the_file() {
+        // The unsupported-model branch used to gate on `keyterms.is_empty()`
+        // while every other count here goes through `usable_keyterms`, so a
+        // blanks-only vocabulary logged "ignoring 0 vocabulary term(s)".
+        let blanks = ["".to_string(), "  ".to_string(), "\t".to_string()];
+        assert!(!blanks.is_empty(), "the old gate would have fired here");
+        assert_eq!(unsupported_model_keyterm_notice("nova-2", &blanks), None);
+        assert_eq!(unsupported_model_keyterm_notice("nova-2", &[]), None);
+
+        let notice =
+            unsupported_model_keyterm_notice("nova-2", &["whisrs".to_string(), "   ".to_string()])
+                .expect("a real term must be reported");
+        assert!(
+            notice.contains("ignoring 1 vocabulary term(s)"),
+            "blank entries must not be counted: {notice}"
+        );
+        assert!(notice.contains("nova-2"), "the notice must name the model");
+
+        // And a blanks-only vocabulary still puts no `keyterm` on the wire.
+        let config = query_config("nova-2", &["", "  ", "\t"]);
+        let params = build_query_params(&config, &[]);
+        assert!(!params.iter().any(|(k, _)| *k == "keyterm"));
+    }
+
+    #[test]
+    fn keyterm_cost_charges_three_bytes_for_anything_either_encoder_escapes() {
+        // `~` is the trap: RFC 3986 leaves it raw (so `percent_encode` charges
+        // 1) but `reqwest.query()` form-encodes it to `%7E`. Costing with
+        // `percent_encode` let a `~`-heavy vocabulary put ~2x the counted bytes
+        // on the REST request line, right back on the ~8KB ceiling.
+        assert_eq!(keyterm_encoded_cost("~~~~~~~~"), 24);
+        assert_eq!(percent_encode("~~~~~~~~").len(), 8, "RFC 3986 leaves ~ raw");
+        // Space is charged as `%20`, not the shorter form-encoded `+`.
+        assert_eq!(keyterm_encoded_cost("GNOME Shell"), 13);
+        // The unreserved set both encoders agree on stays at one byte each.
+        assert_eq!(keyterm_encoded_cost("nova-3_v.1"), 10);
+    }
+
+    #[test]
+    fn keyterm_budget_is_not_overrun_by_a_tilde_heavy_vocabulary() {
+        // 300 copies of `~~~~~~~~`: the whole point is that what the budget
+        // counts is an upper bound on what the form-encoding REST path emits.
+        let terms: Vec<String> = vec!["~~~~~~~~".to_string(); 300];
+        let effective = effective_keyterms(&terms);
+        let counted: usize = effective
+            .iter()
+            .map(|t| KEYTERM_PARAM_OVERHEAD + keyterm_encoded_cost(t))
+            .sum();
+        // What reqwest's form encoding actually puts on the REST request line.
+        let form_encoded: usize = effective
+            .iter()
+            .map(|t| KEYTERM_PARAM_OVERHEAD + t.len() * "%7E".len())
+            .sum();
+        assert!(
+            form_encoded <= counted,
+            "REST carries {form_encoded} bytes but the budget only counted {counted}"
+        );
+        assert!(
+            counted <= KEYTERM_QUERY_BUDGET_BYTES,
+            "counted {counted} bytes, over the {KEYTERM_QUERY_BUDGET_BYTES} budget"
+        );
+    }
+
+    #[test]
+    fn effective_keyterms_caps_the_term_count_well_inside_the_byte_budget() {
+        // Deepgram's real limit is 500 tokens, which the byte budget does not
+        // bound. These terms are short enough that the first 200 of them use
+        // barely half the byte budget, so if `KEYTERM_MAX_TERMS` were not
+        // enforced the byte budget would let ~315 through instead of 200.
+        let terms: Vec<String> = (0..500).map(|i| format!("t{i:03}")).collect();
+        let bytes: usize = terms
+            .iter()
+            .take(KEYTERM_MAX_TERMS)
+            .map(|t| KEYTERM_PARAM_OVERHEAD + keyterm_encoded_cost(t))
+            .sum();
+        assert!(
+            bytes < KEYTERM_QUERY_BUDGET_BYTES,
+            "fixture must be inside the byte budget so the term cap is what fires"
+        );
+        assert_eq!(effective_keyterms(&terms).len(), KEYTERM_MAX_TERMS);
+
+        let config = owned_query_config("nova-3", &terms);
+        let params = build_query_params(&config, &[]);
+        let sent = keyterm_values(&params);
+        assert_eq!(sent.len(), KEYTERM_MAX_TERMS);
+    }
+
+    #[test]
+    fn percent_encode_escapes_spaces_and_leaves_plain_values_alone() {
+        // A raw space in a multi-word keyterm makes the streaming URI invalid
+        // and Deepgram answers the handshake with a bare 400.
+        assert_eq!(percent_encode("GNOME Shell"), "GNOME%20Shell");
+        assert_eq!(percent_encode("nova-3"), "nova-3");
+        assert_eq!(percent_encode("linear16"), "linear16");
+    }
+
+    #[test]
+    fn build_query_string_percent_encodes_values() {
+        // The streaming URI is assembled from these params by hand, so the
+        // encoding has to survive the join, not just `percent_encode`.
+        let config = query_config("nova-3", &["GNOME Shell"]);
+        let params = build_query_params(&config, &[]);
+        let query = build_query_string(&params);
+        assert!(
+            query.contains("keyterm=GNOME%20Shell"),
+            "multi-word keyterm must be percent-encoded: {query}"
+        );
+        assert!(
+            !query.contains("GNOME Shell"),
+            "raw space left in the query string: {query}"
+        );
+        assert!(
+            query.contains("model=nova-3"),
+            "the fixed params must survive encoding: {query}"
+        );
+    }
+
+    /// Trimmed from a real nova-3 `/v1/listen?utterances=true&smart_format=true`
+    /// response.
+    const UTTERANCES_BODY: &str = r#"{
+        "metadata": {"request_id": "x", "duration": 9.5, "channels": 1},
+        "results": {
+            "channels": [{"alternatives": [{"transcript": "Hi team. Let's start.", "confidence": 0.99,
+                "words": []}]}],
+            "utterances": [
+                {"start": 0.32, "end": 1.1, "confidence": 0.98, "channel": 0,
+                 "transcript": "Hi team.", "id": "a",
+                 "words": [
+                    {"word": "hi", "start": 0.32, "end": 0.6, "confidence": 0.9, "punctuated_word": "Hi"},
+                    {"word": "team", "start": 0.6, "end": 1.1, "confidence": 0.9, "punctuated_word": "team."}
+                 ]},
+                {"start": 4.0, "end": 5.25, "confidence": 0.97, "channel": 0,
+                 "transcript": "Let's start.", "id": "b", "speaker": 1,
+                 "words": [
+                    {"word": "let's", "start": 4.0, "end": 4.6, "confidence": 0.9, "punctuated_word": "Let's", "speaker": 1},
+                    {"word": "start", "start": 4.6, "end": 5.25, "confidence": 0.9, "punctuated_word": "start.", "speaker": 1}
+                 ]},
+                {"start": 7.0, "end": 7.2, "confidence": 0.1, "channel": 0,
+                 "transcript": "", "id": "c", "words": []}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn parse_utterances_into_segments() {
+        let t = parse_utterances(UTTERANCES_BODY).unwrap();
+        assert_eq!(t.segments.len(), 2, "blank utterances are dropped");
+        assert_eq!((t.segments[0].start_ms, t.segments[0].end_ms), (320, 1100));
+        assert_eq!(t.segments[0].text, "Hi team.");
+        let words = t.segments[0].words.as_ref().unwrap();
+        assert_eq!(words[1].text, "team.", "punctuated_word wins");
+        assert_eq!(t.segments[1].speaker.as_deref(), Some("1"));
+        assert_eq!(t.segments[1].start_ms, 4000);
+    }
+
+    #[test]
+    fn parse_utterances_without_utterances_uses_the_channel() {
+        let body = r#"{"results": {"channels": [{"alternatives": [{"transcript": "hello",
+            "words": [{"word": "hello", "start": 1.5, "end": 2.0}]}]}]}}"#;
+        let t = parse_utterances(body).unwrap();
+        assert_eq!(t.segments.len(), 1);
+        assert_eq!((t.segments[0].start_ms, t.segments[0].end_ms), (1500, 2000));
+
+        let silent = r#"{"results": {"channels": [{"alternatives": [{"transcript": ""}]}]}}"#;
+        assert!(parse_utterances(silent).unwrap().segments.is_empty());
+    }
+
+    #[test]
+    fn segment_query_asks_for_utterances_and_keeps_keyterms() {
+        let config = query_config("nova-3", &["whisrs"]);
+        let params = build_query_params(&config, SEGMENT_QUERY_EXTRA);
+        assert!(params.contains(&("utterances", "true")));
+        assert!(params.contains(&("smart_format", "true")));
+        assert_eq!(keyterm_values(&params), ["whisrs"]);
+        // Dictation's params stay without it.
+        assert!(!build_query_params(&config, &[]).contains(&("utterances", "true")));
+    }
+
+    /// A backend that posts to the local server on `listener`.
+    fn local_backend(listener: &tokio::net::TcpListener) -> DeepgramRestBackend {
+        DeepgramRestBackend::with_url(
+            "test-key".to_string(),
+            format!("http://{}/v1/listen", listener.local_addr().unwrap()),
+        )
+    }
+
+    fn diarized(model: &str) -> TranscriptionConfig {
+        TranscriptionConfig {
+            diarize: true,
+            ..query_config(model, &[])
+        }
+    }
+
+    /// A recording request that asks for speakers carries
+    /// `diarize_model=latest` and never `diarize=true` (Deepgram rejects
+    /// both together). One that does not ask, a Whisper model (Deepgram
+    /// cannot diarize with it), and the params dictation and the live
+    /// socket build (`build_query_params` without the recording extras)
+    /// carry neither.
+    #[test]
+    fn only_a_recording_request_for_speakers_asks_for_them() {
+        let diarize_params = |params: &[(&str, &str)]| -> Vec<(String, String)> {
+            params
+                .iter()
+                .filter(|(k, _)| k.starts_with("diarize"))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let config = diarized("nova-3");
+        let params = build_query_params(&config, segment_query_extra(&config));
+        assert_eq!(
+            diarize_params(&params),
+            [("diarize_model".to_string(), "latest".to_string())]
+        );
+        assert!(params.contains(&("utterances", "true")));
+
+        let plain = query_config("nova-3", &[]);
+        let params = build_query_params(&plain, segment_query_extra(&plain));
+        assert!(diarize_params(&params).is_empty());
+        let whisper = diarized("whisper-large");
+        assert!(
+            diarize_params(&build_query_params(&whisper, segment_query_extra(&whisper))).is_empty()
+        );
+        // Dictation REST and the WebSocket add their own extras to these.
+        assert!(diarize_params(&build_query_params(&config, &[])).is_empty());
+        assert!(supports_diarization("nova-2-meeting"));
+        assert!(supports_diarization("base"));
+        assert!(!supports_diarization("whisper-medium"));
+    }
+
+    /// A pre-recorded response with diarization, in the shape of
+    /// Deepgram's documentation: `speaker` and `speaker_confidence` on
+    /// every word, `speaker` on every utterance.
+    const DIARIZED_BODY: &str = r#"{
+        "metadata": {"request_id": "test", "duration": 2.6, "channels": 1},
+        "results": {
+            "channels": [{"alternatives": [{
+                "transcript": "hello there how are you fine thanks",
+                "confidence": 0.98,
+                "words": [
+                    {"word": "hello", "start": 0.3, "end": 0.6, "confidence": 0.99,
+                     "speaker": 0, "speaker_confidence": 0.91, "punctuated_word": "Hello"},
+                    {"word": "there", "start": 0.6, "end": 1.0, "confidence": 0.99,
+                     "speaker": 0, "speaker_confidence": 0.9, "punctuated_word": "there."}
+                ]
+            }]}],
+            "utterances": [
+                {"start": 0.3, "end": 1.0, "confidence": 0.99, "channel": 0,
+                 "transcript": "Hello there.", "speaker": 0, "id": "u1",
+                 "words": [
+                    {"word": "hello", "start": 0.3, "end": 0.6, "confidence": 0.99,
+                     "speaker": 0, "speaker_confidence": 0.91, "punctuated_word": "Hello"},
+                    {"word": "there", "start": 0.6, "end": 1.0, "confidence": 0.99,
+                     "speaker": 0, "speaker_confidence": 0.9, "punctuated_word": "there."}
+                 ]},
+                {"start": 1.1, "end": 1.8, "confidence": 0.97, "channel": 0,
+                 "transcript": "How are you?", "speaker": 1, "id": "u2",
+                 "words": [
+                    {"word": "how", "start": 1.1, "end": 1.3, "confidence": 0.98,
+                     "speaker": 1, "speaker_confidence": 0.8, "punctuated_word": "How"},
+                    {"word": "are", "start": 1.3, "end": 1.5, "confidence": 0.98,
+                     "speaker": 1, "speaker_confidence": 0.8, "punctuated_word": "are"},
+                    {"word": "you", "start": 1.5, "end": 1.8, "confidence": 0.98,
+                     "speaker": 1, "speaker_confidence": 0.8, "punctuated_word": "you?"}
+                 ]},
+                {"start": 1.9, "end": 2.4, "confidence": 0.96, "channel": 0,
+                 "transcript": "Fine, thanks.", "speaker": 0, "id": "u3",
+                 "words": [
+                    {"word": "fine", "start": 1.9, "end": 2.1, "confidence": 0.97,
+                     "speaker": 0, "speaker_confidence": 0.85, "punctuated_word": "Fine,"},
+                    {"word": "thanks", "start": 2.1, "end": 2.4, "confidence": 0.97,
+                     "speaker": 0, "speaker_confidence": 0.85, "punctuated_word": "thanks."}
+                 ]}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn diarized_utterances_keep_their_speakers() {
+        let t = parse_utterances(DIARIZED_BODY).unwrap();
+        let lines: Vec<(u64, u64, &str, Option<&str>)> = t
+            .segments
+            .iter()
+            .map(|s| (s.start_ms, s.end_ms, s.text.as_str(), s.speaker.as_deref()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (300, 1000, "Hello there.", Some("0")),
+                (1100, 1800, "How are you?", Some("1")),
+                (1900, 2400, "Fine, thanks.", Some("0")),
+            ]
+        );
+        let words: Vec<(&str, Option<&str>)> = t.segments[1]
+            .words
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|w| (w.text.as_str(), w.speaker.as_deref()))
+            .collect();
+        assert_eq!(
+            words,
+            [("How", Some("1")), ("are", Some("1")), ("you?", Some("1"))]
+        );
+    }
+
+    /// On the wire: the recording request asks for speakers, dictation's
+    /// request with the same config does not.
+    #[tokio::test]
+    async fn the_wire_asks_for_speakers_only_on_recording_requests() {
+        let config = diarized("nova-3");
+        let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
+        let request_line = |request: &crate::transcription::test_server::Request| {
+            request.head.lines().next().unwrap().to_string()
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(listener, DIARIZED_BODY));
+        let t = backend.transcribe_segments(&wav, &config).await.unwrap();
+        assert_eq!(t.segments[1].speaker.as_deref(), Some("1"));
+        let line = request_line(&server.await.unwrap());
+        assert!(line.contains("&diarize_model=latest"), "{line}");
+        assert!(!line.contains("diarize=true"), "{line}");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"results": {"channels": [{"alternatives": [{"transcript": "hi"}]}]}}"#,
+        ));
+        assert_eq!(backend.transcribe(&wav, &config).await.unwrap(), "hi");
+        let line = request_line(&server.await.unwrap());
+        assert!(!line.contains("diarize"), "{line}");
+    }
+
+    /// 1.25 s of a 16 kHz tone: the samples, and the WAV that holds them.
+    fn tone_wav() -> (Vec<i16>, Vec<u8>) {
+        let samples: Vec<i16> = (0..20_000)
+            .map(|i| ((i as f64 * 0.17).sin() * 6000.0) as i16)
+            .collect();
+        let wav = crate::audio::wav::encode_wav(&samples).unwrap();
+        (samples, wav)
+    }
+
+    // FLAC needs the encoder, which comes with the recording feature.
+    #[cfg(feature = "recording")]
+    #[tokio::test]
+    async fn recording_chunks_upload_as_flac() {
+        let config = query_config("nova-3", &[]);
+        let (samples, wav) = tone_wav();
+
+        // The streaming backend hands recordings to this REST path in one line.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"results": {"utterances": [{"start": 0.0, "end": 1.0, "transcript": "hi"}]}}"#,
+        ));
+        let t = backend.transcribe_segments(&wav, &config).await.unwrap();
+        assert_eq!(t.segments.len(), 1);
+        let request = server.await.unwrap();
+        assert_eq!(request.header("content-type"), Some("audio/flac"));
+        assert!(request.body.starts_with(b"fLaC"));
+        // Lossless: the body decodes to the samples the WAV held.
+        let decoded: Vec<i16> = claxon::FlacReader::new(&request.body[..])
+            .unwrap()
+            .samples()
+            .map(|s| s.unwrap() as i16)
+            .collect();
+        assert_eq!(decoded, samples);
+    }
+
+    #[tokio::test]
+    async fn dictation_uploads_as_wav() {
+        let config = query_config("nova-3", &[]);
+        let (_, wav) = tone_wav();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_once(
+            listener,
+            r#"{"results": {"channels": [{"alternatives": [{"transcript": "hi"}]}]}}"#,
+        ));
+        assert_eq!(backend.transcribe(&wav, &config).await.unwrap(), "hi");
+        let request = server.await.unwrap();
+        assert_eq!(request.header("content-type"), Some("audio/wav"));
+        assert_eq!(request.body, wav);
+    }
+    /// A Cloudflare origin timeout (524) on a recording chunk is retried on the
+    /// server-error schedule, here with short stand-ins for its waits.
+    #[tokio::test]
+    async fn a_524_is_retried_until_the_chunk_goes_through() {
+        let config = query_config("nova-3", &[]);
+        let wav = crate::audio::wav::encode_wav(&[300i16; 16_000]).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(&listener);
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![
+                (524, "error code: 524"),
+                (
+                    200,
+                    r#"{"results": {"utterances": [{"start": 0.0, "end": 1.0, "transcript": "hi"}]}}"#,
+                ),
+            ],
+        ));
+        let quick = [std::time::Duration::from_millis(1); 3];
+        let t = retry_transient(RATE_LIMIT_BUDGET, &quick, || {
+            backend.transcribe_segments(&wav, &config)
+        })
+        .await
+        .unwrap();
+        assert_eq!(t.segments[0].text, "hi");
+        assert_eq!(server.await.unwrap().len(), 2);
     }
 }

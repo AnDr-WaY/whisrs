@@ -1,0 +1,12 @@
+# nemo-speech serve config: Nemotron 3 Diarization as the whisrs diarization
+# sidecar. Install it as ~/.config/nemo-speech/diarization.yaml with the
+# absolute path of the model in model_path (see README.md, step 3).
+diar:
+  model_path: /home/YOU/.local/share/nemo-speech/Nemotron-3-Diarization.q8_0.gguf
+  # Larger streaming chunks and caches than the default preset: the same
+  # accuracy, 14 times faster on a CPU and 10 times on Vulkan.
+  # Not to be confused with the API's `mode=offline`, which is one
+  # full-attention pass that only fits about 6.6 minutes of audio. whisrs
+  # never sends `mode`, so every request takes the streaming path with this
+  # preset, whatever the length of the recording.
+  preset: v3-offline

@@ -17,7 +17,7 @@ historical record; current development happens against the v0.1.x patch line.
 ## v0.1.3 — Command Mode & Custom Vocabulary ✓
 
 - [x] **Command mode** (`whisrs command`): Select text + hotkey → record voice instruction → LLM rewrites the selection. Toggleable (press again to stop early). (Originally pasted the result via simulated Ctrl+C/Ctrl+V; later releases inject it through the dictation pipeline instead: typed at the cursor by default, pasted when `[input] paste` is set, with terminals clearing the prompt line first.)
-- [x] **Custom vocabulary**: `vocabulary = ["term1", "term2"]` in config — passed as prompt hint to Groq, OpenAI REST, and local whisper backends
+- [x] **Custom vocabulary**: `vocabulary = ["term1", "term2"]` in config — sent to Deepgram as keyterms on Nova-3/Flux (ignored on older models), and folded into the prompt hint for Groq, OpenAI REST, and local whisper backends
 - [x] **LLM integration**: `[llm]` config section with provider selection (OpenAI, Groq, OpenRouter, Google Gemini) and model menus with latest models. "Other" option for custom model names.
 
 ---

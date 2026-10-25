@@ -1,4 +1,4 @@
-.TH WHISRSD 1 "2026-08-13" "whisrs 0.1.25" "User Commands"
+.TH WHISRSD 1 "2026-10-20" "whisrs 0.1.30" "User Commands"
 .SH NAME
 whisrsd \- whisrs dictation daemon
 .SH SYNOPSIS
@@ -22,7 +22,7 @@ Loads configuration from
 .IP \(bu 2
 Checks /dev/uinput access for virtual keyboard
 .IP \(bu 2
-Checks for available audio input devices
+Resolves the \fB[audio] device\fR input and logs which device it will record from
 .IP \(bu 2
 Auto-detects the active window manager/compositor
 .IP \(bu 2
@@ -149,6 +149,12 @@ IPC socket.
 .TP
 .I ~/.cache/whisrs/recovery/
 Audio recovery files saved on transcription failure.
+.TP
+.I $XDG_DATA_HOME/whisrs/recordings/
+Recordings and their transcripts, one folder per recording. Override with
+.B [recording] dir
+in
+.IR config.toml .
 .SH EXAMPLES
 Run the daemon in the foreground with debug logging:
 .PP
@@ -166,6 +172,12 @@ Enable as a systemd user service:
 .PP
 .RS
 systemctl \-\-user enable \-\-now whisrs.service
+.RE
+.PP
+Enable as an OpenRC user service:
+.PP
+.RS
+rc\-update \-\-user add whisrs default && rc\-service \-\-user whisrs start
 .RE
 .SH SEE ALSO
 .BR whisrs (1)

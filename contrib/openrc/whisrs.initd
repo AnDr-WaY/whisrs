@@ -1,0 +1,195 @@
+#!/sbin/openrc-run
+# whisrs dictation daemon — OpenRC user service
+# https://github.com/whisrs/whisrs
+#
+# Install as a user service:
+#   mkdir -p ~/.config/rc/init.d ~/.config/rc/conf.d
+#   install -m755 contrib/openrc/whisrs.initd ~/.config/rc/init.d/whisrs
+#   install -m644 contrib/openrc/whisrs.confd ~/.config/rc/conf.d/whisrs
+#   rc-update --user add whisrs default
+#   rc-service --user whisrs start
+#
+# OpenRC runs services with a scrubbed environment and has no equivalent of
+# systemd's PassEnvironment=, so whisrsd would otherwise start blind to
+# WAYLAND_DISPLAY, HYPRLAND_INSTANCE_SIGNATURE and the D-Bus address — window
+# tracking, clipboard paste and the tray all need them. import_session_env()
+# below recovers them at every start; see that function for how and why.
+
+description="whisrs dictation daemon"
+description_reload="Restart the daemon to pick up config changes"
+
+# Resolve the daemon binary. Override with whisrsd_command in conf.d.
+if [ -z "$whisrsd_command" ]; then
+	for _candidate in \
+		"$HOME/.cargo/bin/whisrsd" \
+		/usr/local/bin/whisrsd \
+		/usr/bin/whisrsd
+	do
+		if [ -x "$_candidate" ]; then
+			whisrsd_command="$_candidate"
+			break
+		fi
+	done
+fi
+
+command="${whisrsd_command:-/usr/bin/whisrsd}"
+
+# whisrsd stays in the foreground, so supervise-daemon can monitor it
+# directly. This is the equivalent of the systemd unit's Restart=on-failure.
+supervisor="supervise-daemon"
+respawn_delay="${whisrsd_respawn_delay:-3}"
+respawn_max="${whisrsd_respawn_max:-5}"
+respawn_period="${whisrsd_respawn_period:-60}"
+
+# systemd sent stdout/stderr to the journal; OpenRC has no journal, so log
+# to files instead. Rotate these yourself (logrotate) if they grow.
+: "${whisrsd_log_dir:=${XDG_STATE_HOME:-$HOME/.local/state}/whisrs}"
+output_log="${whisrsd_log_dir}/whisrsd.log"
+error_log="${whisrsd_log_dir}/whisrsd.log"
+
+# conf.d variables are sourced, not exported — re-export the ones whisrsd
+# reads from its own environment.
+for _var in RUST_LOG \
+	WHISRS_DEEPGRAM_API_KEY WHISRS_GROQ_API_KEY WHISRS_OPENAI_API_KEY \
+	WHISRS_ASR_SIDECAR_API_KEY \
+	XKB_DEFAULT_LAYOUT XKB_DEFAULT_VARIANT
+do
+	eval "[ -n \"\${$_var}\" ]" && export "$_var"
+done
+
+depend() {
+	# dbus is only present in user mode on some setups; use it if it exists.
+	use dbus
+}
+
+# Variables whisrsd needs from the graphical session, for window tracking,
+# clipboard access and the D-Bus tray.
+session_vars="WAYLAND_DISPLAY DISPLAY XAUTHORITY HYPRLAND_INSTANCE_SIGNATURE \
+NIRI_SOCKET SWAYSOCK XDG_SESSION_TYPE XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS"
+
+_isset() {
+	eval "[ -n \"\${$1-}\" ]"
+}
+
+# Export $1=$2 unless $1 is already set. Never overrides conf.d or the env file.
+_setvar() {
+	_isset "$1" && return 0
+	[ -n "$2" ] || return 0
+	export "$1=$2"
+}
+
+# Harvest session vars from a live process's /proc/<pid>/environ.
+#
+# Note this cannot be the compositor itself: /proc/<pid>/environ is the
+# exec-time snapshot, and a compositor setenv()s WAYLAND_DISPLAY and
+# HYPRLAND_INSTANCE_SIGNATURE only after it starts, so they never appear
+# there. A process the compositor launched does carry them.
+_harvest_from() {
+	_env=$(tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null) || return 1
+	for _v in $session_vars; do
+		_isset "$_v" && continue
+		_setvar "$_v" "$(printf '%s\n' "$_env" | sed -n "s/^$_v=//p" | head -1)"
+	done
+}
+
+# Populate the session environment.
+#
+# Each variable comes from whichever source is authoritative for it, rather
+# than from one scanned process. Harvesting from an arbitrary process that
+# merely looks session-ish is unsafe: a stray dbus-daemon will happily supply
+# a DBUS_SESSION_BUS_ADDRESS for the wrong bus, which silently costs you the
+# tray. Split by origin instead:
+#
+#   inherited by the compositor  -> read the compositor's environ
+#   created by the compositor    -> derive from its runtime files
+#
+# conf.d / whisrsd_env_file always win; _setvar never overwrites.
+import_session_env() {
+	# Vars the compositor inherited at exec, so its environ has them and they
+	# are correct by construction — it *is* the current session.
+	for _p in $(pgrep -u "$(id -u)" -x 'Hyprland|sway|niri|gnome-shell|kwin_wayland|labwc|river' 2>/dev/null); do
+		_compositor_pid="$_p"
+		_harvest_from "$_p"
+		break
+	done
+
+	# Vars the compositor created after exec — absent from its environ, so
+	# derive them from the runtime dir.
+	if ! _isset WAYLAND_DISPLAY; then
+		for _s in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do
+			[ -S "$_s" ] && _setvar WAYLAND_DISPLAY "${_s##*/}" && break
+		done
+	fi
+
+	if ! _isset HYPRLAND_INSTANCE_SIGNATURE; then
+		# Newest instance dir wins; stale ones linger after a crash.
+		for _d in $(ls -1td "$XDG_RUNTIME_DIR"/hypr/*/ 2>/dev/null); do
+			_setvar HYPRLAND_INSTANCE_SIGNATURE "$(basename "$_d")"
+			break
+		done
+	fi
+
+	if ! _isset DISPLAY; then
+		# Xwayland puts the display right in its argv (e.g. "Xwayland :1").
+		for _p in $(pgrep -u "$(id -u)" -x Xwayland 2>/dev/null); do
+			_setvar DISPLAY "$(tr '\0' '\n' < "/proc/$_p/cmdline" 2>/dev/null |
+				sed -n '/^:[0-9][0-9]*$/p' | head -1)"
+			break
+		done
+	fi
+
+	_isset SWAYSOCK || for _s in "$XDG_RUNTIME_DIR"/sway-ipc.*.sock; do
+		[ -S "$_s" ] && _setvar SWAYSOCK "$_s" && break
+	done
+
+	_isset NIRI_SOCKET || for _s in "$XDG_RUNTIME_DIR"/niri.*.sock; do
+		[ -S "$_s" ] && _setvar NIRI_SOCKET "$_s" && break
+	done
+
+	# DBUS_SESSION_BUS_ADDRESS normally came from the compositor's environ
+	# above. Only if there was no compositor to read do we guess at the
+	# conventional socket path.
+	if ! _isset DBUS_SESSION_BUS_ADDRESS && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+		_setvar DBUS_SESSION_BUS_ADDRESS "unix:path=$XDG_RUNTIME_DIR/bus"
+	fi
+}
+
+start_pre() {
+	if [ ! -x "$command" ]; then
+		eerror "whisrsd not found at '$command'"
+		eerror "Set whisrsd_command in ~/.config/rc/conf.d/whisrs"
+		return 1
+	fi
+
+	if [ -z "$XDG_RUNTIME_DIR" ]; then
+		eerror "XDG_RUNTIME_DIR is not set — openrc --user requires it"
+		return 1
+	fi
+
+	checkpath -d -m 0700 "$whisrsd_log_dir" || return 1
+
+	# Optional escape hatch: an explicit env file wins over discovery.
+	if [ -n "$whisrsd_env_file" ] && [ -r "$whisrsd_env_file" ]; then
+		set -a
+		. "$whisrsd_env_file"
+		set +a
+	fi
+
+	import_session_env
+
+	if [ -z "$WAYLAND_DISPLAY" ] && [ -z "$DISPLAY" ]; then
+		ewarn "No display server found — is a compositor running?"
+		ewarn "Window tracking, clipboard paste and the tray will not work."
+		ewarn "If your session is unusual, set whisrsd_env_file in"
+		ewarn "~/.config/rc/conf.d/whisrs to supply the variables explicitly."
+	else
+		vebegin "session env: ${WAYLAND_DISPLAY:+WAYLAND_DISPLAY=$WAYLAND_DISPLAY }${DISPLAY:+DISPLAY=$DISPLAY}"
+		veend 0
+	fi
+}
+
+reload() {
+	ebegin "Restarting whisrs to reload configuration"
+	"$RC_SERVICE" --quiet restart
+	eend $?
+}

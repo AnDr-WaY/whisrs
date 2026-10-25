@@ -26,7 +26,7 @@
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "whisrs";
-          version = "0.1.25";
+          version = "0.1.30";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
@@ -37,6 +37,12 @@
             # not exist here — without this the ACL fallback is a silent no-op.
             substituteInPlace contrib/99-whisrs.rules \
               --replace-fail /usr/bin/setfacl ${pkgs.acl}/bin/setfacl
+
+            # systemd resolves a non-absolute ExecStart against a compile-time
+            # search path, never $PATH, and no store path is ever in it — the
+            # packaged unit would name a binary systemd cannot find.
+            substituteInPlace contrib/whisrs.service \
+              --replace-fail ExecStart=whisrsd ExecStart=$out/bin/whisrsd
 
             install -Dm644 contrib/whisrs.1 $out/share/man/man1/whisrs.1
             install -Dm644 contrib/whisrsd.1 $out/share/man/man1/whisrsd.1

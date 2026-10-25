@@ -13,7 +13,8 @@
 # Environment:
 #   WHISRS_VERSION=v0.1.11   Pin to a specific tag (default: latest)
 #   WHISRS_MINIMAL=1         Use the minimal build (cloud-only, no whisper.cpp;
-#                            still includes the tray icon and overlay)
+#                            still includes the tray icon, overlay, recordings and
+#                            MCP server)
 
 set -euo pipefail
 
@@ -178,11 +179,18 @@ sudo install -Dm755 "$TMPDIR/whisrsd" /usr/local/bin/whisrsd
 info "Installed:" "/usr/local/bin/whisrs"
 info "Installed:" "/usr/local/bin/whisrsd"
 
-if systemctl --user is-active whisrs.service &>/dev/null; then
+# True when a whisrs user service is active under systemd or OpenRC.
+service_is_active() {
+    systemctl --user is-active whisrs.service &>/dev/null && return 0
+    rc-service --user whisrs status &>/dev/null && return 0
+    return 1
+}
+
+if service_is_active; then
     info "Restarting:" "running daemon (whisrs restart)"
     /usr/local/bin/whisrs restart || true
 elif pgrep -x whisrsd &>/dev/null; then
-    warn "whisrsd is running but not via systemd."
+    warn "whisrsd is running but not under a service manager."
     echo "  Restart it manually: pkill whisrsd; sleep 0.2; whisrsd &"
 else
     echo "  No running daemon — it will start after setup."
@@ -195,7 +203,7 @@ step 5 "Running whisrs setup..."
 echo ""
 /usr/local/bin/whisrs setup
 
-if systemctl --user is-active whisrs.service &>/dev/null; then
+if service_is_active; then
     /usr/local/bin/whisrs restart || true
     info "Daemon restarted" "with new config."
 fi

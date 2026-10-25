@@ -10,13 +10,17 @@ use whisrs::state::Action;
 use whisrs::{validate_language_override, Response, State};
 
 use crate::context::{DaemonContext, DaemonState};
-use crate::injection::{inject_text, is_terminal_class};
+use crate::injection::{
+    inject_text, is_terminal_class, notify_copied_for_held_modifier, Injection, KeystrokeSettings,
+};
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     build_transcription_config, format_no_microphone_error, history_backend_tag,
     process_recording_batch, run_streaming_pipeline, save_history_entry, DictationOutcome,
     StreamingPipelineParams,
 };
+#[cfg(feature = "recording")]
+use crate::recording::{refuse_while_recording, DictationStart};
 
 pub(crate) async fn handle_toggle(
     daemon_state: Arc<Mutex<DaemonState>>,
@@ -28,12 +32,20 @@ pub(crate) async fn handle_toggle(
 
     match current_state {
         State::Idle => {
+            // Refused first while a recording is in progress: no capture, no state
+            // change, no start cue. The stop arm below is never refused. A
+            // build without the recording feature has no recordings to wait for.
+            #[cfg(feature = "recording")]
+            if let Some(refused) = refuse_while_recording(&context, DictationStart::Dictation) {
+                return refused;
+            }
+
             // Fail fast on a bad `-l` override before any capture or state
             // transition — otherwise the user records a whole session and
             // only finds out when the backend rejects the language.
             let language = match validate_toggle_language(language) {
                 Ok(lang) => lang,
-                Err(response) => return response,
+                Err(message) => return Response::Error { message },
             };
 
             // Resolve the session language once: per-toggle override, else
@@ -54,20 +66,22 @@ pub(crate) async fn handle_toggle(
             };
 
             // Start recording.
-            let mut capture =
-                match AudioCaptureHandle::start_with_level_tx(context.overlay_level_tx.clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        let friendly = if msg.contains("no default audio input device") {
-                            format_no_microphone_error()
-                        } else {
-                            format!("Failed to start audio capture: {e}")
-                        };
-                        error!("{friendly}");
-                        return Response::Error { message: friendly };
-                    }
-                };
+            let mut capture = match AudioCaptureHandle::start_with_level_tx(
+                &context.config.audio.device,
+                context.overlay_level_tx.clone(),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let friendly = if msg.contains("no default audio input device") {
+                        format_no_microphone_error(&context.config.audio.device)
+                    } else {
+                        format!("Failed to start audio capture: {e}")
+                    };
+                    error!("{friendly}");
+                    return Response::Error { message: friendly };
+                }
+            };
 
             // For streaming backends: start the streaming pipeline immediately.
             // Audio flows in real-time from microphone → API → text at cursor.
@@ -110,13 +124,15 @@ pub(crate) async fn handle_toggle(
                     silence_timeout_ms: context.config.general.silence_timeout_ms,
                     filler_enabled: context.config.general.remove_filler_words,
                     filler_words: context.config.general.filler_words.clone(),
+                    replacements: context.config.replacements.clone(),
                     audio_feedback: context.config.general.audio_feedback,
                     audio_feedback_volume: context.config.general.audio_feedback_volume,
                     backend_name: context.config.general.backend.clone(),
-                    key_delay: std::time::Duration::from_millis(context.config.input.key_delay_ms),
-                    injector_backend: context.config.input.backend,
+                    keys: KeystrokeSettings::from_config(&context.config.input),
                     clipboard_fallback: context.config.input.clipboard_fallback,
                     clipboard_only: context.config.input.clipboard_only,
+                    terminal_classes: context.config.input.terminal_classes.clone(),
+                    history: context.config.general.history,
                 };
 
                 let task = tokio::spawn(run_streaming_pipeline(params));
@@ -146,7 +162,7 @@ pub(crate) async fn handle_toggle(
                         feedback::play_start(context.config.general.audio_feedback_volume);
                     }
                     if context.notify_state() {
-                        send_notification("whisrs", "Recording...");
+                        send_notification("whisrs", "Dictating...");
                     }
                     Response::Ok { state: new_state }
                 }
@@ -182,9 +198,16 @@ pub(crate) async fn handle_toggle(
                     let capture = ds.audio_capture.take();
                     let window_id = ds.recording_window_id.take();
                     let streaming_task = ds.streaming_task.take();
-                    // Normal stop: drop the cancel flag untriggered so the
-                    // pipeline drains and types the remaining text.
-                    ds.streaming_cancel = None;
+                    // Kept to release the slot once the pipeline task is
+                    // awaited, in case it never reached its own tail.
+                    let streaming_cancel = ds.streaming_cancel.clone();
+                    // Normal stop: leave the cancel flag untriggered so the
+                    // pipeline drains and types the remaining text. It stays
+                    // in the state until the pipeline ends, so `whisrs
+                    // cancel` can still discard a delta that is waiting for a
+                    // held modifier key (#154); the pipeline's tail clears
+                    // it, and so does the await below if the pipeline exited
+                    // early (error or panic) without reaching that tail.
                     let recording_started_at = ds.recording_started_at.take();
                     // A plain toggle-stop on a command-mode / llm-command
                     // recording takes the session over as plain dictation: the
@@ -252,6 +275,9 @@ pub(crate) async fn handle_toggle(
                         .map(|t| t.elapsed().as_secs_f64())
                         .unwrap_or(0.0);
                     let mut ds = daemon_state.lock().await;
+                    if let Some(flag) = &streaming_cancel {
+                        ds.release_streaming_cancel(flag);
+                    }
                     match ds.state_machine.transition(Action::TranscriptionDone) {
                         Ok(new_state) => {
                             // Broadcast idle state for tray.
@@ -268,6 +294,7 @@ pub(crate) async fn handle_toggle(
                                         // LLM that rewrote them, so `whisrs
                                         // log` can tell the two apart.
                                         save_history_entry(
+                                            context.config.general.history,
                                             &dictation.text,
                                             &history_backend_tag(
                                                 &context.config.general.backend,
@@ -373,9 +400,26 @@ pub(crate) async fn handle_cancel(
             }
             info!("cancelled recording");
             if context.notify_state() {
-                send_notification("whisrs", "Recording cancelled");
+                send_notification("whisrs", "Dictation cancelled");
             }
             Response::Ok { state: new_state }
+        }
+        // Stopped streaming session still draining: the last deltas may be
+        // waiting for a held modifier key, uncapped (#154). The state stays
+        // Transcribing (the machine has no Transcribing → Idle cancel); the
+        // flag ends the wait, the pending text is discarded, and the
+        // pipeline's own tail moves the state to Idle.
+        Err(_) if ds.streaming_session_draining() => {
+            if let Some(cancel) = ds.streaming_cancel.take() {
+                cancel.store(true, Ordering::SeqCst);
+            }
+            info!("cancelled streaming session after stop; discarding untyped text");
+            if context.notify_state() {
+                send_notification("whisrs", "Dictation cancelled");
+            }
+            Response::Ok {
+                state: State::Transcribing,
+            }
         }
         // Nothing was recording. If we still interrupted TTS playback, that's a
         // successful cancel — report the current (Idle) state rather than the
@@ -388,13 +432,6 @@ pub(crate) async fn handle_cancel(
         },
     }
 }
-
-/// How long `repeat` waits before the first keystroke, to let the hotkey's
-/// physical modifiers (e.g. Shift in `$mod+SHIFT+space`) be released.
-/// Compositors like Hyprland merge the real keyboard's held modifiers into
-/// virtual-keyboard events, which would otherwise reinterpret the first
-/// injected keysyms (see the settle comment in `handle_repeat_last`).
-const REPEAT_INJECTION_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Re-inject the most recent transcription at the cursor.
 ///
@@ -431,8 +468,7 @@ pub(crate) async fn handle_repeat_last(
         return Response::Ok { state };
     }
 
-    let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
-    let injector_backend = context.config.input.backend;
+    let keys = KeystrokeSettings::from_config(&context.config.input);
     let paste = context.config.input.paste;
     let is_terminal = if paste {
         context
@@ -446,26 +482,16 @@ pub(crate) async fn handle_repeat_last(
 
     info!("repeat: re-injecting {} chars", text.len());
     match tokio::task::spawn_blocking(move || {
-        // Settle delay before the first keystroke: the repeat hotkey
-        // commonly involves modifiers (e.g. `$mod+SHIFT+space`), and
-        // compositors (Hyprland) merge the *real* keyboard's held
-        // modifiers into virtual-keyboard events. A still-held Shift
-        // reinterprets the first injected keysyms against the uploaded
-        // keymap: commas come out as `<` (Shift level of the comma key)
-        // and AltGr-level Cyrillic resolves to the unbound level 3 and
-        // silently drops. Waiting out the physical key release keeps the
-        // re-injection clean. Dictation itself is unaffected: its hotkey
-        // is a level-neutral modifier (Super), so no settle is needed
-        // there.
-        std::thread::sleep(REPEAT_INJECTION_SETTLE);
         // Repeat is explicitly a *re-injection*, so the clipboard output
         // modes (`[input] clipboard_fallback` / `clipboard_only`) do not
-        // apply: the text must land at the cursor.
+        // apply: the text must land at the cursor. Held hotkey modifiers
+        // are the injection layer's to handle (it withholds keys and
+        // copies the untyped rest to the clipboard instead — the settle
+        // wait that used to live here is superseded by that).
         inject_text(
             &text,
             is_terminal,
-            key_delay,
-            injector_backend,
+            keys,
             paste,
             /* clipboard_fallback = */ false,
             /* clipboard_only = */ false,
@@ -473,7 +499,12 @@ pub(crate) async fn handle_repeat_last(
     })
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(Injection::Delivered)) => {}
+        Ok(Ok(Injection::CopiedForHeldModifier(copied))) => {
+            if context.notify_error() {
+                notify_copied_for_held_modifier(&copied);
+            }
+        }
         Ok(Err(e)) => {
             warn!("repeat: failed to inject text: {e:#}");
             send_notification("whisrs", &format!("Failed to repeat last dictation: {e:#}"));
@@ -551,19 +582,19 @@ fn resolve_language(override_lang: Option<String>, default_lang: &str) -> String
 
 /// Validate a per-toggle language override before recording starts.
 ///
-/// Returns the normalized override on success, or the error `Response` to
+/// Returns the normalized override on success, or the error message to
 /// send back to the CLI. Called on the start-press before any capture or
 /// state transition so a bad `-l` value (e.g. `english`) is rejected up
 /// front instead of failing a whole session at transcription time. The
 /// config default (`general.language`) is deliberately not validated.
-fn validate_toggle_language(language: Option<String>) -> Result<Option<String>, Response> {
+fn validate_toggle_language(language: Option<String>) -> Result<Option<String>, String> {
     match language {
         None => Ok(None),
         Some(lang) => match validate_language_override(&lang) {
             Ok(normalized) => Ok(Some(normalized)),
             Err(message) => {
                 warn!("rejected language override: {message}");
-                Err(Response::Error { message })
+                Err(message)
             }
         },
     }
@@ -591,8 +622,8 @@ mod tests {
     fn start_press_rejects_invalid_language_override_before_recording() {
         let ds = DaemonState::new();
 
-        let response = validate_toggle_language(Some("english".to_string())).unwrap_err();
-        assert!(matches!(response, Response::Error { .. }));
+        let message = validate_toggle_language(Some("english".to_string())).unwrap_err();
+        assert!(message.starts_with("invalid language"), "{message}");
 
         // handle_toggle returns that response without touching the state
         // machine — the daemon stays idle and no capture is started.
@@ -724,5 +755,41 @@ mod tests {
             "streaming typing loop must be told to discard its tail"
         );
         assert_eq!(ds.state_machine.state(), State::Idle);
+    }
+
+    /// #154: a stopped streaming session is cancellable only while its flag
+    /// is still installed. Releasing it (pipeline tail, or `handle_toggle`
+    /// after an early pipeline error/panic) must leave a later
+    /// `Transcribing` (e.g. command mode) on the old "cannot cancel" path,
+    /// and must never clear a newer session's flag.
+    #[test]
+    fn release_streaming_cancel_ends_post_stop_cancel_window() {
+        let mut ds = DaemonState::new();
+        let old_flag = Arc::new(AtomicBool::new(false));
+        ds.streaming_cancel = Some(Arc::clone(&old_flag));
+        ds.state_machine.transition(Action::Toggle).unwrap(); // → Recording
+        assert!(
+            !ds.streaming_session_draining(),
+            "recording is not draining"
+        );
+        ds.state_machine.transition(Action::Toggle).unwrap(); // → Transcribing
+        assert!(ds.streaming_session_draining());
+
+        // A newer session's flag is never cleared by the old session.
+        let new_flag = Arc::new(AtomicBool::new(false));
+        ds.streaming_cancel = Some(Arc::clone(&new_flag));
+        ds.release_streaming_cancel(&old_flag);
+        assert!(ds
+            .streaming_cancel
+            .as_ref()
+            .is_some_and(|f| Arc::ptr_eq(f, &new_flag)));
+
+        ds.release_streaming_cancel(&new_flag);
+        assert!(ds.streaming_cancel.is_none());
+        assert_eq!(ds.state_machine.state(), State::Transcribing);
+        assert!(
+            !ds.streaming_session_draining(),
+            "a Transcribing with no streaming flag must keep the old cancel error"
+        );
     }
 }

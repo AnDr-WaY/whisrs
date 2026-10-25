@@ -1,0 +1,51 @@
+# Configuration for the whisrs OpenRC user service.
+# Install to ~/.config/rc/conf.d/whisrs
+
+# Path to the whisrsd binary. Leave unset to auto-detect in
+# ~/.cargo/bin, /usr/local/bin, then /usr/bin.
+#whisrsd_command="/home/user/.cargo/bin/whisrsd"
+
+# Daemon log verbosity (see `tracing` env-filter syntax).
+#RUST_LOG="info"
+
+# Force the XKB layout used for text injection, when auto-detection gets it
+# wrong (see the "Wrong characters typed" section of the README).
+#XKB_DEFAULT_LAYOUT="fr"
+#XKB_DEFAULT_VARIANT="bepo"
+
+# API keys, if you prefer them here over ~/.config/whisrs/config.toml.
+# Note this file is world-readable unless you chmod 0600 it.
+#WHISRS_DEEPGRAM_API_KEY=""
+#WHISRS_GROQ_API_KEY=""
+#WHISRS_OPENAI_API_KEY=""
+#WHISRS_ASR_SIDECAR_API_KEY=""
+
+# Where whisrsd's stdout/stderr are written.
+# Default: ${XDG_STATE_HOME:-$HOME/.local/state}/whisrs
+#whisrsd_log_dir="/home/user/.local/state/whisrs"
+
+# Respawn tuning (mirrors systemd's Restart=on-failure / RestartSec=3).
+# Give up after whisrsd_respawn_max crashes within whisrsd_respawn_period
+# seconds. Set whisrsd_respawn_max=0 for unlimited restarts.
+#whisrsd_respawn_delay=3
+#whisrsd_respawn_max=5
+#whisrsd_respawn_period=60
+
+# ---------------------------------------------------------------------------
+# Compositor environment
+# ---------------------------------------------------------------------------
+# The systemd unit used PassEnvironment= to pull WAYLAND_DISPLAY,
+# HYPRLAND_INSTANCE_SIGNATURE, SWAYSOCK, DISPLAY, etc. from the systemd user
+# manager. OpenRC has no equivalent: it runs services with a SCRUBBED
+# environment (roughly HOME, PATH, XDG_RUNTIME_DIR only), and starting the
+# service from inside your compositor session does NOT help — the environment
+# is stripped regardless of who invokes rc-service.
+#
+# Nothing is needed from you here: the init script discovers these itself at
+# start, from the compositor process and the runtime dir. Since discovery runs
+# on every start, the values can never go stale across sessions or reboots.
+#
+# Escape hatch for unusual sessions: point whisrsd_env_file at a file of
+# KEY='value' lines and it is sourced before discovery, so anything it sets
+# wins. Values must be shell-safe — the file is sourced with `set -a`.
+#whisrsd_env_file="/home/user/.config/whisrs/env"

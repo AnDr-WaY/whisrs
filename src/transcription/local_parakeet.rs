@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{StreamText, TranscriptionBackend, TranscriptionConfig};
 
 /// Parakeet-based local transcription backend.
 pub struct ParakeetBackend {
@@ -33,6 +33,32 @@ impl TranscriptionBackend for ParakeetBackend {
              Use the `local-whisper` backend instead, or check back in a future release."
         )
     }
+
+    // Unreachable: `transcribe` bails before a request exists. `false` is
+    // what the rule on the trait method yields — read the answer off the
+    // request-building code, and there is none yet — and it is the safe
+    // direction, since a stale `true` is the exact shape of #133. Whoever
+    // implements Parakeet answers it again off the real request.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+        false
+    }
+
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
+    }
+
+    // Unreachable for the same reason as `transcribe`: there is no backend yet.
+    async fn transcribe_segments(
+        &self,
+        _audio: &[u8],
+        _config: &TranscriptionConfig,
+    ) -> anyhow::Result<super::Transcript> {
+        anyhow::bail!("Parakeet backend is not yet implemented")
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -46,6 +72,8 @@ mod tests {
             language: "en".to_string(),
             model: "eou-120m".to_string(),
             prompt: None,
+            keyterms: Vec::new(),
+            diarize: false,
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("not yet implemented"));

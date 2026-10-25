@@ -10,7 +10,8 @@ use crate::{OverlayConfig, State};
 
 use super::service::OverlayError;
 
-pub(super) const BOTTOM_MARGIN: i32 = 16;
+/// Gap in px between the pill and the screen edges it is placed against.
+pub(super) const EDGE_MARGIN: i32 = 16;
 
 // Per-frame sleep matching the draw loop. ~16 ms ≈ 60 fps for visibly
 // smoother motion. Spawn animation progress is wall-clock-driven (see
@@ -18,7 +19,8 @@ pub(super) const BOTTOM_MARGIN: i32 = 16;
 pub(super) const FRAME_MS: u64 = 16;
 
 // Spawn animation: the pill "draws out" from a 4-px sliver anchored at the
-// bottom of the surface up to its full configured height. Slight overshoot
+// screen-side edge of the surface (bottom, or top for top positions) up to
+// its full configured height. Slight overshoot
 // for life. Going away is shorter and accelerated — feels intentional.
 const SPAWN_IN_MS: f32 = 220.0;
 const SPAWN_OUT_MS: f32 = 140.0;
@@ -184,6 +186,14 @@ pub(super) struct OverlayRenderer {
     /// Wall-clock instant of the previous spring step.
     last_update: Instant,
     theme: Theme,
+    /// Pill sits at the top of the screen: anchor the grow to the surface's
+    /// top edge instead of its bottom.
+    from_top: bool,
+    /// Set on every idle to visible transition, cleared by
+    /// [`Self::take_session_started`]. The Wayland backend recreates its
+    /// layer surface on it so the pill opens on the output focused now, not
+    /// the one focused when the daemon started (issue #198).
+    session_started: bool,
 }
 
 /// Per-frame animation state computed from `spawn_t` + `spawn_in`. The
@@ -214,6 +224,7 @@ impl OverlayRenderer {
         width: u32,
         height: u32,
         theme: Theme,
+        from_top: bool,
     ) -> Result<Self, OverlayError> {
         let pixmap = Pixmap::new(width, height).ok_or(OverlayError::Pixmap(width, height))?;
         Ok(Self {
@@ -233,6 +244,8 @@ impl OverlayRenderer {
             level_velocity: 0.0,
             last_update: Instant::now(),
             theme,
+            from_top,
+            session_started: false,
         })
     }
 
@@ -250,10 +263,13 @@ impl OverlayRenderer {
 
                     // Trigger spawn / despawn only on the boundary between
                     // idle and visible. Recording ↔ Transcribing keeps the
-                    // pill steady.
+                    // pill steady. `target_state` turns Idle as soon as the
+                    // despawn starts, so a new session that lands mid-despawn
+                    // still counts as a start.
                     if was_idle && !now_idle {
                         self.spawn_in = true;
                         self.spawn_started = Instant::now();
+                        self.session_started = true;
                     } else if !was_idle && now_idle {
                         self.spawn_in = false;
                         self.spawn_started = Instant::now();
@@ -302,6 +318,12 @@ impl OverlayRenderer {
         if !self.spawn_in && self.spawn_t() >= 1.0 {
             self.visible_state = State::Idle;
         }
+    }
+
+    /// Whether a session started (idle to visible) since the last call.
+    /// Reading it clears it.
+    pub(super) fn take_session_started(&mut self) -> bool {
+        std::mem::take(&mut self.session_started)
     }
 
     /// Wall-clock progress through the current spawn animation, 0..=1.
@@ -384,6 +406,7 @@ impl OverlayRenderer {
             level_gated,
             anim,
             &self.theme,
+            self.from_top,
         );
         self.frame = self.frame.wrapping_add(1);
     }
@@ -404,9 +427,9 @@ fn ease_out_back(t: f32, c: f32) -> f32 {
 
 /// Render one frame of the overlay into `pixmap` using tiny-skia. The
 /// pixmap is the same size as the surface; the pill is drawn at the bottom
-/// of the surface (its bottom edge glued to the surface bottom) so the
-/// height-morph animation reads as the pill *growing out of the screen
-/// edge* instead of inflating from its center.
+/// of the surface (its bottom edge glued to the surface bottom), or at the
+/// top when `from_top`, so the height-morph animation reads as the pill
+/// *growing out of the screen edge* instead of inflating from its center.
 fn draw_overlay(
     pixmap: &mut Pixmap,
     state: State,
@@ -414,6 +437,7 @@ fn draw_overlay(
     level: f32,
     anim: AnimState,
     theme: &Theme,
+    from_top: bool,
 ) {
     pixmap.fill(Color::TRANSPARENT);
 
@@ -424,7 +448,7 @@ fn draw_overlay(
     let surface_w = pixmap.width() as f32;
     let surface_h = pixmap.height() as f32;
     let pill_h = anim.pill_height.clamp(SPAWN_PILL_MIN_H, surface_h);
-    let pill_y = surface_h - pill_h; // bottom-anchored
+    let pill_y = if from_top { 0.0 } else { surface_h - pill_h };
     let pill_w = surface_w;
 
     // Outer pill — drawn in the *ring* color first. We then paint a 1 px
@@ -725,7 +749,7 @@ mod tests {
     fn idle_draw_is_transparent() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Idle, 0, 0.0, hidden(), &t);
+        draw_overlay(&mut pm, State::Idle, 0, 0.0, hidden(), &t, false);
         assert!(pm.data().iter().all(|b| *b == 0));
     }
 
@@ -733,7 +757,7 @@ mod tests {
     fn faded_out_draw_is_transparent() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Recording, 0, 1.0, hidden(), &t);
+        draw_overlay(&mut pm, State::Recording, 0, 1.0, hidden(), &t, false);
         assert!(pm.data().iter().all(|b| *b == 0));
     }
 
@@ -741,9 +765,37 @@ mod tests {
     fn active_draw_has_visible_pixels() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Recording, 0, 1.0, shown(), &t);
+        draw_overlay(&mut pm, State::Recording, 0, 1.0, shown(), &t, false);
         // tiny-skia stores premultiplied RGBA; alpha lives in the 4th byte.
-        assert!(pm.data().chunks_exact(4).any(|px| px[3] != 0));
+        assert!(pm.data().as_chunks::<4>().0.iter().any(|px| px[3] != 0));
+    }
+
+    #[test]
+    fn growing_pill_hugs_the_screen_edge() {
+        // Mid-grow, the pill must touch the surface edge facing the screen
+        // edge and leave the opposite edge empty.
+        let growing = AnimState {
+            pill_height: 12.0,
+            bar_alpha: 0.0,
+            ..shown()
+        };
+        let row_alpha = |pm: &Pixmap, y: u32| {
+            let row = (y * W * 4) as usize..((y + 1) * W * 4) as usize;
+            pm.data()[row]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[3] != 0)
+        };
+        let t = Theme::ember();
+
+        let mut bottom = fresh_pixmap();
+        draw_overlay(&mut bottom, State::Recording, 0, 0.0, growing, &t, false);
+        assert!(row_alpha(&bottom, H - 2) && !row_alpha(&bottom, 1));
+
+        let mut top = fresh_pixmap();
+        draw_overlay(&mut top, State::Recording, 0, 0.0, growing, &t, true);
+        assert!(row_alpha(&top, 1) && !row_alpha(&top, H - 2));
     }
 
     #[test]
@@ -753,7 +805,9 @@ mod tests {
         // speaking frame paints green-dominant bar pixels that the recording
         // frame does not.
         fn green_dominant(data: &[u8]) -> usize {
-            data.chunks_exact(4)
+            data.as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|px| px[1] > 150 && px[0] < 120 && px[1] > px[0])
                 .count()
         }
@@ -761,8 +815,8 @@ mod tests {
         let t = Theme::ember();
         let mut rec = fresh_pixmap();
         let mut spk = fresh_pixmap();
-        draw_overlay(&mut rec, State::Recording, 0, 1.0, shown(), &t);
-        draw_overlay(&mut spk, State::Speaking, 0, 1.0, shown(), &t);
+        draw_overlay(&mut rec, State::Recording, 0, 1.0, shown(), &t, false);
+        draw_overlay(&mut spk, State::Speaking, 0, 1.0, shown(), &t, false);
         let rec_green = green_dominant(rec.data());
         let spk_green = green_dominant(spk.data());
         assert!(
@@ -776,8 +830,65 @@ mod tests {
     fn synthesizing_draws_visible_pixels() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Synthesizing, 0, 0.0, shown(), &t);
-        assert!(pm.data().chunks_exact(4).any(|px| px[3] != 0));
+        draw_overlay(&mut pm, State::Synthesizing, 0, 0.0, shown(), &t, false);
+        assert!(pm.data().as_chunks::<4>().0.iter().any(|px| px[3] != 0));
+    }
+
+    /// Renderer fed by live channels. The senders are returned so the
+    /// channels stay connected for the test's lifetime.
+    fn renderer() -> (mpsc::Sender<State>, mpsc::Sender<f32>, OverlayRenderer) {
+        let (state_tx, state_rx) = mpsc::channel();
+        let (level_tx, level_rx) = mpsc::channel();
+        let r = OverlayRenderer::new(state_rx, level_rx, W, H, Theme::ember(), false).unwrap();
+        (state_tx, level_tx, r)
+    }
+
+    /// Send `state`, apply it, and report whether it started a session.
+    fn starts_session(tx: &mpsc::Sender<State>, r: &mut OverlayRenderer, state: State) -> bool {
+        tx.send(state).unwrap();
+        r.apply_state_updates();
+        r.take_session_started()
+    }
+
+    #[test]
+    fn idle_to_recording_starts_a_session_once() {
+        let (tx, _levels, mut r) = renderer();
+        assert!(starts_session(&tx, &mut r, State::Recording));
+        assert!(!r.take_session_started());
+    }
+
+    #[test]
+    fn recording_to_transcribing_is_not_a_new_session() {
+        let (tx, _levels, mut r) = renderer();
+        assert!(starts_session(&tx, &mut r, State::Recording));
+        assert!(!starts_session(&tx, &mut r, State::Transcribing));
+    }
+
+    #[test]
+    fn next_session_after_idle_starts_again() {
+        // The second Recording lands while the despawn is still animating.
+        let (tx, _levels, mut r) = renderer();
+        assert!(starts_session(&tx, &mut r, State::Recording));
+        assert!(!starts_session(&tx, &mut r, State::Idle));
+        assert!(starts_session(&tx, &mut r, State::Recording));
+    }
+
+    #[test]
+    fn idle_to_synthesizing_starts_a_session() {
+        let (tx, _levels, mut r) = renderer();
+        assert!(starts_session(&tx, &mut r, State::Synthesizing));
+        assert!(!starts_session(&tx, &mut r, State::Speaking));
+    }
+
+    #[test]
+    fn draw_frame_drain_still_flags_the_session() {
+        // In production the frame callback's `draw_frame` usually drains the
+        // state change, and the run loop reads the flag on its next pass.
+        let (tx, _levels, mut r) = renderer();
+        tx.send(State::Recording).unwrap();
+        r.draw_frame();
+        assert!(r.take_session_started());
+        assert!(!r.take_session_started());
     }
 
     #[test]
@@ -808,7 +919,9 @@ mod tests {
         // count amber-dominant pixels (high R, mid G, low B) to measure
         // bar area independent of the bg pill.
         fn amber_pixels(data: &[u8]) -> usize {
-            data.chunks_exact(4)
+            data.as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|px| px[0] > 200 && px[1] > 70 && px[1] < 180 && px[2] < 60)
                 .count()
         }
@@ -816,8 +929,8 @@ mod tests {
         let t = Theme::ember();
         let mut quiet = fresh_pixmap();
         let mut loud = fresh_pixmap();
-        draw_overlay(&mut quiet, State::Recording, 0, 0.0, shown(), &t);
-        draw_overlay(&mut loud, State::Recording, 0, 1.0, shown(), &t);
+        draw_overlay(&mut quiet, State::Recording, 0, 0.0, shown(), &t, false);
+        draw_overlay(&mut loud, State::Recording, 0, 1.0, shown(), &t, false);
         let count_quiet = amber_pixels(quiet.data());
         let count_loud = amber_pixels(loud.data());
         assert!(

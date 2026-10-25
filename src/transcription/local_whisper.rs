@@ -9,9 +9,28 @@
 //! in issue #55, so the only prompt ever passed to the decoder is the static
 //! vocabulary prompt from the user's config.
 //!
+//! Pause-free speech is force-cut by the splitter before it outgrows
+//! whisper's 30 s context window (soft cap at a genuinely silent frame, hard
+//! ceiling regardless); the phrase after such a cut is decoded on its own,
+//! and its spurious leading capital — whisper capitalizes each decode
+//! independently — is lowercased (see
+//! [`Phrase::continuation`](super::phrase_split::Phrase::continuation)).
+//!
 //! The legacy sliding-window mode (`segmentation = "window"`) keeps the
 //! 8s/2s overlapping windows with text-based n-gram overlap removal
 //! (`asr_dedup::TextDedup`) for lower-latency partial output.
+//!
+//! `segmentation = "none"` turns streaming off: [`supports_streaming`]
+//! returns `false`, so the daemon records the whole session and hands it to
+//! [`transcribe`] in one call when recording stops. Nothing is typed while
+//! you talk, and the batch-only dictation features (`[general]
+//! llm_post_process`, `[input] paste`) apply.
+//!
+//! Both streaming modes create one decoder state per stream and reuse it
+//! across decodes; see [`create_state`].
+//!
+//! [`supports_streaming`]: TranscriptionBackend::supports_streaming
+//! [`transcribe`]: TranscriptionBackend::transcribe
 
 use std::sync::Arc;
 
@@ -20,8 +39,12 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::phrase_split::PhraseSplitter;
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::phrase_split::{decode_windows, DecodeWindow, PhraseSplitter};
+use super::verbose_json::is_no_speech;
+use super::{
+    decode_wav_samples, samples_to_ms, Segment, StreamText, Transcript, TranscriptionBackend,
+    TranscriptionConfig, LOCAL_CHUNK_SECS,
+};
 use crate::audio::AudioChunk;
 
 /// Sliding window parameters for the legacy "window" streaming mode.
@@ -50,6 +73,9 @@ pub enum SegmentationMode {
     Silence,
     /// Legacy overlapping sliding window with text-based dedup.
     Window,
+    /// No segmentation, no streaming: decode the whole recording once,
+    /// after it stops (config value `"none"`).
+    Unsegmented,
 }
 
 impl SegmentationMode {
@@ -58,6 +84,7 @@ impl SegmentationMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "silence" => Self::Silence,
             "window" => Self::Window,
+            "none" => Self::Unsegmented,
             other => {
                 warn!("unknown local-whisper segmentation {other:?}, using \"silence\"");
                 Self::Silence
@@ -80,7 +107,15 @@ impl LocalWhisperBackend {
     /// Defaults to silence-delimited phrase segmentation; see
     /// [`Self::with_segmentation`].
     pub fn new(model_path: String) -> Self {
-        let ctx = match Self::load_model(&model_path) {
+        Self::with_flash_attn(model_path, false)
+    }
+
+    /// Like [`Self::new`], with whisper.cpp flash attention on or off.
+    ///
+    /// It is a context parameter, so it is fixed when the model loads. It
+    /// disables DTW token timestamps, which whisrs does not use.
+    pub fn with_flash_attn(model_path: String, flash_attn: bool) -> Self {
+        let ctx = match Self::load_model(&model_path, flash_attn) {
             Ok(ctx) => {
                 info!("loaded whisper model from {model_path}");
                 Some(Arc::new(ctx))
@@ -102,20 +137,22 @@ impl LocalWhisperBackend {
 
     /// Configure the streaming segmentation strategy.
     ///
-    /// `mode` is `"silence"` (default) or `"window"`; `phrase_silence_ms` is
-    /// how much continuous silence ends a phrase in silence mode.
+    /// `mode` is `"silence"` (default), `"window"` or `"none"`;
+    /// `phrase_silence_ms` is how much continuous silence ends a phrase in
+    /// silence mode.
     pub fn with_segmentation(mut self, mode: &str, phrase_silence_ms: u64) -> Self {
         self.segmentation = SegmentationMode::parse(mode);
         self.phrase_silence_ms = phrase_silence_ms.max(1);
         self
     }
 
-    fn load_model(path: &str) -> anyhow::Result<whisper_rs::WhisperContext> {
+    fn load_model(path: &str, flash_attn: bool) -> anyhow::Result<whisper_rs::WhisperContext> {
         if !std::path::Path::new(path).exists() {
             anyhow::bail!("model file not found: {path}. Run 'whisrs setup' to download a model.");
         }
 
-        let params = whisper_rs::WhisperContextParameters::default();
+        let mut params = whisper_rs::WhisperContextParameters::default();
+        params.flash_attn(flash_attn);
 
         whisper_rs::WhisperContext::new_with_params(path, params)
             .map_err(|e| anyhow::anyhow!("failed to initialize whisper context: {e}"))
@@ -132,17 +169,34 @@ impl LocalWhisperBackend {
     ) -> anyhow::Result<()> {
         let mut splitter =
             PhraseSplitter::new(SAMPLE_RATE, SILENCE_THRESHOLD, self.phrase_silence_ms);
+        let mut state = create_state(ctx)?;
 
         while let Some(chunk) = audio_rx.recv().await {
             for phrase in splitter.feed(&chunk) {
-                decode_phrase(ctx, phrase, config, &text_tx).await;
+                state = decode_phrase(
+                    ctx,
+                    state,
+                    phrase.samples,
+                    phrase.continuation,
+                    config,
+                    &text_tx,
+                )
+                .await?;
             }
         }
 
         // End of stream: flush the trailing in-progress phrase (if any),
         // exactly once. No rewind, no overlap re-send.
         if let Some(phrase) = splitter.flush() {
-            decode_phrase(ctx, phrase, config, &text_tx).await;
+            decode_phrase(
+                ctx,
+                state,
+                phrase.samples,
+                phrase.continuation,
+                config,
+                &text_tx,
+            )
+            .await?;
         }
 
         Ok(())
@@ -162,6 +216,7 @@ impl LocalWhisperBackend {
         let mut last_processed_end: usize = 0;
         // Static vocabulary prompt only — never prior transcription output.
         let prompt = config.prompt.clone().filter(|p| !p.is_empty());
+        let mut state = create_state(ctx)?;
 
         while let Some(chunk) = audio_rx.recv().await {
             buffer.extend_from_slice(&chunk);
@@ -180,16 +235,23 @@ impl LocalWhisperBackend {
                 // Skip silent windows.
                 if !audio_silence_gate::is_silent(&window, SILENCE_THRESHOLD) {
                     let samples_f32 = i16_to_f32(&window);
-                    let ctx_clone = Arc::clone(ctx);
                     let lang = config.language.clone();
                     let prompt = prompt.clone();
+                    let mut decode_state = state;
 
                     match tokio::task::spawn_blocking(move || {
-                        run_whisper_inference(&ctx_clone, &samples_f32, &lang, prompt.as_deref())
+                        let result = run_whisper_inference(
+                            &mut decode_state,
+                            &samples_f32,
+                            &lang,
+                            prompt.as_deref(),
+                        );
+                        (decode_state, result)
                     })
                     .await
                     {
-                        Ok(Ok(full_text)) => {
+                        Ok((returned, Ok(full_text))) => {
+                            state = returned;
                             // Use text-based dedup to extract only the new portion.
                             let new_text = dedup.filter_text(&full_text);
                             if !new_text.trim().is_empty() {
@@ -197,8 +259,20 @@ impl LocalWhisperBackend {
                                 text_tx.send(new_text).await.ok();
                             }
                         }
-                        Ok(Err(e)) => warn!("whisper window inference failed: {e}"),
-                        Err(e) => warn!("whisper task panicked: {e}"),
+                        Ok((stale, Err(e))) => {
+                            warn!("whisper window inference failed: {e}");
+                            // Free the failed state before allocating its
+                            // replacement, so recovery never needs two states
+                            // resident at once.
+                            drop(stale);
+                            state = create_state(ctx)?;
+                        }
+                        Err(e) => {
+                            warn!("whisper task panicked: {e}");
+                            // The state died with the panicked task; make a
+                            // fresh one so later windows can still decode.
+                            state = create_state(ctx)?;
+                        }
                     }
                 } else {
                     debug!(
@@ -224,28 +298,83 @@ impl LocalWhisperBackend {
             if !remaining.is_empty() && !audio_silence_gate::is_silent(remaining, SILENCE_THRESHOLD)
             {
                 let samples_f32 = i16_to_f32(remaining);
-                let ctx_clone = Arc::clone(ctx);
                 let lang = config.language.clone();
                 let prompt = prompt.clone();
+                // Final decode of the stream — the state is consumed.
+                let mut decode_state = state;
 
                 match tokio::task::spawn_blocking(move || {
-                    run_whisper_inference(&ctx_clone, &samples_f32, &lang, prompt.as_deref())
+                    let result = run_whisper_inference(
+                        &mut decode_state,
+                        &samples_f32,
+                        &lang,
+                        prompt.as_deref(),
+                    );
+                    (decode_state, result)
                 })
                 .await
                 {
-                    Ok(Ok(full_text)) => {
+                    Ok((_, Ok(full_text))) => {
                         let new_text = dedup.filter_text(&full_text);
                         if !new_text.trim().is_empty() {
                             text_tx.send(new_text).await.ok();
                         }
                     }
-                    Ok(Err(e)) => warn!("whisper final inference failed: {e}"),
+                    Ok((_, Err(e))) => warn!("whisper final inference failed: {e}"),
                     Err(e) => warn!("whisper final task panicked: {e}"),
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Unsegmented mode over a stream: buffer everything, decode once at
+    /// the end.
+    ///
+    /// The daemon never gets here, since this mode reports
+    /// `supports_streaming() == false` and dictation takes the batch path
+    /// instead. It exists so a direct `transcribe_stream` caller still gets
+    /// batch semantics (one decode, one send) rather than a silent fallback
+    /// to phrase streaming.
+    async fn stream_unsegmented(
+        &self,
+        ctx: &Arc<whisper_rs::WhisperContext>,
+        mut audio_rx: mpsc::Receiver<AudioChunk>,
+        text_tx: mpsc::Sender<String>,
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<()> {
+        let mut buffer: Vec<i16> = Vec::new();
+        while let Some(chunk) = audio_rx.recv().await {
+            buffer.extend_from_slice(&chunk);
+        }
+
+        if buffer.is_empty() || audio_silence_gate::is_silent(&buffer, SILENCE_THRESHOLD) {
+            return Ok(());
+        }
+
+        decode_phrase(ctx, create_state(ctx)?, buffer, false, config, &text_tx).await?;
+        Ok(())
+    }
+
+    /// Cut a recording chunk into phrases of at most ~28 s with the same
+    /// splitter as silence-mode dictation.
+    ///
+    /// `segmentation` is not consulted: it picks how dictation streams, and
+    /// `"none"` would hand whisper.cpp a whole chunk (up to ten minutes) in one
+    /// `full()` call, where it carries text across its 30 s windows even with
+    /// `no_context(true)`: the repetition loop of #55. `phrase_silence_ms` is
+    /// capped ([`super::recording_phrase_silence_ms`]), so every join between
+    /// the chunk's speech regions ends a phrase.
+    fn recording_phrases(&self, samples: &[i16]) -> Vec<super::phrase_split::Phrase> {
+        let mut splitter = PhraseSplitter::new(
+            SAMPLE_RATE,
+            SILENCE_THRESHOLD,
+            super::recording_phrase_silence_ms(self.phrase_silence_ms),
+        );
+        let mut phrases = splitter.feed(samples);
+        phrases.extend(splitter.flush());
+        phrases
     }
 }
 
@@ -258,15 +387,57 @@ fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
         .collect()
 }
 
+/// Lowercase the first character of `text` if it is an uppercase letter.
+///
+/// Applied to continuation phrases (those starting at a forced mid-speech
+/// cut): whisper capitalizes each decode independently, so a continuation's
+/// leading capital is spurious mid-sentence. Char-safe for UTF-8;
+/// `char::to_lowercase` may expand to multiple chars.
+#[cfg(any(feature = "local-whisper", test))]
+fn decapitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        // The standalone pronoun "I" (and contractions: "I'm", "I'll") is
+        // correctly capitalized mid-sentence; lowercasing it is visibly wrong.
+        Some('I') if !chars.clone().next().is_some_and(|c| c.is_alphabetic()) => text.to_string(),
+        Some(c) if c.is_alphabetic() && c.is_uppercase() => {
+            let mut out: String = c.to_lowercase().collect();
+            out.push_str(chars.as_str());
+            out
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// Create a decoder state for a stream (or a single batch call).
+///
+/// Creating a state allocates all of whisper.cpp's KV and compute buffers —
+/// on GPU backends that is a full device buffer build — so it must happen
+/// once per stream and be reused across decodes, never once per phrase.
+/// Reuse carries no decoder context between phrases: every decode sets
+/// `set_no_context(true)` (see [`run_whisper_inference`]).
+fn create_state(ctx: &whisper_rs::WhisperContext) -> anyhow::Result<whisper_rs::WhisperState> {
+    ctx.create_state()
+        .map_err(|e| anyhow::anyhow!("failed to create whisper state: {e}"))
+}
+
 /// Decode a single phrase and send its trimmed text over `text_tx`.
 ///
 /// Each phrase is decoded exactly once with only the static config prompt.
+/// `continuation` marks a phrase starting at a forced mid-speech cut; its
+/// spurious leading capital is lowercased before sending.
+/// The stream's reusable `state` is taken by value (it has to move into the
+/// blocking task) and handed back on return; if the decode fails or the task
+/// panics, that state is discarded and a fresh one is created to keep the
+/// stream going.
 async fn decode_phrase(
     ctx: &Arc<whisper_rs::WhisperContext>,
+    mut state: whisper_rs::WhisperState,
     mut phrase: Vec<i16>,
+    continuation: bool,
     config: &TranscriptionConfig,
     text_tx: &mpsc::Sender<String>,
-) {
+) -> anyhow::Result<whisper_rs::WhisperState> {
     debug!(
         "decoding phrase of {:.2}s",
         phrase.len() as f64 / SAMPLE_RATE as f64
@@ -277,44 +448,78 @@ async fn decode_phrase(
     }
 
     let samples_f32 = i16_to_f32(&phrase);
-    let ctx = Arc::clone(ctx);
     let lang = config.language.clone();
     let prompt = config.prompt.clone().filter(|p| !p.is_empty());
 
     match tokio::task::spawn_blocking(move || {
-        run_whisper_inference(&ctx, &samples_f32, &lang, prompt.as_deref())
+        let result = run_whisper_inference(&mut state, &samples_f32, &lang, prompt.as_deref());
+        (state, result)
     })
     .await
     {
-        Ok(Ok(text)) => {
+        Ok((state, Ok(text))) => {
             let text = text.trim();
             if !text.is_empty() {
+                let text = if continuation {
+                    decapitalize_first(text)
+                } else {
+                    text.to_string()
+                };
                 debug!("phrase produced: {:?}", text);
-                text_tx.send(text.to_string()).await.ok();
+                text_tx.send(text).await.ok();
             }
+            Ok(state)
         }
-        Ok(Err(e)) => warn!("whisper phrase inference failed: {e}"),
-        Err(e) => warn!("whisper phrase task panicked: {e}"),
+        Ok((stale, Err(e))) => {
+            warn!("whisper phrase inference failed: {e}");
+            // Free the failed state before allocating its replacement, so
+            // recovery never needs two states resident at once.
+            drop(stale);
+            create_state(ctx)
+        }
+        Err(e) => {
+            warn!("whisper phrase task panicked: {e}");
+            create_state(ctx)
+        }
     }
 }
 
 /// Run whisper inference on an audio buffer.
 ///
+/// - `state`: a reusable decoder state (see [`create_state`]). Reuse carries
+///   no context between calls: `set_no_context(true)` below decodes every
+///   buffer independently.
 /// - `prompt`: the static vocabulary/context hint from the user's config.
 ///   Never prior transcription output — feeding decoded text back as the
 ///   prompt caused the repetition loops of issue #55.
 fn run_whisper_inference(
-    ctx: &whisper_rs::WhisperContext,
+    state: &mut whisper_rs::WhisperState,
     audio: &[f32],
     language: &str,
     prompt: Option<&str>,
 ) -> anyhow::Result<String> {
+    state
+        .full(full_params(language, prompt), audio)
+        .map_err(|e| anyhow::anyhow!("whisper inference failed: {e}"))?;
+
+    let mut text = String::new();
+    for segment in state.as_iter() {
+        text.push_str(&format!("{}", segment));
+    }
+
+    Ok(text.trim().to_string())
+}
+
+/// Decode parameters shared by every whisper call, dictation and recordings
+/// alike, so the invariants below cannot drift between the two.
+fn full_params<'a>(language: &'a str, prompt: Option<&str>) -> whisper_rs::FullParams<'a, 'a> {
     use whisper_rs::{FullParams, SamplingStrategy};
 
-    let mut state = ctx
-        .create_state()
-        .map_err(|e| anyhow::anyhow!("failed to create whisper state: {e}"))?;
-
+    // `best_of: 1` is load-bearing beyond decode quality: it keeps whisper.cpp's
+    // decoder count at 1, which is the only reason the library never takes the
+    // path where it frees the state itself and hands back an error. Raising it,
+    // or switching to beam search, needs the error arms above to stop dropping
+    // the returned state.
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
     if language != "auto" {
@@ -330,6 +535,8 @@ fn run_whisper_inference(
     // Decode every buffer independently: carrying decoder context across
     // buffers amplified repetition/invented text (issue #55). The static
     // initial_prompt above is still applied.
+    // Reusing one state across decodes depends on this staying true: it is what
+    // drops the previous decode's text context (see `create_state`).
     params.set_no_context(true);
     // Fall back to a higher temperature sooner when the decoder gets stuck in
     // low-entropy (repetitive) output. whisper.cpp default is 2.4.
@@ -347,17 +554,152 @@ fn run_whisper_inference(
         .unwrap_or(4)
         .min(8);
     params.set_n_threads(n_threads);
+    params
+}
 
+/// One whisper segment of a decoded buffer, timed relative to that buffer.
+struct RawSegment {
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
+    no_speech_prob: f64,
+    avg_logprob: Option<f64>,
+}
+
+/// Decode a recording window and return whisper's own segments with their
+/// timing and confidence. Dictation's parameters ([`full_params`]), with one
+/// change: `n_max_text_ctx` 0.
+///
+/// A window fits one 30 s mel window, but `full()` can still take a second
+/// pass: it seeks to the last timestamp it decoded and runs on over the
+/// rest, and that pass is conditioned on the first pass's text
+/// (`no_context` clears the carried text only when the call starts). That
+/// is the carried context of the #55 repetition loop. With `n_max_text_ctx`
+/// 0 no pass takes any prompt; in this whisper.cpp that includes the
+/// initial prompt, so recordings send local whisper none (see
+/// `crate::transcription::factory::recording_transcription_config`).
+fn run_whisper_segments(
+    state: &mut whisper_rs::WhisperState,
+    audio: &[f32],
+    language: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<Vec<RawSegment>> {
+    let mut params = full_params(language, prompt);
+    params.set_n_max_text_ctx(0);
     state
         .full(params, audio)
         .map_err(|e| anyhow::anyhow!("whisper inference failed: {e}"))?;
 
-    let mut text = String::new();
+    let mut out = Vec::new();
     for segment in state.as_iter() {
-        text.push_str(&format!("{}", segment));
+        // Mean log-probability of the text tokens; special tokens
+        // (`[_BEG_]`, `<|en|>`, ...) carry no information about the speech.
+        let mut logprob_sum = 0.0f64;
+        let mut tokens = 0usize;
+        for i in 0..segment.n_tokens() {
+            let Some(token) = segment.get_token(i) else {
+                continue;
+            };
+            let is_special = token
+                .to_str_lossy()
+                .map(|t| t.starts_with("[_") || t.starts_with("<|"))
+                .unwrap_or(true);
+            if is_special {
+                continue;
+            }
+            logprob_sum += f64::from(token.token_probability().max(1e-10)).ln();
+            tokens += 1;
+        }
+        // t0/t1 are centiseconds.
+        out.push(RawSegment {
+            start_ms: segment.start_timestamp().max(0) as u64 * 10,
+            end_ms: segment.end_timestamp().max(0) as u64 * 10,
+            text: segment
+                .to_str_lossy()
+                .map(|t| t.into_owned())
+                .unwrap_or_default(),
+            no_speech_prob: f64::from(segment.no_speech_probability()),
+            avg_logprob: (tokens > 0).then(|| logprob_sum / tokens as f64),
+        });
+    }
+    Ok(out)
+}
+
+/// Whisper's segments for one decode window, placed on the chunk: blank and
+/// no-speech segments dropped, times clamped into the window (its decoded
+/// buffer may have been padded) and moved by its start, and the first kept
+/// segment of a window that starts at a forced cut lowercased, since it
+/// continues a sentence.
+fn place_window_segments(raw: Vec<RawSegment>, window: &DecodeWindow) -> Vec<Segment> {
+    let window_start_ms = samples_to_ms(window.range.start as u64);
+    let window_len_ms = samples_to_ms(window.range.len() as u64);
+    let mut out = Vec::new();
+    for seg in raw {
+        let text = seg.text.trim();
+        if text.is_empty() || is_no_speech(Some(seg.no_speech_prob), seg.avg_logprob) {
+            continue;
+        }
+        let text = if window.continuation && out.is_empty() {
+            decapitalize_first(text)
+        } else {
+            text.to_string()
+        };
+        let start = seg.start_ms.min(window_len_ms);
+        let end = seg.end_ms.clamp(start, window_len_ms);
+        out.push(Segment {
+            start_ms: window_start_ms + start,
+            end_ms: window_start_ms + end,
+            text,
+            speaker: None,
+            words: None,
+        });
+    }
+    out
+}
+
+/// Decode a recording chunk window by window on one reused state, one
+/// `full()` call per [`DecodeWindow`].
+///
+/// Windows group the phrases of the same [`PhraseSplitter`] as streaming
+/// dictation, at most ~28 s each, so each fits one 30 s mel window and a
+/// call never decodes on into a second one. Passes inside a window take no
+/// carried text ([`run_whisper_segments`]). Whisper's own segments are
+/// kept, placed by [`place_window_segments`].
+fn decode_recording_windows(
+    ctx: &whisper_rs::WhisperContext,
+    samples: &[i16],
+    windows: &[DecodeWindow],
+    language: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<Vec<Segment>> {
+    let mut state = create_state(ctx)?;
+    let mut segments = Vec::new();
+    let mut failures = 0usize;
+    let total = windows.len();
+
+    for window in windows {
+        let window_start_ms = samples_to_ms(window.range.start as u64);
+        let mut buf = samples[window.range.clone()].to_vec();
+        // whisper.cpp silently produces nothing for <1 s buffers; pad with silence.
+        if buf.len() < MIN_DECODE_SAMPLES {
+            buf.resize(MIN_DECODE_SAMPLES, 0);
+        }
+        match run_whisper_segments(&mut state, &i16_to_f32(&buf), language, prompt) {
+            Ok(raw) => segments.extend(place_window_segments(raw, window)),
+            Err(e) => {
+                warn!("whisper recording window at {window_start_ms} ms failed: {e}");
+                failures += 1;
+                // Same recovery as streaming: free the failed state first.
+                drop(state);
+                state = create_state(ctx)?;
+            }
+        }
     }
 
-    Ok(text.trim().to_string())
+    if total > 0 && failures == total {
+        anyhow::bail!("whisper failed to decode every window of the chunk");
+    }
+    Ok(segments)
 }
 
 #[async_trait]
@@ -387,7 +729,8 @@ impl TranscriptionBackend for LocalWhisperBackend {
         let prompt = config.prompt.clone();
 
         tokio::task::spawn_blocking(move || {
-            run_whisper_inference(&ctx, &samples_f32, &language, prompt.as_deref())
+            let mut state = create_state(&ctx)?;
+            run_whisper_inference(&mut state, &samples_f32, &language, prompt.as_deref())
         })
         .await?
     }
@@ -406,11 +749,69 @@ impl TranscriptionBackend for LocalWhisperBackend {
         match self.segmentation {
             SegmentationMode::Silence => self.stream_phrases(ctx, audio_rx, text_tx, config).await,
             SegmentationMode::Window => self.stream_windows(ctx, audio_rx, text_tx, config).await,
+            SegmentationMode::Unsegmented => {
+                self.stream_unsegmented(ctx, audio_rx, text_tx, config)
+                    .await
+            }
         }
     }
 
+    // Unsegmented mode opts out so the daemon records the whole session and calls
+    // `transcribe` once on stop, instead of typing phrases as they end.
     fn supports_streaming(&self) -> bool {
+        self.segmentation != SegmentationMode::Unsegmented
+    }
+
+    // `run_whisper_inference` hands the prompt to `set_initial_prompt`, so
+    // whisper.cpp really does decode conditioned on it.
+    fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         true
+    }
+
+    // One trimmed phrase, or a window's new words, per send.
+    fn stream_text(&self) -> StreamText {
+        StreamText::Phrases
+    }
+
+    // Native timestamps from whisper's segments, decoded a window of phrases
+    // at a time (see `decode_recording_windows` for why never a whole chunk at
+    // once, and `recording_phrases` for why `segmentation` does not apply).
+    async fn transcribe_segments(
+        &self,
+        audio: &[u8],
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<Transcript> {
+        let ctx = self.ctx.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "whisper model not loaded from {}. Run 'whisrs setup' to download a model.",
+                self.model_path
+            )
+        })?;
+
+        let samples = decode_wav_samples(audio)?;
+        let phrases = self.recording_phrases(&samples);
+        let windows = decode_windows(&samples, &phrases, SAMPLE_RATE);
+        debug!(
+            "local whisper: {} phrase(s) in {} decode window(s) (whisper full() calls) \
+             for a {:.1}s recording chunk",
+            phrases.len(),
+            windows.len(),
+            samples.len() as f64 / SAMPLE_RATE as f64
+        );
+        drop(phrases);
+
+        let ctx = Arc::clone(ctx);
+        let language = config.language.clone();
+        let prompt = config.prompt.clone().filter(|p| !p.is_empty());
+        let segments = tokio::task::spawn_blocking(move || {
+            decode_recording_windows(&ctx, &samples, &windows, &language, prompt.as_deref())
+        })
+        .await??;
+        Ok(Transcript { segments })
+    }
+
+    fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+        Some(LOCAL_CHUNK_SECS)
     }
 }
 
@@ -425,6 +826,8 @@ mod tests {
             language: "en".to_string(),
             model: "base.en".to_string(),
             prompt: None,
+            keyterms: Vec::new(),
+            diarize: false,
         };
         let err = backend.transcribe(&[1, 2, 3], &config).await.unwrap_err();
         let msg = err.to_string();
@@ -446,6 +849,45 @@ mod tests {
     }
 
     #[test]
+    fn decapitalize_first_lowercases_ascii_uppercase() {
+        assert_eq!(decapitalize_first("Hello world"), "hello world");
+    }
+
+    #[test]
+    fn decapitalize_first_leaves_lowercase_unchanged() {
+        assert_eq!(decapitalize_first("hello World"), "hello World");
+    }
+
+    #[test]
+    fn decapitalize_first_leaves_digit_and_punct_unchanged() {
+        assert_eq!(decapitalize_first("42 things"), "42 things");
+        assert_eq!(decapitalize_first("...And then"), "...And then");
+    }
+
+    #[test]
+    fn decapitalize_first_handles_multibyte_uppercase() {
+        assert_eq!(decapitalize_first("École normale"), "école normale");
+    }
+
+    #[test]
+    fn decapitalize_first_handles_empty_string() {
+        assert_eq!(decapitalize_first(""), "");
+    }
+
+    #[test]
+    fn decapitalize_first_keeps_pronoun_i() {
+        assert_eq!(decapitalize_first("I think so"), "I think so");
+        assert_eq!(decapitalize_first("I'm here"), "I'm here");
+        assert_eq!(decapitalize_first("I"), "I");
+    }
+
+    #[test]
+    fn decapitalize_first_still_lowercases_i_words() {
+        assert_eq!(decapitalize_first("It works"), "it works");
+        assert_eq!(decapitalize_first("Instead of that"), "instead of that");
+    }
+
+    #[test]
     fn segmentation_mode_parsing() {
         assert_eq!(
             SegmentationMode::parse("silence"),
@@ -456,8 +898,135 @@ mod tests {
             SegmentationMode::parse(" window "),
             SegmentationMode::Window
         );
+        assert_eq!(
+            SegmentationMode::parse("none"),
+            SegmentationMode::Unsegmented
+        );
+        assert_eq!(
+            SegmentationMode::parse(" NONE "),
+            SegmentationMode::Unsegmented
+        );
         // Unknown values fall back to the default.
         assert_eq!(SegmentationMode::parse("bogus"), SegmentationMode::Silence);
         assert_eq!(SegmentationMode::default(), SegmentationMode::Silence);
+    }
+
+    /// Recordings decode in short phrases on every segmentation mode, `"none"`
+    /// included: 70 s of unbroken speech (no pause to cut at) still comes out
+    /// as phrases no longer than the splitter's hard cap.
+    #[test]
+    fn recording_phrases_stay_short_whatever_the_segmentation() {
+        let speech: Vec<i16> = (0..70 * SAMPLE_RATE)
+            .map(|i| if i % 2 == 0 { 8000 } else { -8000 })
+            .collect();
+        for mode in ["none", "silence", "window"] {
+            let backend = LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
+                .with_segmentation(mode, 400);
+            let phrases = backend.recording_phrases(&speech);
+            assert!(phrases.len() >= 3, "{mode}: {} phrase(s)", phrases.len());
+            for phrase in &phrases {
+                assert!(
+                    phrase.samples.len() <= 28 * SAMPLE_RATE,
+                    "{mode}: a {:.1} s phrase",
+                    phrase.samples.len() as f64 / SAMPLE_RATE as f64
+                );
+            }
+            let covered: usize = phrases.iter().map(|p| p.samples.len()).sum();
+            assert!(covered >= 69 * SAMPLE_RATE, "{mode}: speech was dropped");
+        }
+    }
+
+    fn raw(start_ms: u64, end_ms: u64, text: &str, no_speech_prob: f64) -> RawSegment {
+        RawSegment {
+            start_ms,
+            end_ms,
+            text: text.to_string(),
+            no_speech_prob,
+            avg_logprob: Some(-1.5),
+        }
+    }
+
+    /// A window's segments land on the chunk: moved by the window's start,
+    /// clamped into it, blank and no-speech ones dropped, and a forced-cut
+    /// window's first kept line lowercased (only that one).
+    #[test]
+    fn window_segments_are_placed_on_the_chunk() {
+        let window = DecodeWindow {
+            range: 16_000..16_000 + 20 * SAMPLE_RATE,
+            continuation: true,
+            phrases: 3,
+        };
+        let placed = place_window_segments(
+            vec![
+                raw(0, 900, " ", 0.0),
+                raw(900, 1_800, " Thanks for watching.", 0.9),
+                raw(2_000, 6_500, " And then We shipped it.", 0.1),
+                raw(7_000, 9_000, " Then the tests.", 0.1),
+                // Ends in the zero padding past the window.
+                raw(19_000, 30_000, " Done.", 0.1),
+            ],
+            &window,
+        );
+        let lines: Vec<(u64, u64, &str)> = placed
+            .iter()
+            .map(|s| (s.start_ms, s.end_ms, s.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (3_000, 7_500, "and then We shipped it."),
+                (8_000, 10_000, "Then the tests."),
+                (20_000, 21_000, "Done."),
+            ]
+        );
+        // A window that starts fresh keeps its capital.
+        let fresh = DecodeWindow {
+            continuation: false,
+            ..window
+        };
+        let placed = place_window_segments(vec![raw(0, 500, " Yes.", 0.0)], &fresh);
+        assert_eq!(placed[0].text, "Yes.");
+    }
+
+    /// Two speech regions a second of silence apart, as a recording chunk
+    /// joins them, are two phrases however long `phrase_silence_ms` is.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn recording_phrases_break_at_every_join() {
+        let region: Vec<i16> = (0..16 * SAMPLE_RATE / 10)
+            .map(|i| if i % 8 < 4 { 8000 } else { -8000 })
+            .collect();
+        let join = crate::recording::speech::JOIN_GAP;
+        let chunk: Vec<i16> = region
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(0, join))
+            .chain(region.iter().copied())
+            .collect();
+        for silence_ms in [400, 900, 1000, 5000] {
+            let backend = LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
+                .with_segmentation("silence", silence_ms);
+            let phrases = backend.recording_phrases(&chunk);
+            assert_eq!(phrases.len(), 2, "phrase_silence_ms = {silence_ms}");
+            assert!(phrases[1].start_sample as usize >= region.len() + join / 2);
+        }
+        assert!(
+            super::super::RECORDING_PHRASE_SILENCE_MAX_MS < (join * 1000 / SAMPLE_RATE) as u64,
+            "the cap must stay under the join"
+        );
+    }
+
+    #[test]
+    fn no_segmentation_disables_streaming() {
+        // A missing model only logs a warning, which is all this test needs:
+        // `supports_streaming` must not depend on the model being loaded.
+        let backend = |mode: &str| {
+            LocalWhisperBackend::new("/nonexistent/ggml.bin".to_string())
+                .with_segmentation(mode, 400)
+        };
+        assert!(!backend("none").supports_streaming());
+        assert!(backend("silence").supports_streaming());
+        assert!(backend("window").supports_streaming());
+        assert!(backend("bogus").supports_streaming());
     }
 }
